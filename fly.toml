@@ -6,6 +6,7 @@ primary_region = "iad"
 [env]
   PHX_HOST = "ezthrottle-local.fly.dev"
   PORT = "4000"
+  PHX_SERVER = "true"
 
 [http_service]
   internal_port = 4000

@@ -28,6 +28,7 @@ COPY --from=build /app/_build/prod/rel/ezthrottle_local ./
 
 ENV PHX_HOST=localhost
 ENV PORT=4000
+ENV PHX_SERVER=true
 
 EXPOSE 4000
 
