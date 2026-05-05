@@ -1,10 +1,10 @@
 # EZThrottle Local
 
-A self-hosted, open-source API rate limit router built on the BEAM.
+A self-hosted, open-source API Aquaduct built on the BEAM.
 
 Kubernetes and modern orchestrators are great at scaling compute — but they were not designed for spiky traffic or tenant fairness. When a burst of agentic requests arrives, your pods get hammered, queues back up unevenly, and noisy tenants crowd out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready.
 
-**EZThrottle Local is a singleton, in-memory, webhook-driven load balancer for outbound API traffic.** When spiky agentic traffic arrives, it is queued in memory and forwarded to your microservices or external APIs at a controlled, predictable pace. As Kubernetes scales your upstream capacity, you respond with a higher RPS header and EZThrottle adjusts in real time — no redeploy needed.
+**EZThrottle Local is a singleton, in-memory, webhook-driven load balancer for internal API traffic. ** When spiky agentic traffic arrives, it is queued in memory and forwarded to your microservices or external APIs at a controlled, predictable pace. As Kubernetes scales your upstream capacity, you respond with a higher RPS header and EZThrottle adjusts in real time — no redeploy needed. The response is delivered as a webhook to the user
 
 ## How it works
 
