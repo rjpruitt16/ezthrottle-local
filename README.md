@@ -29,7 +29,11 @@ By default all traffic for a destination flows through one shared queue. When yo
 X-EZTHROTTLE-ACCOUNT-QUEUE: enabled
 ```
 
-EZThrottle switches to per-user isolation — each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else. Different tenants naturally get different paces based on what your service signals back. Disable it any time by responding with `X-EZTHROTTLE-ACCOUNT-QUEUE: disabled`.
+EZThrottle switches to per-user isolation — each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else.
+
+Critically, each user can run at a **different pace**. If your service processes requests from user A faster than user B — because of their tier, their data size, or just load at that moment — each user's queue drains independently at the rate their own responses signal back. A premium user responding with `X-EZTHROTTLE-RPS: 50` runs at 50 RPS while a free-tier user on `X-EZTHROTTLE-RPS: 2` runs at 2, in parallel, without either affecting the other.
+
+Disable it any time by responding with `X-EZTHROTTLE-ACCOUNT-QUEUE: disabled`.
 
 ## API
 
