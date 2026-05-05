@@ -8,6 +8,8 @@ defmodule EzthrottleLocal.AccountQueue do
 
   use GenServer
 
+  require Logger
+
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.IdempotentStore
   alias EzthrottleLocal.Webhook

@@ -111,6 +111,19 @@ fly launch --config fly.toml
 fly deploy
 ```
 
+For maximum queue capacity, use the largest available machine. A 32GB RAM machine can hold 3–32 million jobs in memory — enough buffer for hours of traffic at typical agentic workloads, giving your autoscaler time to catch up before a single request is dropped.
+
+```toml
+[[vm]]
+  memory = "32gb"
+  cpu_kind = "performance"
+  cpus = 16
+```
+
+## Zero-downtime updates
+
+EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloading. Updates to rate limiting logic, routing behavior, or configuration can be deployed to a running node without restarting the process — the in-memory queue is preserved across deploys and no jobs are lost.
+
 ## EZThrottle Cloud
 
 EZThrottle Local is best-effort: in-memory queues, single node, no retry on failure.
