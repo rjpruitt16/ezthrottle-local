@@ -18,7 +18,7 @@ COPY priv priv
 RUN mix compile
 RUN mix release
 
-FROM alpine:3.19 AS app
+FROM alpine:3.22 AS app
 
 RUN apk add --no-cache libstdc++ openssl ncurses-libs
 
