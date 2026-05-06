@@ -91,13 +91,14 @@ defmodule EzthrottleLocal.AccountQueue do
       true ->
         {{:value, job}, remaining_queue} = :queue.out(state.queue)
 
-        # Enforce RPS — sleep if needed
+        # Enforce RPS with jitter to prevent synchronized bursts across queues
         now = System.system_time(:millisecond)
         interval_ms = trunc(1_000 / state.rps)
+        jitter_ms = :rand.uniform(trunc(interval_ms * 0.1) + 1)
         elapsed = now - state.last_request_at
 
         if elapsed < interval_ms do
-          Process.sleep(interval_ms - elapsed)
+          Process.sleep(interval_ms - elapsed + jitter_ms)
         end
 
         new_state = %{state |
