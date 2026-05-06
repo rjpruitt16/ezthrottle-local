@@ -31,7 +31,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   """
   def check_or_insert(%Job{} = job) do
     hashed = hash(job.idempotent_key)
-    expires_at = System.system_time(:millisecond) + ttl_ms()
+    expires_at = System.system_time(:millisecond) + ttl_ms(:queued)
 
     case :ets.lookup(@keys_table, hashed) do
       [{^hashed, existing_id, _expires_at, _status}] ->
@@ -49,11 +49,12 @@ defmodule EzthrottleLocal.IdempotentStore do
   """
   def update_status(job_id, status) do
     case :ets.lookup(@jobs_table, job_id) do
-      [{^job_id, job, expires_at, _old_status}] ->
-        :ets.insert(@jobs_table, {job_id, job, expires_at, status})
+      [{^job_id, job, _expires_at, _old_status}] ->
+        new_expires = System.system_time(:millisecond) + ttl_ms(status)
+        :ets.insert(@jobs_table, {job_id, job, new_expires, status})
         case :ets.match_object(@keys_table, {:_, job_id, :_, :_}) do
-          [{hashed, ^job_id, key_expires, _}] ->
-            :ets.insert(@keys_table, {hashed, job_id, key_expires, status})
+          [{hashed, ^job_id, _key_expires, _}] ->
+            :ets.insert(@keys_table, {hashed, job_id, new_expires, status})
           _ -> :ok
         end
         :ok
@@ -109,10 +110,9 @@ defmodule EzthrottleLocal.IdempotentStore do
     :crypto.hash(:sha256, key) |> Base.encode16(case: :lower)
   end
 
-  defp ttl_ms do
-    ttl_seconds = Application.get_env(:ezthrottle_local, :idempotent_ttl, 86_400)
-    ttl_seconds * 1_000
-  end
+  defp ttl_ms(:completed), do: 30 * 60 * 1_000
+  defp ttl_ms(:failed),    do: 2 * 60 * 60 * 1_000
+  defp ttl_ms(_),          do: Application.get_env(:ezthrottle_local, :idempotent_ttl, 86_400) * 1_000
 
   defp schedule_cleanup do
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
