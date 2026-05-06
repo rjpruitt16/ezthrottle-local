@@ -136,7 +136,7 @@ EZThrottle Local is best-effort: in-memory queues, single node, no retry on fail
 
 - **Multi-step workflows** — chain dependent API calls with conditional branching
 - **Partial outage recovery** — jobs survive pod restarts and region failures
-- **Guaranteed delivery** — automatic retry with backoff and dead-letter queues
+- **Regional delivery guarantee** — if a region is healthy, your job will be delivered. Automatic retry with backoff and dead-letter queues for visibility when it isn't
 - **Internal + external traffic** — protect both your own services and third-party APIs from the same control plane
 - **Distributed fairness** — per-tenant rate limiting across multiple nodes and regions
 
