@@ -75,6 +75,16 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   @doc """
+  Returns total jobs and queue depth from ETS for autoscaler headers.
+  """
+  def counts do
+    now = System.system_time(:millisecond)
+    total = :ets.select_count(@jobs_table, [{{:_, :_, :"$1", :_}, [{:>, :"$1", now}], [true]}])
+    queued = :ets.select_count(@jobs_table, [{{:_, :_, :"$1", :queued}, [{:>, :"$1", now}], [true]}])
+    %{total_jobs: total, queue_depth: queued}
+  end
+
+  @doc """
   Get the full Job struct by job_id. Returns the Job or nil.
   """
   def get_job(job_id) do

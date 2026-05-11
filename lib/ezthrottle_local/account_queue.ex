@@ -109,7 +109,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
         # Execute in a Task so the GenServer stays responsive
         parent = self()
-        Task.start(fn -> execute(job, parent) end)
+        Task.start(fn -> execute(job, parent, state.rps) end)
 
         {:noreply, new_state, @idle_timeout_ms}
     end
@@ -137,8 +137,8 @@ defmodule EzthrottleLocal.AccountQueue do
 
   # ---- Private ----
 
-  defp execute(%Job{} = job, parent) do
-    result = make_request(job)
+  defp execute(%Job{} = job, parent, flow_rate) do
+    result = make_request(job, flow_rate)
 
     case result do
       {:ok, %{status: status, body: body, headers: resp_headers}} ->
@@ -166,9 +166,15 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
-  defp make_request(%Job{} = job) do
+  defp make_request(%Job{} = job, flow_rate) do
+    %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()
     url = String.to_charlist(job.url)
-    headers = headers_to_charlist(job.headers |> Enum.map(fn {k, v} -> {k, v} end))
+    metric_headers = [
+      {"x-aquifer-total-jobs", to_string(total)},
+      {"x-aquifer-queue-depth", to_string(depth)},
+      {"x-aquifer-flow-rate", :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])}
+    ]
+    headers = headers_to_charlist(Enum.map(job.headers, fn {k, v} -> {k, v} end) ++ metric_headers)
 
     method = case String.upcase(job.method) do
       "GET" -> :get
