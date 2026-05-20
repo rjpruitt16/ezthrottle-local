@@ -1,4 +1,4 @@
-.PHONY: server test integration-test start-webhook stop-webhook
+.PHONY: server test integration-test start-webhook stop-webhook release
 
 # Start the Phoenix server
 server:
@@ -36,3 +36,11 @@ stop-webhook:
 		kill $$(cat test/integration/.webhook.pid) 2>/dev/null && echo "Webhook server stopped" || true; \
 		rm -f test/integration/.webhook.pid; \
 	fi
+
+release:
+	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=0.1.0"; exit 1; fi
+	@echo "Releasing v$(VERSION)..."
+	@git tag -a v$(VERSION) -m "Release v$(VERSION)"
+	@git push origin v$(VERSION)
+	@gh release create v$(VERSION) --title "v$(VERSION)" --generate-notes
+	@echo "Released v$(VERSION)!"
