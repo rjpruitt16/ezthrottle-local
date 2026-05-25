@@ -20,10 +20,17 @@ integration-test: start-webhook
 		--variable WEBHOOK_CALLBACK_URL=http://localhost:9090/webhook \
 		--variable timestamp=$$(date +%s) \
 		test/integration/*.hurl || \
-		(echo "Test failed"; make stop-webhook; exit 1)
+		(echo "Hurl tests failed"; make stop-webhook; exit 1)
+	@echo ""
+	@echo "Running SSE streaming tests..."
+	@EZTHROTTLE_URL=http://localhost:4000 \
+		WEBHOOK_URL=http://localhost:9090 \
+		WEBHOOK_CALLBACK_URL=http://localhost:9090/webhook \
+		python3 test/integration/test_stream.py || \
+		(echo "Streaming tests failed"; make stop-webhook; exit 1)
 	@make stop-webhook
 	@echo ""
-	@echo "Integration tests passed!"
+	@echo "All integration tests passed!"
 
 start-webhook:
 	@echo "Starting webhook server on port 9090..."
