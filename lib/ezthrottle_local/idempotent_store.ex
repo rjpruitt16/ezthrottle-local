@@ -16,6 +16,7 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   @keys_table :idempotent_keys
   @jobs_table :jobs
+  @delivery_table :job_delivery_modes
   @cleanup_interval_ms 60_000
 
   # ---- Public API ----
@@ -94,12 +95,31 @@ defmodule EzthrottleLocal.IdempotentStore do
     end
   end
 
+  @doc """
+  Set delivery mode for a job. :webhook (default), :stream, :stream_fallback.
+  """
+  def set_delivery_mode(job_id, mode) do
+    :ets.insert(@delivery_table, {job_id, mode})
+    :ok
+  end
+
+  @doc """
+  Get delivery mode for a job. Returns :webhook if not set.
+  """
+  def get_delivery_mode(job_id) do
+    case :ets.lookup(@delivery_table, job_id) do
+      [{^job_id, mode}] -> mode
+      [] -> :webhook
+    end
+  end
+
   # ---- GenServer Callbacks ----
 
   @impl true
   def init(_) do
     :ets.new(@keys_table, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
     :ets.new(@jobs_table, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
+    :ets.new(@delivery_table, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
     schedule_cleanup()
     {:ok, %{}}
   end

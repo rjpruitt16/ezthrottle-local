@@ -138,12 +138,25 @@ defmodule EzthrottleLocal.AccountQueue do
   # ---- Private ----
 
   defp execute(%Job{} = job, parent, flow_rate) do
+    Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
+      event: "dispatching",
+      job_id: job.id
+    }})
+
     result = make_request(job, flow_rate)
 
     case result do
       {:ok, %{status: status, body: body, headers: resp_headers}} ->
         IdempotentStore.update_status(job.id, :completed)
-        Webhook.deliver(job.webhook_url, %{
+
+        Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
+          event: "completed",
+          job_id: job.id,
+          response_status: status,
+          body: body
+        }})
+
+        maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, %{
           job_id: job.id,
           status: "completed",
           response_status: status,
@@ -156,7 +169,14 @@ defmodule EzthrottleLocal.AccountQueue do
 
       {:error, reason} ->
         IdempotentStore.update_status(job.id, :failed)
-        Webhook.deliver(job.webhook_url, %{
+
+        Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
+          event: "failed",
+          job_id: job.id,
+          reason: inspect(reason)
+        }})
+
+        maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, %{
           job_id: job.id,
           status: "failed",
           reason: inspect(reason)
@@ -165,6 +185,9 @@ defmodule EzthrottleLocal.AccountQueue do
         send(parent, {:job_done, nil, nil})
     end
   end
+
+  defp maybe_deliver_webhook(:stream, _job, _payload), do: :ok
+  defp maybe_deliver_webhook(_mode, job, payload), do: Webhook.deliver(job.webhook_url, payload)
 
   defp make_request(%Job{} = job, flow_rate) do
     %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()

@@ -13,6 +13,10 @@ defmodule EzthrottleLocalWeb.Router do
     get "/health", HealthController, :index
   end
 
+  scope "/", EzthrottleLocalWeb do
+    get "/jobs/:id/stream", JobStreamController, :stream
+  end
+
   # Enable LiveDashboard in development
   if Application.compile_env(:ezthrottle_local, :dev_routes) do
     # If you want to use the LiveDashboard in production, you should put
