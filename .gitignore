@@ -25,3 +25,7 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 ezthrottle_local-*.tar
 
+# L8 protocol — generated keys and trust cache
+.l8-key
+/l8-trust/
+

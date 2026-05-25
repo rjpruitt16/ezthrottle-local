@@ -11,6 +11,7 @@ defmodule EzthrottleLocal.Application do
       EzthrottleLocalWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:ezthrottle_local, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: EzthrottleLocal.PubSub},
+      EzthrottleLocal.L8,
       EzthrottleLocal.IdempotentStore,
       EzthrottleLocal.AccountQueueRegistry,
       EzthrottleLocalWeb.Endpoint

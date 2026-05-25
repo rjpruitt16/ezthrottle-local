@@ -1,4 +1,4 @@
-.PHONY: server test integration-test start-webhook stop-webhook release
+.PHONY: server test integration-test l8-test start-server stop-server start-webhook stop-webhook start-l8-receiver stop-l8-receiver release
 
 # Start the Phoenix server
 server:
@@ -10,7 +10,7 @@ test:
 
 # ---- Integration Tests ----
 
-integration-test: start-webhook
+integration-test: start-server start-webhook
 	@echo "Running integration tests against http://localhost:4000"
 	@echo "Webhook server on http://localhost:9090"
 	@echo ""
@@ -20,29 +20,59 @@ integration-test: start-webhook
 		--variable WEBHOOK_CALLBACK_URL=http://localhost:9090/webhook \
 		--variable timestamp=$$(date +%s) \
 		test/integration/*.hurl || \
-		(echo "Hurl tests failed"; make stop-webhook; exit 1)
+		(make stop-webhook stop-server; exit 1)
 	@echo ""
 	@echo "Running SSE streaming tests..."
 	@EZTHROTTLE_URL=http://localhost:4000 \
 		WEBHOOK_URL=http://localhost:9090 \
 		WEBHOOK_CALLBACK_URL=http://localhost:9090/webhook \
 		python3 test/integration/test_stream.py || \
-		(echo "Streaming tests failed"; make stop-webhook; exit 1)
-	@make stop-webhook
+		(make stop-webhook stop-server; exit 1)
+	@make stop-webhook stop-server
 	@echo ""
 	@echo "All integration tests passed!"
 
+l8-test: start-server start-webhook start-l8-receiver
+	@echo "Running L8 protocol tests..."
+	@echo "  ezthrottle: http://localhost:4000"
+	@echo "  target:     http://localhost:9090/health"
+	@echo "  receiver:   http://localhost:9001"
+	@echo ""
+	@EZTHROTTLE_URL=http://localhost:4000 \
+		TARGET_URL=http://localhost:9090/health \
+		RECEIVER_URL=http://localhost:9001 \
+		python3 test/integration/test_l8.py || \
+		(make stop-l8-receiver stop-webhook stop-server; exit 1)
+	@make stop-l8-receiver stop-webhook stop-server
+
+# ---- Server lifecycle (kill by port — no pid files) ----
+
+start-server:
+	@echo "Starting ezthrottle-local on port 4000..."
+	@PORT=4000 mix run --no-halt > /tmp/ezthrottle_local.log 2>&1 &
+	@until curl -s http://localhost:4000/health > /dev/null 2>&1; do sleep 0.5; done
+	@echo "Server ready"
+
+stop-server:
+	@lsof -ti :4000 | xargs kill 2>/dev/null || true
+
 start-webhook:
 	@echo "Starting webhook server on port 9090..."
-	@python3 test/integration/webhook_server.py 9090 > /tmp/webhook_9090.log 2>&1 & echo $$! > test/integration/.webhook.pid
-	@sleep 1
-	@echo "Webhook server started (PID $$(cat test/integration/.webhook.pid))"
+	@python3 test/integration/webhook_server.py 9090 > /tmp/webhook_9090.log 2>&1 &
+	@until curl -s http://localhost:9090/health > /dev/null 2>&1; do sleep 0.5; done
+	@echo "Webhook server ready"
 
 stop-webhook:
-	@if [ -f test/integration/.webhook.pid ]; then \
-		kill $$(cat test/integration/.webhook.pid) 2>/dev/null && echo "Webhook server stopped" || true; \
-		rm -f test/integration/.webhook.pid; \
-	fi
+	@lsof -ti :9090 | xargs kill 2>/dev/null || true
+
+start-l8-receiver:
+	@echo "Starting L8 receiver on port 9001..."
+	@python3 test/integration/l8_receiver.py > /tmp/l8_receiver_9001.log 2>&1 &
+	@until curl -s http://localhost:9001/.well-known/l8 > /dev/null 2>&1; do sleep 0.5; done
+	@echo "L8 receiver ready"
+
+stop-l8-receiver:
+	@lsof -ti :9001 | xargs kill 2>/dev/null || true
 
 release:
 	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=0.1.0"; exit 1; fi

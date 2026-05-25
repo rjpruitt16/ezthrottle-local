@@ -144,6 +144,41 @@ config :ezthrottle_local,
   idempotent_ttl: 86_400          # seconds
 ```
 
+## L8 Protocol — trustless webhook delivery
+
+Traditional webhook security shares a secret between sender and receiver. That secret can be stolen, logged by accident, or forgotten to rotate — and a compromised secret lets anyone forge deliveries silently.
+
+EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol built on Ed25519 public key cryptography. There is no shared secret to steal.
+
+**How it works:**
+
+1. Your webhook receiver publishes a public key at `GET /.well-known/l8`
+2. Before the first delivery, EZThrottle challenges the receiver to prove ownership of the corresponding private key — a one-time handshake per domain
+3. Trust is cached to disk as `l8-trust/{domain}.json` — the handshake never runs again for that domain
+4. Every webhook delivery carries `X-L8-Signature` headers the receiver verifies locally — no database query, no round-trip, microseconds
+
+**Why this keeps things fast:** Verification is a single local Ed25519 `verify()` call against a cached public key. No shared state, no HTTP call.
+
+**Key management:**
+
+Set `L8_PRIVATE_KEY` (base64 Ed25519 private key) for a stable identity across restarts. Without it, EZThrottle auto-generates a key and saves it to `.l8-key` on first start.
+
+To revoke trust with a domain: delete `l8-trust/{domain}.json`. The handshake re-runs on next delivery.
+
+**EZThrottle exposes:**
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /.well-known/l8` | EZThrottle's public key — receivers discover it here |
+| `POST /l8/challenge` | Handles incoming challenges from receivers verifying EZThrottle's identity |
+| `GET /l8-spec` | Full L8 protocol spec |
+
+**Graceful degradation:** L8 is opt-in. If a receiver doesn't implement `/.well-known/l8`, delivery proceeds unsigned. Receivers that don't support L8 are completely unaffected.
+
+The full protocol spec is at [rjpruitt16.github.io/l8-protocol](https://rjpruitt16.github.io/l8-protocol/) and browsable at `GET /l8-spec` on any running instance.
+
+---
+
 ## Running locally
 
 ```bash
@@ -155,6 +190,12 @@ Integration tests (requires `hurl` and Python 3 with Flask):
 
 ```bash
 make integration-test
+```
+
+L8 protocol tests (verifies handshake, signed delivery, and cryptographic signature — requires `pip install cryptography`):
+
+```bash
+make l8-test
 ```
 
 ## Docker

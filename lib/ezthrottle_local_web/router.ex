@@ -11,6 +11,9 @@ defmodule EzthrottleLocalWeb.Router do
     post "/jobs", JobController, :create
     get "/jobs/:id", JobController, :show
     get "/health", HealthController, :index
+    get "/.well-known/l8", L8Controller, :well_known
+    post "/l8/challenge", L8Controller, :challenge
+    get "/l8-spec", L8Controller, :spec
   end
 
   scope "/", EzthrottleLocalWeb do

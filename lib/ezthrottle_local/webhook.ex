@@ -1,8 +1,7 @@
 defmodule EzthrottleLocal.Webhook do
   @moduledoc """
-  Webhook delivery with exponential backoff.
+  Webhook delivery with exponential backoff and optional L8 signed headers.
   Retries up to @max_retries times on non-2xx or connection error.
-  Use EZThrottle Cloud for guaranteed delivery with persistence.
   """
 
   require Logger
@@ -13,17 +12,14 @@ defmodule EzthrottleLocal.Webhook do
 
   def deliver(url, payload, attempt) when attempt < @max_retries do
     body = Jason.encode!(payload)
+    EzthrottleLocal.L8.ensure_trust(url)
+    l8_headers = l8_headers_for(url, body)
 
-    case :httpc.request(
-      :post,
-      {String.to_charlist(url), [], ~c"application/json", String.to_charlist(body)},
-      [{:timeout, 5_000}],
-      []
-    ) do
-      {:ok, {{_, status, _}, _headers, _body}} when status in 200..299 ->
+    case do_post(url, body, l8_headers) do
+      {:ok, status} when status in 200..299 ->
         :ok
 
-      {:ok, {{_, status, _}, _headers, _body}} ->
+      {:ok, status} ->
         backoff = backoff_ms(attempt)
         Logger.warning("[Webhook] #{status} from #{url}, retry #{attempt + 1}/#{@max_retries} in #{backoff}ms")
         Process.sleep(backoff)
@@ -39,23 +35,42 @@ defmodule EzthrottleLocal.Webhook do
 
   def deliver(url, payload, _attempt) do
     body = Jason.encode!(payload)
+    EzthrottleLocal.L8.ensure_trust(url)
+    l8_headers = l8_headers_for(url, body)
 
-    case :httpc.request(
-      :post,
-      {String.to_charlist(url), [], ~c"application/json", String.to_charlist(body)},
-      [{:timeout, 5_000}],
-      []
-    ) do
-      {:ok, {{_, status, _}, _headers, _body}} when status in 200..299 ->
+    case do_post(url, body, l8_headers) do
+      {:ok, status} when status in 200..299 ->
         :ok
 
-      {:ok, {{_, status, _}, _headers, _body}} ->
+      {:ok, status} ->
         Logger.warning("[Webhook] Giving up after #{@max_retries} retries, last status #{status} for #{url}")
         :error
 
       {:error, reason} ->
         Logger.warning("[Webhook] Giving up after #{@max_retries} retries for #{url}: #{inspect(reason)}")
         :error
+    end
+  end
+
+  defp do_post(url, body, extra_headers) do
+    headers = Enum.map(extra_headers, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
+
+    case :httpc.request(
+      :post,
+      {String.to_charlist(url), headers, ~c"application/json", String.to_charlist(body)},
+      [{:timeout, 5_000}],
+      []
+    ) do
+      {:ok, {{_, status, _}, _headers, _body}} -> {:ok, status}
+      {:error, reason}                          -> {:error, reason}
+    end
+  end
+
+  defp l8_headers_for(url, body) do
+    if EzthrottleLocal.L8.is_trusted?(url) do
+      EzthrottleLocal.L8.sign_headers(body)
+    else
+      %{}
     end
   end
 
