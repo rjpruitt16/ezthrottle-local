@@ -19,7 +19,8 @@ import uuid
 EZTHROTTLE_URL = os.getenv("EZTHROTTLE_URL", "http://localhost:4000")
 WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "http://localhost:9090")
 WEBHOOK_CB     = os.getenv("WEBHOOK_CALLBACK_URL", "http://localhost:9090/webhook")
-TARGET_URL     = os.getenv("TARGET_URL", "https://httpbin.org/get")
+TARGET_URL      = os.getenv("TARGET_URL", "https://httpbin.org/get")
+LOCAL_TARGET    = os.getenv("LOCAL_TARGET", "http://localhost:9090/health")
 
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -169,16 +170,32 @@ def test_disconnect_fallback():
 
 # ---- Test 3: Position counts down ----------------------------------------
 
+def submit_local_job(user_id="test-user", extra_headers=None):
+    """Submit a job to the local target server so the queue drains predictably."""
+    payload = {
+        "user_id": user_id,
+        "idempotent_key": str(uuid.uuid4()),
+        "url": LOCAL_TARGET,
+        "method": "GET",
+        "headers": extra_headers or {},
+        "webhook_url": WEBHOOK_CB,
+    }
+    r = requests.post(f"{EZTHROTTLE_URL}/jobs", json=payload, timeout=5)
+    r.raise_for_status()
+    return r.json()["job_id"]
+
+
 def test_position_updates():
     print("\nTest 3: Position updates count down as queue drains")
     reset()
 
-    # Submit 3 jobs under the same user+api_key so they share a queue.
-    # Use a shared api_key header to force them into the same AccountQueue.
+    # 8 jobs under the same queue key. At 2 RPS they take ~4 seconds to drain —
+    # long enough for the 2-second timer to fire at least once mid-drain.
     shared_headers = {"x-api-key": "test-key-position"}
-    job_ids = [submit_job(user_id="position-user", extra_headers=shared_headers) for _ in range(3)]
+    # 20 jobs at 2 RPS = ~10s to drain, timer fires every 2s — plenty of countdown ticks
+    job_ids = [submit_local_job(user_id="position-user", extra_headers=shared_headers) for _ in range(20)]
 
-    # Watch the last job — it starts at position 3 and should count down
+    # Watch the last job — it starts deep in the queue and should count down
     last_job_id = job_ids[-1]
     events = collect_sse_events(last_job_id, stop_after="completed", timeout=60)
 
@@ -195,8 +212,8 @@ def test_position_updates():
     else:
         fail("initial position is > 1", f"got {positions[0]} — jobs may not have shared a queue")
 
-    if positions == sorted(positions, reverse=True) or positions[-1] <= positions[0]:
-        ok("position counts down over time")
+    if positions[-1] < positions[0]:
+        ok(f"position counts down over time ({positions[0]} → {positions[-1]})")
     else:
         fail("position counts down over time", f"positions={positions}")
 

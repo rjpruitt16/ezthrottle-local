@@ -22,10 +22,24 @@ defmodule EzthrottleLocalWeb.JobStreamController do
           |> put_resp_header("connection", "keep-alive")
           |> send_chunked(200)
 
+        # Send catchup events for any states already passed before client connected
         status = IdempotentStore.get_status(job_id)
-        {:ok, conn} = chunk(conn, sse_event("queued", %{job_id: job_id, status: status}))
+        conn = send_catchup_events(conn, job_id, status)
 
         listen_loop(conn, job)
+    end
+  end
+
+  # Send synthetic events for states the client missed by connecting late
+  defp send_catchup_events(conn, job_id, status) do
+    {:ok, conn} = chunk(conn, sse_event("queued", %{job_id: job_id, status: "queued"}))
+
+    case status do
+      s when s in ["in_flight", "completed", "failed"] ->
+        {:ok, conn} = chunk(conn, sse_event("dispatching", %{job_id: job_id}))
+        conn
+      _ ->
+        conn
     end
   end
 
@@ -51,10 +65,25 @@ defmodule EzthrottleLocalWeb.JobStreamController do
     end
   end
 
-  defp handle_disconnect(job, event, data) when event in ["completed", "failed"] do
-    Webhook.deliver(job.webhook_url, Map.put(data, :job_id, job.id))
+  # Stream died on the final event — fire webhook with normalized payload
+  defp handle_disconnect(job, "completed", data) do
+    Webhook.deliver(job.webhook_url, %{
+      job_id: job.id,
+      status: "completed",
+      response_status: data[:response_status],
+      body: data[:body]
+    })
   end
 
+  defp handle_disconnect(job, "failed", data) do
+    Webhook.deliver(job.webhook_url, %{
+      job_id: job.id,
+      status: "failed",
+      reason: data[:reason]
+    })
+  end
+
+  # Stream died mid-job — AccountQueue fires webhook on completion
   defp handle_disconnect(job, _event, _data) do
     IdempotentStore.set_delivery_mode(job.id, :stream_fallback)
   end

@@ -157,6 +157,7 @@ defmodule EzthrottleLocal.AccountQueue do
   # ---- Private ----
 
   defp execute(%Job{} = job, parent, flow_rate) do
+    IdempotentStore.update_status(job.id, :in_flight)
     Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
       event: "dispatching",
       job_id: job.id
