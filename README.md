@@ -10,16 +10,18 @@ Kubernetes and modern orchestrators are great at scaling compute — but they we
 
 ```
 Client → POST /jobs → EZThrottle Local → paced outbound requests → Your API
-                                      ↓
-                               webhook delivery
-                                      ↓
-                                  Your App
+              ↓                                                          ↓
+     GET /jobs/:id/stream                                        response body
+              ↓                                                          ↓
+     live event stream ←─────────────────────────────────────────────────
+              ↓
+     (or webhook if stream drops)
 ```
 
 1. **Submit a job** — POST the request you want forwarded, with a `webhook_url` for the response.
 2. **EZThrottle queues it** — Jobs are held in memory and dispatched at the configured RPS.
 3. **Your API responds** — EZThrottle reads `X-EZTHROTTLE-RPS` and `X-EZTHROTTLE-MAX-CONCURRENT` headers from the response and adjusts pace automatically.
-4. **Webhook delivery** — The response body and status are POSTed to your `webhook_url`.
+4. **Stay on the line or hang up** — open `GET /jobs/:id/stream` to receive live events as the job moves through the queue, or disconnect and the result is delivered to your `webhook_url` when ready.
 
 ## Per-tenant fairness (AccountQueue mode)
 
@@ -34,6 +36,52 @@ EZThrottle switches to per-user isolation — each `user_id` + API key gets its 
 Critically, each user can run at a **different pace**. If your service processes requests from user A faster than user B — because of their tier, their data size, or just load at that moment — each user's queue drains independently at the rate their own responses signal back. A premium user responding with `X-EZTHROTTLE-RPS: 50` runs at 50 RPS while a free-tier user on `X-EZTHROTTLE-RPS: 2` runs at 2, in parallel, without either affecting the other.
 
 Disable it any time by responding with `X-EZTHROTTLE-ACCOUNT-QUEUE: disabled`.
+
+## Streaming — stay on the line or get a voicemail
+
+Most queue systems force you to choose: poll for status or hope the webhook lands. EZThrottle gives you a third option — an open SSE stream that tells you exactly what's happening in real time.
+
+```bash
+# Submit a job
+curl -X POST http://localhost:4000/jobs -d '{...}'
+# → { "job_id": "abc123" }
+
+# Stay on the line
+curl -N http://localhost:4000/jobs/abc123/stream
+```
+
+```
+event: queued
+data: {"job_id":"abc123","status":"queued"}
+
+event: position
+data: {"job_id":"abc123","position":4}
+
+event: position
+data: {"job_id":"abc123","position":2}
+
+event: dispatching
+data: {"job_id":"abc123"}
+
+event: completed
+data: {"job_id":"abc123","response_status":200,"body":"..."}
+```
+
+**If the stream drops before completion, the result is delivered to your `webhook_url` automatically.** You never lose the response — stream for the happy path, webhook as the guaranteed fallback.
+
+### Queue position for agent fleets
+
+When multiple agents share the same API key, they share the same queue. The `position` event tells each agent where it stands:
+
+```
+position: 12 → the line is long, go work on something else
+position: 3  → getting close, stay on the line
+dispatching  → your turn
+```
+
+An agent that sees position 12 can disconnect, pick up other work, and trust the webhook will arrive when the job is done. An agent at position 1 stays on the line and streams the response as tokens arrive.
+
+This is the same pattern TCP brought to packet delivery at Layer 4 — coordination built into the infrastructure so every client doesn't have to solve it independently. At Layer 7, for API workflows, the queue is the protocol.
 
 ## API
 
@@ -61,6 +109,14 @@ Content-Type: application/json
 | `X-EZTHROTTLE-RPS: 10` | Raise or lower requests per second |
 | `X-EZTHROTTLE-MAX-CONCURRENT: 5` | Change max in-flight requests |
 | `X-EZTHROTTLE-ACCOUNT-QUEUE: enabled` | Switch to per-tenant queue isolation |
+
+### Stream job events (SSE)
+
+```bash
+GET /jobs/:id/stream
+```
+
+Opens a server-sent event stream. Events: `queued`, `position`, `dispatching`, `completed`, `failed`. Keepalive pings sent every 30 seconds. If you disconnect before completion, the result is delivered to your `webhook_url`.
 
 ### Check job status
 
