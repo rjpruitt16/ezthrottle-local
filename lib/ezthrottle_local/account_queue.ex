@@ -16,6 +16,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @idle_timeout_ms 300_000
   @min_rps 0.5
+  @position_broadcast_ms 2_000
 
   defstruct [
     :queue_key,
@@ -57,6 +58,7 @@ defmodule EzthrottleLocal.AccountQueue do
       max_concurrent: max_concurrent
     }
 
+    schedule_position_broadcast()
     {:ok, state, @idle_timeout_ms}
   end
 
@@ -127,6 +129,23 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   @impl true
+  def handle_info(:broadcast_positions, state) do
+    state.queue
+    |> :queue.to_list()
+    |> Enum.with_index(1)
+    |> Enum.each(fn {job, position} ->
+      Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
+        event: "position",
+        job_id: job.id,
+        position: position
+      }})
+    end)
+
+    schedule_position_broadcast()
+    {:noreply, state, @idle_timeout_ms}
+  end
+
+  @impl true
   def handle_info(:timeout, state) do
     if :queue.is_empty(state.queue) and state.in_flight == 0 do
       {:stop, :normal, state}
@@ -188,6 +207,10 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp maybe_deliver_webhook(:stream, _job, _payload), do: :ok
   defp maybe_deliver_webhook(_mode, job, payload), do: Webhook.deliver(job.webhook_url, payload)
+
+  defp schedule_position_broadcast do
+    Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
+  end
 
   defp make_request(%Job{} = job, flow_rate) do
     %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()
