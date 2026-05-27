@@ -75,11 +75,12 @@ defmodule EzthrottleLocal.UrlActor do
 
   @impl true
   def handle_call({:enqueue, job}, _from, state) do
-    queue_key = if state.account_queue_enabled do
-      Job.queue_key(job)
-    else
-      @shared_queue_key
-    end
+    queue_key =
+      if state.account_queue_enabled do
+        Job.queue_key(job)
+      else
+        @shared_queue_key
+      end
 
     {queue_pid, new_state} = find_or_spawn_queue(queue_key, state)
     AccountQueue.enqueue(queue_pid, job)
@@ -88,10 +89,21 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   @impl true
+  def handle_call({:account_queue_header, "enabled"}, _from, state) do
+    {:reply, :ok, %{state | account_queue_enabled: true}, @idle_timeout_ms}
+  end
+
+  @impl true
+  def handle_call({:account_queue_header, "disabled"}, _from, state) do
+    {:reply, :ok, %{state | account_queue_enabled: false}, @idle_timeout_ms}
+  end
+
+  @impl true
   def handle_cast({:update_rps, rps}, state) do
     Enum.each(state.queues, fn {_key, pid} ->
       AccountQueue.update_rps(pid, rps)
     end)
+
     {:noreply, %{state | rps: rps}, @idle_timeout_ms}
   end
 
@@ -100,6 +112,7 @@ defmodule EzthrottleLocal.UrlActor do
     Enum.each(state.queues, fn {_key, pid} ->
       AccountQueue.update_max_concurrent(pid, max)
     end)
+
     {:noreply, %{state | max_concurrent: max}, @idle_timeout_ms}
   end
 
@@ -143,11 +156,14 @@ defmodule EzthrottleLocal.UrlActor do
   defp find_or_spawn_queue(queue_key, state) do
     case Map.get(state.queues, queue_key) do
       nil ->
-        {:ok, pid} = AccountQueue.start_link(
-          queue_key: queue_key,
-          rps: state.rps,
-          max_concurrent: state.max_concurrent
-        )
+        {:ok, pid} =
+          AccountQueue.start_link(
+            queue_key: queue_key,
+            url_actor: self(),
+            rps: state.rps,
+            max_concurrent: state.max_concurrent
+          )
+
         Process.monitor(pid)
         new_state = %{state | queues: Map.put(state.queues, queue_key, pid)}
         {pid, new_state}

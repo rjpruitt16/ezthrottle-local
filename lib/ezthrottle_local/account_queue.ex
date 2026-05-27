@@ -20,6 +20,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defstruct [
     :queue_key,
+    :url_actor,
     rps: 2.0,
     max_concurrent: 1,
     queue: :queue.new(),
@@ -33,7 +34,14 @@ defmodule EzthrottleLocal.AccountQueue do
     queue_key = Keyword.fetch!(opts, :queue_key)
     rps = Keyword.get(opts, :rps, 2.0)
     max_concurrent = Keyword.get(opts, :max_concurrent, 1)
-    GenServer.start_link(__MODULE__, %{queue_key: queue_key, rps: rps, max_concurrent: max_concurrent})
+    url_actor = Keyword.get(opts, :url_actor)
+
+    GenServer.start_link(__MODULE__, %{
+      queue_key: queue_key,
+      url_actor: url_actor,
+      rps: rps,
+      max_concurrent: max_concurrent
+    })
   end
 
   def enqueue(pid, %Job{} = job) do
@@ -51,9 +59,15 @@ defmodule EzthrottleLocal.AccountQueue do
   # ---- GenServer Callbacks ----
 
   @impl true
-  def init(%{queue_key: queue_key, rps: rps, max_concurrent: max_concurrent}) do
+  def init(%{
+        queue_key: queue_key,
+        url_actor: url_actor,
+        rps: rps,
+        max_concurrent: max_concurrent
+      }) do
     state = %__MODULE__{
       queue_key: queue_key,
+      url_actor: url_actor,
       rps: rps,
       max_concurrent: max_concurrent
     }
@@ -103,15 +117,19 @@ defmodule EzthrottleLocal.AccountQueue do
           Process.sleep(interval_ms - elapsed + jitter_ms)
         end
 
-        new_state = %{state |
-          queue: remaining_queue,
-          in_flight: state.in_flight + 1,
-          last_request_at: System.system_time(:millisecond)
+        new_state = %{
+          state
+          | queue: remaining_queue,
+            in_flight: state.in_flight + 1,
+            last_request_at: System.system_time(:millisecond)
         }
 
         # Execute in a Task so the GenServer stays responsive
         parent = self()
-        Task.start(fn -> execute(job, parent, state.rps) end)
+
+        Task.start(fn ->
+          execute(job, parent, state.rps, state.max_concurrent, state.queue_key)
+        end)
 
         {:noreply, new_state, @idle_timeout_ms}
     end
@@ -119,10 +137,12 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info({:job_done, rps_header, max_concurrent_header}, state) do
-    new_state = state
-    |> maybe_update_rps(rps_header)
-    |> maybe_update_max_concurrent(max_concurrent_header)
-    |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+    handle_info({:job_done, rps_header, max_concurrent_header, nil}, state)
+  end
+
+  @impl true
+  def handle_info({:job_done, rps_header, max_concurrent_header, account_queue_header}, state) do
+    new_state = apply_job_done(state, rps_header, max_concurrent_header, account_queue_header)
 
     send(self(), :process_next)
     {:noreply, new_state, @idle_timeout_ms}
@@ -134,11 +154,16 @@ defmodule EzthrottleLocal.AccountQueue do
     |> :queue.to_list()
     |> Enum.with_index(1)
     |> Enum.each(fn {job, position} ->
-      Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
-        event: "position",
-        job_id: job.id,
-        position: position
-      }})
+      Phoenix.PubSub.broadcast(
+        EzthrottleLocal.PubSub,
+        "job:#{job.id}",
+        {:job_event,
+         %{
+           event: "position",
+           job_id: job.id,
+           position: position
+         }}
+      )
     end)
 
     schedule_position_broadcast()
@@ -154,27 +179,55 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
+  @impl true
+  def handle_call(
+        {:job_done, rps_header, max_concurrent_header, account_queue_header},
+        _from,
+        state
+      ) do
+    new_state = apply_job_done(state, rps_header, max_concurrent_header, account_queue_header)
+
+    send(self(), :process_next)
+    {:reply, :ok, new_state, @idle_timeout_ms}
+  end
+
   # ---- Private ----
 
-  defp execute(%Job{} = job, parent, flow_rate) do
+  defp execute(%Job{} = job, parent, flow_rate, max_concurrent, queue_key) do
     IdempotentStore.update_status(job.id, :in_flight)
-    Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
-      event: "dispatching",
-      job_id: job.id
-    }})
 
-    result = make_request(job, flow_rate)
+    Phoenix.PubSub.broadcast(
+      EzthrottleLocal.PubSub,
+      "job:#{job.id}",
+      {:job_event,
+       %{
+         event: "dispatching",
+         job_id: job.id
+       }}
+    )
+
+    result = make_request(job, flow_rate, max_concurrent, queue_key)
 
     case result do
       {:ok, %{status: status, body: body, headers: resp_headers}} ->
+        rps = parse_rps_header(resp_headers)
+        max_concurrent = parse_max_concurrent_header(resp_headers)
+        account_queue = parse_account_queue_header(resp_headers)
+        GenServer.call(parent, {:job_done, rps, max_concurrent, account_queue})
+
         IdempotentStore.update_status(job.id, :completed)
 
-        Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
-          event: "completed",
-          job_id: job.id,
-          response_status: status,
-          body: body
-        }})
+        Phoenix.PubSub.broadcast(
+          EzthrottleLocal.PubSub,
+          "job:#{job.id}",
+          {:job_event,
+           %{
+             event: "completed",
+             job_id: job.id,
+             response_status: status,
+             body: body
+           }}
+        )
 
         maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, %{
           job_id: job.id,
@@ -183,26 +236,27 @@ defmodule EzthrottleLocal.AccountQueue do
           body: body
         })
 
-        rps = parse_rps_header(resp_headers)
-        max_concurrent = parse_max_concurrent_header(resp_headers)
-        send(parent, {:job_done, rps, max_concurrent})
-
       {:error, reason} ->
+        GenServer.call(parent, {:job_done, nil, nil, nil})
+
         IdempotentStore.update_status(job.id, :failed)
 
-        Phoenix.PubSub.broadcast(EzthrottleLocal.PubSub, "job:#{job.id}", {:job_event, %{
-          event: "failed",
-          job_id: job.id,
-          reason: inspect(reason)
-        }})
+        Phoenix.PubSub.broadcast(
+          EzthrottleLocal.PubSub,
+          "job:#{job.id}",
+          {:job_event,
+           %{
+             event: "failed",
+             job_id: job.id,
+             reason: inspect(reason)
+           }}
+        )
 
         maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, %{
           job_id: job.id,
           status: "failed",
           reason: inspect(reason)
         })
-
-        send(parent, {:job_done, nil, nil})
     end
   end
 
@@ -213,40 +267,57 @@ defmodule EzthrottleLocal.AccountQueue do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
   end
 
-  defp make_request(%Job{} = job, flow_rate) do
+  defp make_request(%Job{} = job, flow_rate, max_concurrent, queue_key) do
     %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()
     url = String.to_charlist(job.url)
+    account_queue_enabled = queue_key != :shared
+    queue_key_header = if account_queue_enabled, do: to_string(queue_key), else: "shared"
+
     metric_headers = [
       {"x-aquifer-total-jobs", to_string(total)},
       {"x-aquifer-queue-depth", to_string(depth)},
-      {"x-aquifer-flow-rate", :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])}
+      {"x-aquifer-flow-rate", :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])},
+      {"x-ezthrottle-current-total-jobs", to_string(total)},
+      {"x-ezthrottle-current-queue-depth", to_string(depth)},
+      {"x-ezthrottle-current-flow-rate",
+       :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])},
+      {"x-ezthrottle-current-max-concurrent", to_string(max_concurrent)},
+      {"x-ezthrottle-current-account-queue-enabled", to_string(account_queue_enabled)},
+      {"x-ezthrottle-current-queue-key", queue_key_header},
+      {"x-ezthrottle-current-queue-mode",
+       if(account_queue_enabled, do: "account", else: "shared")}
     ]
-    headers = headers_to_charlist(Enum.map(job.headers, fn {k, v} -> {k, v} end) ++ metric_headers)
 
-    method = case String.upcase(job.method) do
-      "GET" -> :get
-      "POST" -> :post
-      "PUT" -> :put
-      "PATCH" -> :patch
-      "DELETE" -> :delete
-      _ -> :get
-    end
+    headers =
+      headers_to_charlist(Enum.map(job.headers, fn {k, v} -> {k, v} end) ++ metric_headers)
+
+    method =
+      case String.upcase(job.method) do
+        "GET" -> :get
+        "POST" -> :post
+        "PUT" -> :put
+        "PATCH" -> :patch
+        "DELETE" -> :delete
+        _ -> :get
+      end
 
     # :httpc uses {url, headers} for bodyless methods, {url, headers, content_type, body} for body methods
-    request = if method in [:post, :put, :patch] do
-      body = job.body || ""
-      {url, headers, ~c"application/json", body}
-    else
-      {url, headers}
-    end
+    request =
+      if method in [:post, :put, :patch] do
+        body = job.body || ""
+        {url, headers, ~c"application/json", body}
+      else
+        {url, headers}
+      end
 
     case :httpc.request(method, request, [], []) do
       {:ok, {{_, status, _}, resp_headers, resp_body}} ->
-        {:ok, %{
-          status: status,
-          body: to_string(resp_body),
-          headers: charlist_headers_to_map(resp_headers)
-        }}
+        {:ok,
+         %{
+           status: status,
+           body: to_string(resp_body),
+           headers: charlist_headers_to_map(resp_headers)
+         }}
 
       {:error, reason} ->
         {:error, reason}
@@ -259,13 +330,15 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp charlist_headers_to_map(headers) do
     Enum.reduce(headers, %{}, fn {k, v}, acc ->
-      Map.put(acc, to_string(k), to_string(v))
+      Map.put(acc, k |> to_string() |> String.downcase(), to_string(v))
     end)
   end
 
   defp parse_rps_header(headers) when is_map(headers) do
     case Map.get(headers, "x-ezthrottle-rps") do
-      nil -> nil
+      nil ->
+        nil
+
       val ->
         case Float.parse(val) do
           {rps, _} -> rps
@@ -273,11 +346,14 @@ defmodule EzthrottleLocal.AccountQueue do
         end
     end
   end
+
   defp parse_rps_header(_), do: nil
 
   defp parse_max_concurrent_header(headers) when is_map(headers) do
     case Map.get(headers, "x-ezthrottle-max-concurrent") do
-      nil -> nil
+      nil ->
+        nil
+
       val ->
         case Integer.parse(val) do
           {max, _} -> max
@@ -285,11 +361,44 @@ defmodule EzthrottleLocal.AccountQueue do
         end
     end
   end
+
   defp parse_max_concurrent_header(_), do: nil
+
+  defp parse_account_queue_header(headers) when is_map(headers) do
+    case Map.get(headers, "x-ezthrottle-account-queue") do
+      nil ->
+        nil
+
+      val ->
+        case val |> String.trim() |> String.downcase() do
+          mode when mode in ["enabled", "disabled"] -> mode
+          _ -> nil
+        end
+    end
+  end
+
+  defp parse_account_queue_header(_), do: nil
 
   defp maybe_update_rps(state, nil), do: state
   defp maybe_update_rps(state, rps), do: %{state | rps: max(rps, @min_rps)}
 
   defp maybe_update_max_concurrent(state, nil), do: state
   defp maybe_update_max_concurrent(state, max), do: %{state | max_concurrent: max}
+
+  defp apply_job_done(state, rps_header, max_concurrent_header, account_queue_header) do
+    maybe_update_account_queue_mode(state, account_queue_header)
+
+    state
+    |> maybe_update_rps(rps_header)
+    |> maybe_update_max_concurrent(max_concurrent_header)
+    |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+  end
+
+  defp maybe_update_account_queue_mode(%{url_actor: nil}, _mode), do: :ok
+  defp maybe_update_account_queue_mode(_state, nil), do: :ok
+
+  defp maybe_update_account_queue_mode(%{url_actor: url_actor}, mode) do
+    GenServer.call(url_actor, {:account_queue_header, mode})
+    :ok
+  end
 end
