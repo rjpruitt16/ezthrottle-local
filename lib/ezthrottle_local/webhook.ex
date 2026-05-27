@@ -17,17 +17,26 @@ defmodule EzthrottleLocal.Webhook do
 
     case do_post(url, body, l8_headers) do
       {:ok, status} when status in 200..299 ->
+        EzthrottleLocal.Metrics.webhook_delivered(url, attempt + 1)
         :ok
 
       {:ok, status} ->
         backoff = backoff_ms(attempt)
-        Logger.warning("[Webhook] #{status} from #{url}, retry #{attempt + 1}/#{@max_retries} in #{backoff}ms")
+
+        Logger.warning(
+          "[Webhook] #{status} from #{url}, retry #{attempt + 1}/#{@max_retries} in #{backoff}ms"
+        )
+
         Process.sleep(backoff)
         deliver(url, payload, attempt + 1)
 
       {:error, reason} ->
         backoff = backoff_ms(attempt)
-        Logger.warning("[Webhook] Error delivering to #{url}, retry #{attempt + 1}/#{@max_retries} in #{backoff}ms: #{inspect(reason)}")
+
+        Logger.warning(
+          "[Webhook] Error delivering to #{url}, retry #{attempt + 1}/#{@max_retries} in #{backoff}ms: #{inspect(reason)}"
+        )
+
         Process.sleep(backoff)
         deliver(url, payload, attempt + 1)
     end
@@ -40,29 +49,39 @@ defmodule EzthrottleLocal.Webhook do
 
     case do_post(url, body, l8_headers) do
       {:ok, status} when status in 200..299 ->
+        EzthrottleLocal.Metrics.webhook_delivered(url, @max_retries + 1)
         :ok
 
       {:ok, status} ->
-        Logger.warning("[Webhook] Giving up after #{@max_retries} retries, last status #{status} for #{url}")
+        Logger.warning(
+          "[Webhook] Giving up after #{@max_retries} retries, last status #{status} for #{url}"
+        )
+
+        EzthrottleLocal.Metrics.webhook_failed(url, @max_retries + 1)
         :error
 
       {:error, reason} ->
-        Logger.warning("[Webhook] Giving up after #{@max_retries} retries for #{url}: #{inspect(reason)}")
+        Logger.warning(
+          "[Webhook] Giving up after #{@max_retries} retries for #{url}: #{inspect(reason)}"
+        )
+
+        EzthrottleLocal.Metrics.webhook_failed(url, @max_retries + 1)
         :error
     end
   end
 
   defp do_post(url, body, extra_headers) do
-    headers = Enum.map(extra_headers, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
+    headers =
+      Enum.map(extra_headers, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
 
     case :httpc.request(
-      :post,
-      {String.to_charlist(url), headers, ~c"application/json", String.to_charlist(body)},
-      [{:timeout, 5_000}],
-      []
-    ) do
+           :post,
+           {String.to_charlist(url), headers, ~c"application/json", String.to_charlist(body)},
+           [{:timeout, 5_000}],
+           []
+         ) do
       {:ok, {{_, status, _}, _headers, _body}} -> {:ok, status}
-      {:error, reason}                          -> {:error, reason}
+      {:error, reason} -> {:error, reason}
     end
   end
 

@@ -159,6 +159,7 @@ defmodule EzthrottleLocal.UrlActor do
         {:ok, pid} =
           AccountQueue.start_link(
             queue_key: queue_key,
+            upstream: state.domain,
             url_actor: self(),
             rps: state.rps,
             max_concurrent: state.max_concurrent

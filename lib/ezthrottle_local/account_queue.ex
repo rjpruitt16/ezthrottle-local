@@ -12,6 +12,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.IdempotentStore
+  alias EzthrottleLocal.Metrics
   alias EzthrottleLocal.Webhook
 
   @idle_timeout_ms 300_000
@@ -20,6 +21,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defstruct [
     :queue_key,
+    :upstream,
     :url_actor,
     rps: 2.0,
     max_concurrent: 1,
@@ -32,12 +34,14 @@ defmodule EzthrottleLocal.AccountQueue do
 
   def start_link(opts) do
     queue_key = Keyword.fetch!(opts, :queue_key)
+    upstream = Keyword.fetch!(opts, :upstream)
     rps = Keyword.get(opts, :rps, 2.0)
     max_concurrent = Keyword.get(opts, :max_concurrent, 1)
     url_actor = Keyword.get(opts, :url_actor)
 
     GenServer.start_link(__MODULE__, %{
       queue_key: queue_key,
+      upstream: upstream,
       url_actor: url_actor,
       rps: rps,
       max_concurrent: max_concurrent
@@ -61,12 +65,14 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def init(%{
         queue_key: queue_key,
+        upstream: upstream,
         url_actor: url_actor,
         rps: rps,
         max_concurrent: max_concurrent
       }) do
     state = %__MODULE__{
       queue_key: queue_key,
+      upstream: upstream,
       url_actor: url_actor,
       rps: rps,
       max_concurrent: max_concurrent
@@ -80,6 +86,7 @@ defmodule EzthrottleLocal.AccountQueue do
   def handle_cast({:enqueue, job}, state) do
     new_queue = :queue.in(job, state.queue)
     new_state = %{state | queue: new_queue}
+    Metrics.queue_depth(state.upstream, :queue.len(new_queue))
     send(self(), :process_next)
     {:noreply, new_state, @idle_timeout_ms}
   end
@@ -87,6 +94,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_cast({:update_rps, rps}, state) do
     safe_rps = max(rps, @min_rps)
+    Metrics.flow_rate(state.upstream, safe_rps)
     {:noreply, %{state | rps: safe_rps}, @idle_timeout_ms}
   end
 
@@ -123,6 +131,8 @@ defmodule EzthrottleLocal.AccountQueue do
             in_flight: state.in_flight + 1,
             last_request_at: System.system_time(:millisecond)
         }
+
+        Metrics.queue_depth(state.upstream, :queue.len(remaining_queue))
 
         # Execute in a Task so the GenServer stays responsive
         parent = self()
@@ -194,7 +204,11 @@ defmodule EzthrottleLocal.AccountQueue do
   # ---- Private ----
 
   defp execute(%Job{} = job, parent, flow_rate, max_concurrent, queue_key) do
+    started_at = System.monotonic_time(:millisecond)
+    upstream = Metrics.upstream(job.url)
+
     IdempotentStore.update_status(job.id, :in_flight)
+    Metrics.job_dispatched(job.user_id, upstream)
 
     Phoenix.PubSub.broadcast(
       EzthrottleLocal.PubSub,
@@ -216,6 +230,12 @@ defmodule EzthrottleLocal.AccountQueue do
         GenServer.call(parent, {:job_done, rps, max_concurrent, account_queue})
 
         IdempotentStore.update_status(job.id, :completed)
+
+        Metrics.job_completed(
+          job.user_id,
+          upstream,
+          System.monotonic_time(:millisecond) - started_at
+        )
 
         Phoenix.PubSub.broadcast(
           EzthrottleLocal.PubSub,
@@ -240,6 +260,7 @@ defmodule EzthrottleLocal.AccountQueue do
         GenServer.call(parent, {:job_done, nil, nil, nil})
 
         IdempotentStore.update_status(job.id, :failed)
+        Metrics.job_failed(job.user_id, upstream, inspect(reason))
 
         Phoenix.PubSub.broadcast(
           EzthrottleLocal.PubSub,
@@ -388,10 +409,17 @@ defmodule EzthrottleLocal.AccountQueue do
   defp apply_job_done(state, rps_header, max_concurrent_header, account_queue_header) do
     maybe_update_account_queue_mode(state, account_queue_header)
 
-    state
-    |> maybe_update_rps(rps_header)
-    |> maybe_update_max_concurrent(max_concurrent_header)
-    |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+    new_state =
+      state
+      |> maybe_update_rps(rps_header)
+      |> maybe_update_max_concurrent(max_concurrent_header)
+      |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+
+    if new_state.rps != state.rps do
+      Metrics.flow_rate(state.upstream, new_state.rps)
+    end
+
+    new_state
   end
 
   defp maybe_update_account_queue_mode(%{url_actor: nil}, _mode), do: :ok

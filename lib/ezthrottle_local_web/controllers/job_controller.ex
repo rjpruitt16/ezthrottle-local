@@ -3,6 +3,7 @@ defmodule EzthrottleLocalWeb.JobController do
 
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.IdempotentStore
+  alias EzthrottleLocal.Metrics
   alias EzthrottleLocal.AccountQueueRegistry
 
   def create(conn, params) do
@@ -20,6 +21,7 @@ defmodule EzthrottleLocalWeb.JobController do
             |> json(%{job_id: existing_id, status: "queued", duplicate: true})
 
           :ok ->
+            Metrics.job_queued(job.user_id, Metrics.upstream(job.url))
             AccountQueueRegistry.enqueue(job)
 
             conn
@@ -38,6 +40,7 @@ defmodule EzthrottleLocalWeb.JobController do
 
       job ->
         status = IdempotentStore.get_status(job_id)
+
         json(conn, %{
           job_id: job_id,
           status: status,

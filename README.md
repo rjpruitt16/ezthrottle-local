@@ -141,8 +141,31 @@ Every job requires an `idempotent_key`. Submitting the same key twice returns th
 config :ezthrottle_local,
   default_rps: 2.0,
   account_queue_enabled: false,   # opt-in per-tenant isolation
-  idempotent_ttl: 86_400          # seconds
+  idempotent_ttl: 86_400,         # seconds
+  metrics_adapter: MyApp.Metrics  # optional; defaults to no-op
 ```
+
+### Metrics adapter
+
+EZThrottle Local emits lifecycle events through a configurable metrics adapter.
+Adapters implement the `EzthrottleLocal.Metrics` behaviour:
+
+```elixir
+defmodule MyApp.Metrics do
+  @behaviour EzthrottleLocal.Metrics
+
+  def job_queued(user_id, upstream), do: :ok
+  def job_dispatched(user_id, upstream), do: :ok
+  def job_completed(user_id, upstream, duration_ms), do: :ok
+  def job_failed(user_id, upstream, reason), do: :ok
+  def webhook_delivered(url, attempt), do: :ok
+  def webhook_failed(url, attempts), do: :ok
+  def queue_depth(upstream, depth), do: :ok
+  def flow_rate(upstream, rps), do: :ok
+end
+```
+
+The default adapter is `EzthrottleLocal.Metrics.Noop`, so existing deployments do not change.
 
 ## L8 Protocol — trustless webhook delivery
 

@@ -8,7 +8,8 @@
 import Config
 
 config :ezthrottle_local,
-  generators: [timestamp_type: :utc_datetime]
+  generators: [timestamp_type: :utc_datetime],
+  metrics_adapter: EzthrottleLocal.Metrics.Noop
 
 # Configures the endpoint
 config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
