@@ -29,3 +29,8 @@ ezthrottle_local-*.tar
 .l8-key
 /l8-trust/
 
+# Local Mnesia disc_copies data (dev/test only — prod points MNESIA_DIR at
+# a persistent volume via fly.toml)
+/priv/mnesia/
+/priv/mnesia_dev/
+

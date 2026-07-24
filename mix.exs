@@ -19,7 +19,16 @@ defmodule EzthrottleLocal.MixProject do
   def application do
     [
       mod: {EzthrottleLocal.Application, []},
-      extra_applications: [:logger, :runtime_tools, :inets, :crypto]
+      extra_applications: [:logger, :runtime_tools, :inets, :crypto],
+      # :mnesia goes in included_applications, not extra_applications:
+      # extra_applications get auto-started by OTP *before*
+      # EzthrottleLocal.Application.start/2 runs, which would start Mnesia
+      # with its default (RAM-only) directory before our code ever gets to
+      # configure :dir and call create_schema/start explicitly.
+      # included_applications still bundles Mnesia's code into a release
+      # without OTP auto-starting it — we start it ourselves in
+      # IdempotentStore.ensure_schema!/0, after configuring where it writes.
+      included_applications: [:mnesia]
     ]
   end
 

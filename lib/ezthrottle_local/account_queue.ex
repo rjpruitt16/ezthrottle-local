@@ -295,6 +295,9 @@ defmodule EzthrottleLocal.AccountQueue do
     queue_key_header = if account_queue_enabled, do: to_string(queue_key), else: "shared"
 
     metric_headers = [
+      {"x-aqueduct-total-jobs", to_string(total)},
+      {"x-aqueduct-queue-depth", to_string(depth)},
+      {"x-aqueduct-flow-rate", :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])},
       {"x-aquifer-total-jobs", to_string(total)},
       {"x-aquifer-queue-depth", to_string(depth)},
       {"x-aquifer-flow-rate", :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])},
@@ -355,8 +358,21 @@ defmodule EzthrottleLocal.AccountQueue do
     end)
   end
 
-  defp parse_rps_header(headers) when is_map(headers) do
-    case Map.get(headers, "x-ezthrottle-rps") do
+  # Reads X-Aqueduct-<name> first, falling back to X-EZThrottle-<name> —
+  # same dual-namespace precedence Aquifer uses (X-Aqueduct-* is the
+  # protocol name, X-Aquifer-*/X-EZThrottle-* are product aliases), so a
+  # backend speaking either protocol's headers is understood.
+  defp pacing_header(headers, name) when is_map(headers) do
+    case Map.get(headers, "x-aqueduct-#{name}") do
+      nil -> Map.get(headers, "x-ezthrottle-#{name}")
+      val -> val
+    end
+  end
+
+  defp pacing_header(_headers, _name), do: nil
+
+  defp parse_rps_header(headers) do
+    case pacing_header(headers, "rps") do
       nil ->
         nil
 
@@ -368,10 +384,8 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
-  defp parse_rps_header(_), do: nil
-
-  defp parse_max_concurrent_header(headers) when is_map(headers) do
-    case Map.get(headers, "x-ezthrottle-max-concurrent") do
+  defp parse_max_concurrent_header(headers) do
+    case pacing_header(headers, "max-concurrent") do
       nil ->
         nil
 
@@ -383,10 +397,8 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
-  defp parse_max_concurrent_header(_), do: nil
-
-  defp parse_account_queue_header(headers) when is_map(headers) do
-    case Map.get(headers, "x-ezthrottle-account-queue") do
+  defp parse_account_queue_header(headers) do
+    case pacing_header(headers, "account-queue") do
       nil ->
         nil
 
@@ -397,8 +409,6 @@ defmodule EzthrottleLocal.AccountQueue do
         end
     end
   end
-
-  defp parse_account_queue_header(_), do: nil
 
   defp maybe_update_rps(state, nil), do: state
   defp maybe_update_rps(state, rps), do: %{state | rps: max(rps, @min_rps)}

@@ -42,6 +42,8 @@ config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
 # Enable dev routes for dashboard and mailbox
 config :ezthrottle_local, dev_routes: true
 
+config :ezthrottle_local, :mnesia_dir, "priv/mnesia_dev"
+
 # Do not include metadata nor timestamps in development logs
 config :logger, :console, format: "[$level] $message\n"
 

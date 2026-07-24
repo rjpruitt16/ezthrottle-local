@@ -20,9 +20,16 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   @doc """
   Route a job to the correct UrlActor, spawning one if needed.
+  account_queue_header is the raw X-Aqueduct-Account-Queue/
+  X-EZThrottle-Account-Queue value from the originating request, or nil if
+  this job has no live request behind it (e.g. recovered from Mnesia at
+  startup). nil leaves the UrlActor's current account-queue mode
+  unchanged rather than forcing it off — the mode is shared per upstream
+  domain, so one request that doesn't care about it shouldn't be able to
+  flip it off for every other concurrent tenant relying on it being on.
   """
-  def enqueue(%Job{} = job) do
-    GenServer.call(__MODULE__, {:enqueue, job})
+  def enqueue(%Job{} = job, account_queue_header \\ nil) do
+    GenServer.call(__MODULE__, {:enqueue, job, account_queue_header})
   end
 
   # ---- GenServer Callbacks ----
@@ -34,7 +41,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   end
 
   @impl true
-  def handle_call({:enqueue, job}, _from, state) do
+  def handle_call({:enqueue, job, account_queue_header}, _from, state) do
     url_key = url_key(job.url)
 
     pid = case :ets.lookup(@table, url_key) do
@@ -46,6 +53,16 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
         Process.monitor(new_pid)
         :ets.insert(@table, {url_key, new_pid})
         new_pid
+    end
+
+    if account_queue_header do
+      mode = account_queue_header |> to_string() |> String.trim() |> String.downcase()
+
+      case mode do
+        "enabled" -> UrlActor.enable_account_queue(pid)
+        "disabled" -> UrlActor.disable_account_queue(pid)
+        _ -> :ok
+      end
     end
 
     UrlActor.enqueue(pid, job)

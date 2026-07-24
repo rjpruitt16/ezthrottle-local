@@ -4,7 +4,9 @@ A self-hosted, open-source API Aquaduct built on the BEAM.
 
 Kubernetes and modern orchestrators are great at scaling compute — but they were not designed for spiky traffic or tenant fairness. When a burst of agentic requests arrives, your pods get hammered, queues back up unevenly, and noisy tenants crowd out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready.
 
-**EZThrottle Local is a singleton, in-memory, webhook-driven load balancer for internal API traffic. ** When spiky agentic traffic arrives, it is queued in memory and forwarded to your microservices or external APIs at a controlled, predictable pace. As Kubernetes scales your upstream capacity, you respond with a higher RPS header and EZThrottle adjusts in real time — no redeploy needed. The response is delivered as a webhook to the user
+**EZThrottle Local is a singleton, durable, webhook-driven load balancer for internal API traffic.** When spiky agentic traffic arrives, it is queued (to disk, via Mnesia — survives a crash, not just a graceful restart) and forwarded to your microservices or external APIs at a controlled, predictable pace. As Kubernetes scales your upstream capacity, you respond with a higher RPS header and EZThrottle adjusts in real time — no redeploy needed. The response is delivered as a webhook to the user.
+
+Real numbers on durability, throughput ceiling, admission shedding, and multi-tenant fairness are in [benchmark.md](benchmark.md) — including a head-to-head comparison against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
 ## How it works
 
@@ -20,22 +22,32 @@ Client → POST /jobs → EZThrottle Local → paced outbound requests → Your 
 
 1. **Submit a job** — POST the request you want forwarded, with a `webhook_url` for the response.
 2. **EZThrottle queues it** — Jobs are held in memory and dispatched at the configured RPS.
-3. **Your API responds** — EZThrottle reads `X-EZTHROTTLE-RPS` and `X-EZTHROTTLE-MAX-CONCURRENT` headers from the response and adjusts pace automatically.
+3. **Your API responds** — EZThrottle reads `X-Aqueduct-Rps`/`X-EZTHROTTLE-RPS` and `X-Aqueduct-Max-Concurrent`/`X-EZTHROTTLE-MAX-CONCURRENT` headers from the response and adjusts pace automatically. `X-Aqueduct-*` is read first if both are present — the shared protocol namespace also spoken by [Aquifer](https://github.com/rjpruitt16/aquifer), so a backend already emitting Aqueduct headers works against either implementation unchanged.
 4. **Stay on the line or hang up** — open `GET /jobs/:id/stream` to receive live events as the job moves through the queue, or disconnect and the result is delivered to your `webhook_url` when ready.
 
 ## Per-tenant fairness (AccountQueue mode)
 
-By default all traffic for a destination flows through one shared queue. When your API responds with:
+By default all traffic for a destination flows through one shared queue. Isolation can be turned on two ways:
+
+**By your API's response** — respond to a dispatched request with:
 
 ```
-X-EZTHROTTLE-ACCOUNT-QUEUE: enabled
+X-Aqueduct-Account-Queue: enabled
 ```
 
-EZThrottle switches to per-user isolation — each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else.
+(or `X-EZTHROTTLE-ACCOUNT-QUEUE: enabled` — both are read, `X-Aqueduct-*` first if both are present)
 
-Critically, each user can run at a **different pace**. If your service processes requests from user A faster than user B — because of their tier, their data size, or just load at that moment — each user's queue drains independently at the rate their own responses signal back. A premium user responding with `X-EZTHROTTLE-RPS: 50` runs at 50 RPS while a free-tier user on `X-EZTHROTTLE-RPS: 2` runs at 2, in parallel, without either affecting the other.
+**By the client submitting the job** — set the same header on the `POST /jobs` request itself, if you already know at submission time that this tenant needs isolation:
 
-Disable it any time by responding with `X-EZTHROTTLE-ACCOUNT-QUEUE: disabled`.
+```
+X-Aqueduct-Account-Queue: enabled
+```
+
+Either way, EZThrottle switches to per-user isolation — each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else.
+
+Critically, each user can run at a **different pace**. If your service processes requests from user A faster than user B — because of their tier, their data size, or just load at that moment — each user's queue drains independently at the rate their own responses signal back. A premium user responding with `X-Aqueduct-Rps: 50` runs at 50 RPS while a free-tier user on `X-Aqueduct-Rps: 2` runs at 2, in parallel, without either affecting the other. Note that literal pace (RPS/max-concurrent) can only ever be set by the upstream's own response headers — never by the client submitting the job — so a client can ask for isolation but never for a faster rate than what's configured.
+
+Disable it any time by responding with `X-Aqueduct-Account-Queue: disabled`.
 
 ## Streaming — stay on the line or get a voicemail
 
@@ -132,7 +144,27 @@ GET /health
 
 ## Idempotency
 
-Every job requires an `idempotent_key`. Submitting the same key twice returns the original job ID without re-executing the request. Keys expire after 24 hours (configurable).
+Every job requires an `idempotent_key`. Submitting the same key twice returns the original job ID without re-executing the request. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS — durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
+
+## Durability (Mnesia)
+
+Jobs are written to Mnesia disc-backed tables, not kept purely in memory. Two things matter for what "durable" actually means here:
+
+- `MNESIA_DIR` — where the on-disk tables live. **Must point at a persistent volume in production** (defaults to `/data/mnesia` in `fly.toml`, mirroring Aquifer's `DB_PATH`) — without a real volume mount, this data lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
+- `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` (default `100`) — Mnesia's `disc_copies` tables live in RAM by default, with the disk copy caught up via a periodic flush, not on every write. `0` flushes synchronously on every write (zero loss, real per-request latency cost); a positive value batches the flush on a timer instead, bounding the loss window on a true crash to roughly that many milliseconds of writes. 100ms was found empirically to be a good default — see [benchmark.md](benchmark.md) for why going higher made things *worse*, not better.
+
+## Admission control
+
+Opt-in memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exceeded, mirroring [Aquifer's](https://github.com/rjpruitt16/aquifer) admission control:
+
+| Env var | Default | Description |
+|---|---|---|
+| `EZTHROTTLE_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once BEAM's total memory exceeds this many MB |
+| `EZTHROTTLE_MAX_BODY_BYTES` | *(disabled)* | Reject oversized request bodies with `413` |
+| `EZTHROTTLE_DB_MAX_BYTES` | *(disabled)* | Reject new jobs once the Mnesia directory exceeds this many bytes |
+| `EZTHROTTLE_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429` — doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |
+
+Leave these unset and EZThrottle accepts everything, same as before. `GET /health` reports a live `admission` snapshot.
 
 ## Configuration
 
@@ -232,8 +264,11 @@ docker run -p 4000:4000 ezthrottle-local
 
 ```bash
 fly launch --config fly.toml
+fly volumes create ezthrottle_data --region iad --size 1
 fly deploy
 ```
+
+The volume is required now that jobs are Mnesia-backed (`disc_copies`), not pure ETS — without it, `MNESIA_DIR` lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
 
 For maximum queue capacity, use the largest available machine. A 32GB RAM machine can hold 3–32 million jobs in memory — enough buffer for hours of traffic at typical agentic workloads, giving your autoscaler time to catch up before a single request is dropped.
 
@@ -250,13 +285,13 @@ EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloa
 
 ## EZThrottle Cloud
 
-EZThrottle Local is best-effort: in-memory queues, single node, no retry on failure.
+EZThrottle Local is a single node: jobs are durable to disk (survives a crash or restart of that machine — see [benchmark.md](benchmark.md)) and webhook delivery already retries with backoff, but there's no cross-machine or cross-region replication — if the machine itself is destroyed (not just restarted) before its volume can be recovered, or the whole region goes down, that's outside what a single node can promise.
 
 **[EZThrottle Cloud](https://ezthrottle.network)** handles the cases this cannot:
 
 - **Multi-step workflows** — chain dependent API calls with conditional branching
-- **Partial outage recovery** — jobs survive pod restarts and region failures
-- **Regional delivery guarantee** — if a region is healthy, your job will be delivered. Automatic retry with backoff and dead-letter queues for visibility when it isn't
+- **Cross-region durability** — jobs survive not just a node restart but a full region failure
+- **Regional delivery guarantee** — if a region is healthy, your job will be delivered, with dead-letter queues for visibility when it isn't
 - **Internal + external traffic** — protect both your own services and third-party APIs from the same control plane
 - **Distributed fairness** — per-tenant rate limiting across multiple nodes and regions
 

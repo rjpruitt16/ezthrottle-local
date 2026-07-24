@@ -37,15 +37,19 @@ if config_env() == :prod do
   port = String.to_integer(System.get_env("PORT") || "4000")
 
   config :ezthrottle_local, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
+  config :ezthrottle_local, :mnesia_dir, System.get_env("MNESIA_DIR", "/data/mnesia")
 
   config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [
-      # Enable IPv6 and bind on all interfaces.
-      # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.
-      # See the documentation on https://hexdocs.pm/bandit/Bandit.html#t:options/0
-      # for details about using IPv6 vs IPv4 and loopback vs public addresses.
-      ip: {0, 0, 0, 0, 0, 0, 0, 0},
+      # IPv4 any-address, not IPv6 — fly-proxy's own health/process
+      # scanning explicitly checks for a raw 0.0.0.0:PORT listener and
+      # flagged this app as unreachable when it was bound to :::PORT
+      # (IPv6-any) instead, even though ad-hoc curl requests still worked
+      # by luck of dual-stack routing. This app doesn't need IPv6 client
+      # support, so bind plainly on IPv4 to match what Fly's tooling
+      # actually checks for.
+      ip: {0, 0, 0, 0},
       port: port
     ],
     secret_key_base: secret_key_base

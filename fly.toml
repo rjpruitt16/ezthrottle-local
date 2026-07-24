@@ -7,6 +7,11 @@ primary_region = "iad"
   PHX_HOST = "ezthrottle-local.fly.dev"
   PORT = "4000"
   PHX_SERVER = "true"
+  MNESIA_DIR = "/data/mnesia"
+  EZTHROTTLE_MEMORY_LIMIT_MB = "400"
+  EZTHROTTLE_MAX_BODY_BYTES = "1048576"
+  EZTHROTTLE_DB_MAX_BYTES = "104857600"
+  EZTHROTTLE_RETRY_AFTER_SECONDS = "5"
 
 [http_service]
   internal_port = 4000
@@ -19,6 +24,10 @@ primary_region = "iad"
     type = "requests"
     hard_limit = 1000
     soft_limit = 800
+
+[[mounts]]
+  source = "ezthrottle_data"
+  destination = "/data"
 
 [[vm]]
   memory = "512mb"
