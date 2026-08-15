@@ -8,7 +8,7 @@ A self-hosted, open-source API Aquaduct built on the BEAM.
 
 Kubernetes and modern orchestrators are great at scaling compute — but they were not designed for spiky traffic or tenant fairness. When a burst of agentic requests arrives, your pods get hammered, queues back up unevenly, and noisy tenants crowd out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready.
 
-**EZThrottle Local is a singleton, durable, webhook-driven load balancer for internal API traffic.** When spiky agentic traffic arrives, it is queued (to disk, via Mnesia — survives a crash, not just a graceful restart) and forwarded to your microservices or external APIs at a controlled, predictable pace. As Kubernetes scales your upstream capacity, you respond with a higher RPS header and EZThrottle adjusts in real time — no redeploy needed. The response is delivered as a webhook to the user.
+**EZThrottle Local is a singleton, durable, agent-native load balancer for internal API traffic, with webhook-driven delivery.** When spiky agentic traffic arrives, it is queued (to disk, via Mnesia — survives a crash, not just a graceful restart) and forwarded to your microservices or external APIs at a controlled, predictable pace. As Kubernetes scales your upstream capacity, you respond with a higher RPS header and EZThrottle adjusts in real time — no redeploy needed. The response is delivered as a webhook to the user.
 
 Real numbers on durability, throughput ceiling, admission shedding, and multi-tenant fairness are in [benchmark.md](benchmark.md) — including a head-to-head comparison against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
@@ -57,7 +57,7 @@ Each tenant's own pace is still capped by the upstream's actual budget, though �
 
 ---
 
-## Pool-based load balancing
+## Agent-native load balancing
 
 Instead of dispatching to a fixed `url`, a job can target a named **pool** — a group of registered service instances EZThrottle picks from at dispatch time. Useful when you have several interchangeable backends (or, e.g., a separate group of writers and a separate group of readers) instead of one fixed endpoint. Ported from [Aquifer](https://github.com/rjpruitt16/aquifer)'s Go implementation, built and proven out there first.
 
