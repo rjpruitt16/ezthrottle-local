@@ -2,13 +2,9 @@
 
 **Increase your rate limit without DDoSing your backend.**
 
-A dedicated service absorbs the burst, paces dispatch to your backend, and — with agent-native load balancing — spreads it across a pool of registered instances, giving your autoscaler time to catch up before it ever sees the flood. That's what makes raising your rate limit safe — and your own clients see fewer 429s, so they retry less too.
-
-A self-hosted, open-source API Aquaduct built on the BEAM.
+EZThrottle Local is a self-hosted, agent-native load balancer for internal API traffic. It absorbs bursts into a durable, Mnesia-backed queue, dispatches at a controlled rate, and spreads traffic across a pool of registered backend instances. Your API can dynamically slow EZThrottle down with `X-Aqueduct-*` response headers, so an overloaded service can shed pressure before it starts returning 429s.
 
 Kubernetes and modern orchestrators are great at scaling compute — but they were not designed for spiky traffic or tenant fairness. When a burst of agentic requests arrives, your pods get hammered, queues back up unevenly, and noisy tenants crowd out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready.
-
-**EZThrottle Local is a singleton, durable, agent-native load balancer for internal API traffic, with webhook-driven delivery.** When spiky agentic traffic arrives, it is queued (to disk, via Mnesia — survives a crash, not just a graceful restart) and forwarded to your microservices or external APIs at a controlled, predictable pace. As Kubernetes scales your upstream capacity, you respond with a higher RPS header and EZThrottle adjusts in real time — no redeploy needed. The response is delivered as a webhook to the user.
 
 Real numbers on durability, throughput ceiling, admission shedding, and multi-tenant fairness are in [benchmark.md](benchmark.md) — including a head-to-head comparison against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
@@ -55,7 +51,7 @@ Disable it any time by responding with `X-Aqueduct-Account-Queue: disabled`.
 
 Each tenant's own pace is still capped by the upstream's actual budget, though — a background check keeps the *sum* of every active tenant queue's rate within the upstream's configured (or, for a pool-backed upstream, live aggregate) ceiling, throttling proportionally if too many tenants are active at once. Isolation between tenants doesn't mean each one gets its own unbounded copy of the full rate.
 
-**This is built for a network effect, not just a single deployment.** If more tools, agents, and services come to speak `X-Aqueduct-*`, traffic across the whole internet could coordinate directly with each other instead of every client guessing alone under load — each adopter would make the signal more useful to every other adopter, not just to itself. That's the design goal; it depends on adoption EZThrottle alone can't create, so treat it as the long-term shape, not a claim about how much of the internet speaks this today.
+Long-term protocol goal: if more services emit `X-Aqueduct-*`, agents can respond to capacity signals instead of independently guessing retry and concurrency behavior. EZThrottle works today without ecosystem adoption; broader protocol adoption is the longer-term goal.
 
 ---
 
@@ -193,7 +189,7 @@ GET /health
 
 Every job requires an `idempotent_key`. Submitting the same key twice returns the original job ID without re-executing the request. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS — durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
 
-**This is at-least-once delivery, not exactly-once.** A webhook can be delivered more than once — for example, if the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches again on restart. Make your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
+**Delivery semantics:** EZThrottle provides at-least-once dispatch and webhook delivery, not exactly-once execution. If the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches to the upstream again on restart — so it's not just the webhook that can repeat, the upstream call itself can. Make both your upstream endpoint and your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
 
 ## Durability (Mnesia)
 
@@ -256,26 +252,18 @@ The default adapter is `EzthrottleLocal.Metrics.Noop`, so existing deployments d
 
 ## L8 Protocol — trustless webhook delivery
 
-Traditional webhook security shares a secret between sender and receiver. That secret can be stolen, logged by accident, or forgotten to rotate — and a compromised secret lets anyone forge deliveries silently.
-
-EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol built on Ed25519 public key cryptography. There is no shared secret to steal.
+Traditional webhook security shares a secret between sender and receiver, stored in a database on both sides — something that can be stolen, logged by accident, or forgotten to rotate, letting anyone forge deliveries silently once it leaks. EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography — there's no secret to steal from a database.
 
 **How it works:**
 
 1. Your webhook receiver publishes a public key at `GET /.well-known/l8`
 2. Before the first delivery, EZThrottle challenges the receiver to prove ownership of the corresponding private key — a one-time handshake per domain
 3. Trust is cached to disk as `l8-trust/{domain}.json` — the handshake never runs again for that domain
-4. Every webhook delivery carries `X-L8-Signature` headers the receiver verifies locally — no database query, no round-trip, microseconds
+4. Every delivery carries `X-L8-Signature` headers, verified locally with a single Ed25519 call — no database lookup, no round-trip to any authority, microseconds
 
-**Why this keeps things fast:** Verification is a single local Ed25519 `verify()` call against a cached public key. No shared state, no HTTP call.
+Trust stays deliberately pairwise, not transitive, by design. For better security and less latency than a shared-secret scheme, see the [L8 spec](https://rjpruitt16.github.io/l8-protocol/) for the full protocol rationale.
 
-**This is built for a network effect too, of a different kind than the pacing headers above.** L8 trust stays deliberately pairwise — a receiver verifies each sender's key directly, on first contact, cached for that pair; there's no transitive "I trust A, A vouches for B, so I trust B" chain, and there shouldn't be, since that's exactly the kind of indirection that makes forged trust possible. The network effect here, if the protocol gets adopted beyond Aquifer and EZThrottle Local, would be protocol standardization, not trust propagation: a receiver that implements the L8 verification endpoint once could accept *any* sender that speaks L8 with no new secret to provision or rotate per sender, the same way supporting HTTPS once means supporting any HTTPS client. That's the value if L8 spreads — right now it's the two implementations that already speak it.
-
-**Key management:**
-
-Set `L8_PRIVATE_KEY` (base64 Ed25519 private key) for a stable identity across restarts. Without it, EZThrottle auto-generates a key and saves it to `.l8-key` on first start.
-
-To revoke trust with a domain: delete `l8-trust/{domain}.json`. The handshake re-runs on next delivery.
+Set `L8_PRIVATE_KEY` (base64 Ed25519 private key) for a stable identity across restarts, or let EZThrottle auto-generate one on first start. Delete `l8-trust/{domain}.json` to revoke trust with a domain — the handshake re-runs on next delivery.
 
 **EZThrottle exposes:**
 
@@ -283,11 +271,9 @@ To revoke trust with a domain: delete `l8-trust/{domain}.json`. The handshake re
 |---|---|
 | `GET /.well-known/l8` | EZThrottle's public key — receivers discover it here |
 | `POST /l8/challenge` | Handles incoming challenges from receivers verifying EZThrottle's identity |
-| `GET /l8-spec` | Full L8 protocol spec |
+| `GET /l8-spec` | Full L8 protocol spec, served locally for an agent/script with only network access to this instance |
 
-**Graceful degradation:** L8 is opt-in. If a receiver doesn't implement `/.well-known/l8`, delivery proceeds unsigned. Receivers that don't support L8 are completely unaffected.
-
-The full protocol spec is at [rjpruitt16.github.io/l8-protocol](https://rjpruitt16.github.io/l8-protocol/) and browsable at `GET /l8-spec` on any running instance.
+**Graceful degradation:** L8 is opt-in. If a receiver doesn't implement `/.well-known/l8`, delivery proceeds unsigned — receivers that don't support L8 are completely unaffected.
 
 ---
 
