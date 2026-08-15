@@ -55,7 +55,7 @@ Disable it any time by responding with `X-Aqueduct-Account-Queue: disabled`.
 
 Each tenant's own pace is still capped by the upstream's actual budget, though — a background check keeps the *sum* of every active tenant queue's rate within the upstream's configured (or, for a pool-backed upstream, live aggregate) ceiling, throttling proportionally if too many tenants are active at once. Isolation between tenants doesn't mean each one gets its own unbounded copy of the full rate.
 
-**This has a network effect.** The value isn't capped at one deployment: the more tools, agents, and services that speak `X-Aqueduct-*`, the more traffic across the whole internet can coordinate directly with each other instead of every client guessing alone under load. Each new adopter makes the signal more useful to every other adopter, not just to itself.
+**This is built for a network effect, not just a single deployment.** If more tools, agents, and services come to speak `X-Aqueduct-*`, traffic across the whole internet could coordinate directly with each other instead of every client guessing alone under load — each adopter would make the signal more useful to every other adopter, not just to itself. That's the design goal; it depends on adoption EZThrottle alone can't create, so treat it as the long-term shape, not a claim about how much of the internet speaks this today.
 
 ---
 
@@ -193,6 +193,8 @@ GET /health
 
 Every job requires an `idempotent_key`. Submitting the same key twice returns the original job ID without re-executing the request. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS — durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
 
+**This is at-least-once delivery, not exactly-once.** A webhook can be delivered more than once — for example, if the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches again on restart. Make your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
+
 ## Durability (Mnesia)
 
 Jobs are written to Mnesia disc-backed tables, not kept purely in memory. Two things matter for what "durable" actually means here:
@@ -267,7 +269,7 @@ EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protoc
 
 **Why this keeps things fast:** Verification is a single local Ed25519 `verify()` call against a cached public key. No shared state, no HTTP call.
 
-**This also has a network effect, of a different kind than the pacing headers above.** L8 trust stays deliberately pairwise — a receiver verifies each sender's key directly, on first contact, cached for that pair; there's no transitive "I trust A, A vouches for B, so I trust B" chain, and there shouldn't be, since that's exactly the kind of indirection that makes forged trust possible. The network effect here is protocol standardization, not trust propagation: once a receiver implements the L8 verification endpoint once, *any* sender that speaks L8 can start delivering trustlessly with no new secret to provision or rotate per sender. The marginal cost of the next integration drops as more senders adopt the protocol — the same way supporting HTTPS once means supporting any HTTPS client, not a fresh negotiation per client.
+**This is built for a network effect too, of a different kind than the pacing headers above.** L8 trust stays deliberately pairwise — a receiver verifies each sender's key directly, on first contact, cached for that pair; there's no transitive "I trust A, A vouches for B, so I trust B" chain, and there shouldn't be, since that's exactly the kind of indirection that makes forged trust possible. The network effect here, if the protocol gets adopted beyond Aquifer and EZThrottle Local, would be protocol standardization, not trust propagation: a receiver that implements the L8 verification endpoint once could accept *any* sender that speaks L8 with no new secret to provision or rotate per sender, the same way supporting HTTPS once means supporting any HTTPS client. That's the value if L8 spreads — right now it's the two implementations that already speak it.
 
 **Key management:**
 
