@@ -2,7 +2,7 @@
 
 **Increase your rate limit without DDoSing your backend.**
 
-A dedicated service absorbs the burst and paces dispatch to your backend, giving your autoscaler time to catch up before it ever sees the flood. That's what makes raising your rate limit safe — and your own clients see fewer 429s, so they retry less too.
+A dedicated service absorbs the burst, paces dispatch to your backend, and — with agent-native load balancing — spreads it across a pool of registered instances, giving your autoscaler time to catch up before it ever sees the flood. That's what makes raising your rate limit safe — and your own clients see fewer 429s, so they retry less too.
 
 A self-hosted, open-source API Aquaduct built on the BEAM.
 
