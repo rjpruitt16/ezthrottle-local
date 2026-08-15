@@ -1,5 +1,9 @@
 # EZThrottle Local
 
+**Increase your rate limit without DDoSing your backend.**
+
+A dedicated service absorbs the burst and paces dispatch to your backend, giving your autoscaler time to catch up before it ever sees the flood. That's what makes raising your rate limit safe — and your own clients see fewer 429s, so they retry less too.
+
 A self-hosted, open-source API Aquaduct built on the BEAM.
 
 Kubernetes and modern orchestrators are great at scaling compute — but they were not designed for spiky traffic or tenant fairness. When a burst of agentic requests arrives, your pods get hammered, queues back up unevenly, and noisy tenants crowd out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready.
@@ -155,16 +159,22 @@ Jobs are written to Mnesia disc-backed tables, not kept purely in memory. Two th
 
 ## Admission control
 
-Opt-in memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exceeded, mirroring [Aquifer's](https://github.com/rjpruitt16/aquifer) admission control:
+Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exceeded, mirroring [Aquifer's](https://github.com/rjpruitt16/aquifer) admission control:
 
 | Env var | Default | Description |
 |---|---|---|
 | `EZTHROTTLE_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once BEAM's total memory exceeds this many MB |
-| `EZTHROTTLE_MAX_BODY_BYTES` | *(disabled)* | Reject oversized request bodies with `413` |
-| `EZTHROTTLE_DB_MAX_BYTES` | *(disabled)* | Reject new jobs once the Mnesia directory exceeds this many bytes |
+| `EZTHROTTLE_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
+| `EZTHROTTLE_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |
 | `EZTHROTTLE_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429` — doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |
 
-Leave these unset and EZThrottle accepts everything, same as before. `GET /health` reports a live `admission` snapshot.
+Body-size and DB-size admission are **on by default**, sized off the infrastructure this project is
+actually benchmarked against (a single 512MB Fly.io instance with a 1GB volume — see
+[benchmark.md](benchmark.md)); set an explicit `0` to disable a check, or raise it for a bigger
+deployment. Memory is the exception — there's no safe one-size-fits-all default since it depends on
+your own deployment's memory budget, so it stays disabled until set explicitly; EZThrottle logs a
+warning on startup if it isn't (benchmarked safe at 400MB on a 512MB instance, as a starting point).
+`GET /health` reports a live `admission` snapshot.
 
 ## Configuration
 
