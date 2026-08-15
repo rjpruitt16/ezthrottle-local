@@ -37,13 +37,26 @@ defmodule EzthrottleLocal.AdmissionTest do
     Admission.check()
   end
 
-  test "disabled by default with no env vars set" do
+  test "memory stays disabled by default, body/db default on, with no env vars set" do
     System.delete_env("EZTHROTTLE_MEMORY_LIMIT_MB")
     System.delete_env("EZTHROTTLE_MAX_BODY_BYTES")
     System.delete_env("EZTHROTTLE_DB_MAX_BYTES")
 
-    refute Admission.any_limit_configured?()
+    assert Admission.memory_limit_mb() == 0
+    assert Admission.max_body_bytes() == 1 * 1024 * 1024
+    assert Admission.db_max_bytes() == 800 * 1024 * 1024
+    assert Admission.any_limit_configured?()
+    # The Mnesia dir in a test run is well under the 800MB default, so a
+    # real check() still passes even with a size ceiling on by default.
     assert :ok = Admission.check()
+  end
+
+  test "explicit 0 still disables body/db limits" do
+    System.put_env("EZTHROTTLE_MAX_BODY_BYTES", "0")
+    System.put_env("EZTHROTTLE_DB_MAX_BYTES", "0")
+
+    assert Admission.max_body_bytes() == 0
+    assert Admission.db_max_bytes() == 0
   end
 
   test "rejects over memory limit" do
@@ -82,10 +95,14 @@ defmodule EzthrottleLocal.AdmissionTest do
     assert Admission.retry_after_seconds() == 60
   end
 
-  test "snapshot reports enabled false when unconfigured, true when configured" do
+  test "snapshot reports enabled true by default (body/db defaults), false only if explicitly all disabled" do
     System.delete_env("EZTHROTTLE_MEMORY_LIMIT_MB")
     System.delete_env("EZTHROTTLE_MAX_BODY_BYTES")
     System.delete_env("EZTHROTTLE_DB_MAX_BYTES")
+    assert Admission.snapshot().enabled
+
+    System.put_env("EZTHROTTLE_MAX_BODY_BYTES", "0")
+    System.put_env("EZTHROTTLE_DB_MAX_BYTES", "0")
     refute Admission.snapshot().enabled
 
     System.put_env("EZTHROTTLE_MEMORY_LIMIT_MB", "1000000")

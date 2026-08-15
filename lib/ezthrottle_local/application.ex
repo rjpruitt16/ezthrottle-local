@@ -19,6 +19,7 @@ defmodule EzthrottleLocal.Application do
       EzthrottleLocal.L8,
       EzthrottleLocal.Admission,
       EzthrottleLocal.IdempotentStore,
+      EzthrottleLocal.PoolRegistry,
       EzthrottleLocal.AccountQueueRegistry,
       EzthrottleLocalWeb.Endpoint
     ]

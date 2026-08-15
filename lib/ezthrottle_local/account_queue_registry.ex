@@ -9,6 +9,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   alias EzthrottleLocal.UrlActor
   alias EzthrottleLocal.Job
+  alias EzthrottleLocal.PoolRegistry
 
   @table :url_actors
 
@@ -42,18 +43,21 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   @impl true
   def handle_call({:enqueue, job, account_queue_header}, _from, state) do
-    url_key = url_key(job.url)
+    {route_key, pool_pid} = route_key_and_pool(job)
 
-    pid = case :ets.lookup(@table, url_key) do
-      [{^url_key, existing_pid}] ->
-        existing_pid
+    pid =
+      case :ets.lookup(@table, route_key) do
+        [{^route_key, existing_pid}] ->
+          existing_pid
 
-      [] ->
-        {:ok, new_pid} = UrlActor.start_link(url_key: url_key, domain: url_key)
-        Process.monitor(new_pid)
-        :ets.insert(@table, {url_key, new_pid})
-        new_pid
-    end
+        [] ->
+          {:ok, new_pid} =
+            UrlActor.start_link(url_key: route_key, domain: route_key, pool_pid: pool_pid)
+
+          Process.monitor(new_pid)
+          :ets.insert(@table, {route_key, new_pid})
+          new_pid
+      end
 
     if account_queue_header do
       mode = account_queue_header |> to_string() |> String.trim() |> String.downcase()
@@ -80,5 +84,19 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   defp url_key(url) do
     uri = URI.parse(url)
     "#{uri.scheme}://#{uri.host}"
+  end
+
+  # Pool-backed jobs route by pool_id instead of the destination domain,
+  # since there is no single fixed domain -- PoolRegistry.get_or_create
+  # lazily creates the pool if nobody's registered to it yet, so a
+  # pool-backed job always gets pool-mode dispatch behavior (failing
+  # cleanly with "no pool members registered" if empty) instead of
+  # silently falling through to a non-pool dispatch path with no URL.
+  defp route_key_and_pool(%Job{pool_id: pool_id}) when is_binary(pool_id) do
+    {"pool:" <> pool_id, PoolRegistry.get_or_create(pool_id)}
+  end
+
+  defp route_key_and_pool(%Job{url: url}) do
+    {url_key(url), nil}
   end
 end

@@ -14,6 +14,7 @@ defmodule EzthrottleLocal.AccountQueue do
   alias EzthrottleLocal.IdempotentStore
   alias EzthrottleLocal.Metrics
   alias EzthrottleLocal.Webhook
+  alias EzthrottleLocal.Pool
 
   @idle_timeout_ms 300_000
   @min_rps 0.5
@@ -23,6 +24,7 @@ defmodule EzthrottleLocal.AccountQueue do
     :queue_key,
     :upstream,
     :url_actor,
+    :pool_pid,
     rps: 2.0,
     max_concurrent: 1,
     queue: :queue.new(),
@@ -38,13 +40,15 @@ defmodule EzthrottleLocal.AccountQueue do
     rps = Keyword.get(opts, :rps, 2.0)
     max_concurrent = Keyword.get(opts, :max_concurrent, 1)
     url_actor = Keyword.get(opts, :url_actor)
+    pool_pid = Keyword.get(opts, :pool_pid)
 
     GenServer.start_link(__MODULE__, %{
       queue_key: queue_key,
       upstream: upstream,
       url_actor: url_actor,
       rps: rps,
-      max_concurrent: max_concurrent
+      max_concurrent: max_concurrent,
+      pool_pid: pool_pid
     })
   end
 
@@ -55,6 +59,9 @@ defmodule EzthrottleLocal.AccountQueue do
   def update_rps(pid, rps) do
     GenServer.cast(pid, {:update_rps, rps})
   end
+
+  @doc "Current dispatch rate -- used by UrlActor's aggregate-budget check to read every sibling queue's live rate."
+  def get_rps(pid), do: GenServer.call(pid, :get_rps)
 
   def update_max_concurrent(pid, max) do
     GenServer.cast(pid, {:update_max_concurrent, max})
@@ -68,14 +75,16 @@ defmodule EzthrottleLocal.AccountQueue do
         upstream: upstream,
         url_actor: url_actor,
         rps: rps,
-        max_concurrent: max_concurrent
+        max_concurrent: max_concurrent,
+        pool_pid: pool_pid
       }) do
     state = %__MODULE__{
       queue_key: queue_key,
       upstream: upstream,
       url_actor: url_actor,
       rps: rps,
-      max_concurrent: max_concurrent
+      max_concurrent: max_concurrent,
+      pool_pid: pool_pid
     }
 
     schedule_position_broadcast()
@@ -113,35 +122,56 @@ defmodule EzthrottleLocal.AccountQueue do
         {:noreply, state, @idle_timeout_ms}
 
       true ->
-        {{:value, job}, remaining_queue} = :queue.out(state.queue)
+        case resolve_target(state) do
+          {:no_pool_members, job, remaining_queue} ->
+            # Pool-backed queue with nothing registered -- fail this job
+            # immediately rather than blocking the whole queue behind an
+            # empty pool, then keep processing whatever's next.
+            Metrics.queue_depth(state.upstream, :queue.len(remaining_queue))
+            fail_immediately(job, "no pool members registered")
+            send(self(), :process_next)
+            {:noreply, %{state | queue: remaining_queue}, @idle_timeout_ms}
 
-        # Enforce RPS with jitter to prevent synchronized bursts across queues
-        now = System.system_time(:millisecond)
-        interval_ms = trunc(1_000 / state.rps)
-        jitter_ms = :rand.uniform(trunc(interval_ms * 0.1) + 1)
-        elapsed = now - state.last_request_at
+          {:ok, job, dispatch_url, member, remaining_queue} ->
+            # Enforce RPS with jitter to prevent synchronized bursts across queues
+            now = System.system_time(:millisecond)
+            interval_ms = trunc(1_000 / state.rps)
+            jitter_ms = :rand.uniform(trunc(interval_ms * 0.1) + 1)
+            elapsed = now - state.last_request_at
 
-        if elapsed < interval_ms do
-          Process.sleep(interval_ms - elapsed + jitter_ms)
+            if elapsed < interval_ms do
+              Process.sleep(interval_ms - elapsed + jitter_ms)
+            end
+
+            new_state = %{
+              state
+              | queue: remaining_queue,
+                in_flight: state.in_flight + 1,
+                last_request_at: System.system_time(:millisecond)
+            }
+
+            Metrics.queue_depth(state.upstream, :queue.len(remaining_queue))
+
+            # Execute in a Task so the GenServer stays responsive
+            parent = self()
+            pool_pid = state.pool_pid
+            member_id = member && member.id
+
+            Task.start(fn ->
+              execute(
+                job,
+                dispatch_url,
+                parent,
+                state.rps,
+                state.max_concurrent,
+                state.queue_key,
+                pool_pid,
+                member_id
+              )
+            end)
+
+            {:noreply, new_state, @idle_timeout_ms}
         end
-
-        new_state = %{
-          state
-          | queue: remaining_queue,
-            in_flight: state.in_flight + 1,
-            last_request_at: System.system_time(:millisecond)
-        }
-
-        Metrics.queue_depth(state.upstream, :queue.len(remaining_queue))
-
-        # Execute in a Task so the GenServer stays responsive
-        parent = self()
-
-        Task.start(fn ->
-          execute(job, parent, state.rps, state.max_concurrent, state.queue_key)
-        end)
-
-        {:noreply, new_state, @idle_timeout_ms}
     end
   end
 
@@ -201,11 +231,61 @@ defmodule EzthrottleLocal.AccountQueue do
     {:reply, :ok, new_state, @idle_timeout_ms}
   end
 
+  @impl true
+  def handle_call(:get_rps, _from, state), do: {:reply, state.rps, state}
+
   # ---- Private ----
 
-  defp execute(%Job{} = job, parent, flow_rate, max_concurrent, queue_key) do
+  # Pool-backed queue: resolve via weighted selection. nil url/pool_pid on
+  # a plain queue means dispatch straight to the job's own fixed url, same
+  # as before pools existed.
+  defp resolve_target(%{pool_pid: nil} = state) do
+    {{:value, job}, remaining_queue} = :queue.out(state.queue)
+    {:ok, job, job.url, nil, remaining_queue}
+  end
+
+  defp resolve_target(%{pool_pid: pool_pid} = state) do
+    {{:value, job}, remaining_queue} = :queue.out(state.queue)
+
+    case Pool.pick(pool_pid) do
+      nil -> {:no_pool_members, job, remaining_queue}
+      member -> {:ok, job, member.address, member, remaining_queue}
+    end
+  end
+
+  # Fails a job that never even attempted dispatch (e.g. an empty pool) --
+  # mirrors the terminal-failure shape of execute/8's error branch, just
+  # without a request ever having gone out.
+  defp fail_immediately(%Job{} = job, reason) do
+    IdempotentStore.update_status(job.id, :failed)
+    upstream = Metrics.upstream(job.pool_id || job.url || "unknown")
+    Metrics.job_failed(job.user_id, upstream, reason)
+
+    Phoenix.PubSub.broadcast(
+      EzthrottleLocal.PubSub,
+      "job:#{job.id}",
+      {:job_event, %{event: "failed", job_id: job.id, reason: reason}}
+    )
+
+    maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, %{
+      job_id: job.id,
+      status: "failed",
+      reason: reason
+    })
+  end
+
+  defp execute(
+         %Job{} = job,
+         dispatch_url,
+         parent,
+         flow_rate,
+         max_concurrent,
+         queue_key,
+         pool_pid,
+         member_id
+       ) do
     started_at = System.monotonic_time(:millisecond)
-    upstream = Metrics.upstream(job.url)
+    upstream = Metrics.upstream(job.pool_id || dispatch_url)
 
     IdempotentStore.update_status(job.id, :in_flight)
     Metrics.job_dispatched(job.user_id, upstream)
@@ -220,10 +300,12 @@ defmodule EzthrottleLocal.AccountQueue do
        }}
     )
 
-    result = make_request(job, flow_rate, max_concurrent, queue_key)
+    result = make_request(job, dispatch_url, flow_rate, max_concurrent, queue_key)
 
     case result do
       {:ok, %{status: status, body: body, headers: resp_headers}} ->
+        record_pool_outcome(pool_pid, member_id, status)
+
         rps = parse_rps_header(resp_headers)
         max_concurrent = parse_max_concurrent_header(resp_headers)
         account_queue = parse_account_queue_header(resp_headers)
@@ -257,6 +339,8 @@ defmodule EzthrottleLocal.AccountQueue do
         })
 
       {:error, reason} ->
+        if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
+
         GenServer.call(parent, {:job_done, nil, nil, nil})
 
         IdempotentStore.update_status(job.id, :failed)
@@ -281,6 +365,20 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
+  # A dispatch attempt that comes back with a 5xx still "succeeded" from
+  # httpc's point of view (a real response, not a connection error) but
+  # is a genuine failure for reputation purposes -- mirrors Aquifer's
+  # execute() checking resp.StatusCode >= 500 after a successful HTTP
+  # round trip, not just the connection-error branch.
+  defp record_pool_outcome(nil, _member_id, _status), do: :ok
+  defp record_pool_outcome(_pool_pid, nil, _status), do: :ok
+
+  defp record_pool_outcome(pool_pid, member_id, status) when status >= 500,
+    do: Pool.record_failure(pool_pid, member_id)
+
+  defp record_pool_outcome(pool_pid, member_id, _status),
+    do: Pool.record_success(pool_pid, member_id)
+
   defp maybe_deliver_webhook(:stream, _job, _payload), do: :ok
   defp maybe_deliver_webhook(_mode, job, payload), do: Webhook.deliver(job.webhook_url, payload)
 
@@ -288,9 +386,9 @@ defmodule EzthrottleLocal.AccountQueue do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
   end
 
-  defp make_request(%Job{} = job, flow_rate, max_concurrent, queue_key) do
+  defp make_request(%Job{} = job, dispatch_url, flow_rate, max_concurrent, queue_key) do
     %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()
-    url = String.to_charlist(job.url)
+    url = String.to_charlist(dispatch_url)
     account_queue_enabled = queue_key != :shared
     queue_key_header = if account_queue_enabled, do: to_string(queue_key), else: "shared"
 

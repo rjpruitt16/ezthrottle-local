@@ -1,17 +1,24 @@
 defmodule EzthrottleLocal.Admission do
   @moduledoc """
-  Opt-in memory/DB-size ceilings that protect this instance from the
+  Memory/DB-size/body-size ceilings that protect this instance from the
   traffic it's meant to be absorbing, mirroring Aquifer's admission
-  control. All limits are opt-in: an unset or zero env var disables that
-  particular check, preserving unbounded behavior for anyone who hasn't
-  configured them.
+  control. Body-size and DB-size limits default on, sized off the
+  infrastructure this project is actually benchmarked against (a single
+  512MB Fly.io instance with a 1GB volume — see benchmark.md); an
+  explicit 0 still disables a given check. Memory has no safe
+  one-size-fits-all default (it depends on the deployment's own memory
+  budget, not benchmarked disk usage), so it stays disabled unless set
+  explicitly — start_link/1 logs a warning when it's unset.
 
   Env vars:
     EZTHROTTLE_MEMORY_LIMIT_MB      - reject new jobs once BEAM's total
                                        memory exceeds this many MB
+                                       (default: disabled)
     EZTHROTTLE_MAX_BODY_BYTES       - reject oversized request bodies (413)
+                                       (default: 1MB)
     EZTHROTTLE_DB_MAX_BYTES         - reject new jobs once the Mnesia
                                        directory exceeds this many bytes
+                                       (default: 800MB)
     EZTHROTTLE_RETRY_AFTER_SECONDS  - base Retry-After on a 429 (default 5)
 
   Retry-After doubles on each consecutive rejection (capped at 60s),
@@ -19,16 +26,26 @@ defmodule EzthrottleLocal.Admission do
   """
 
   use Agent
+  require Logger
 
   @max_retry_after_seconds 60
+  @default_max_body_bytes 1 * 1024 * 1024
+  @default_db_max_bytes 800 * 1024 * 1024
 
   def start_link(_opts) do
+    if env_int("EZTHROTTLE_MEMORY_LIMIT_MB", 0) == 0 do
+      Logger.warning(
+        "[Admission] EZTHROTTLE_MEMORY_LIMIT_MB is not set — BEAM memory is unbounded. " <>
+          "Benchmarked safe at 400MB on a 512MB instance; set it to protect against OOM under burst load."
+      )
+    end
+
     Agent.start_link(fn -> %{reject_streak: 0} end, name: __MODULE__)
   end
 
   def memory_limit_mb, do: env_int("EZTHROTTLE_MEMORY_LIMIT_MB", 0)
-  def max_body_bytes, do: env_int("EZTHROTTLE_MAX_BODY_BYTES", 0)
-  def db_max_bytes, do: env_int("EZTHROTTLE_DB_MAX_BYTES", 0)
+  def max_body_bytes, do: env_int("EZTHROTTLE_MAX_BODY_BYTES", @default_max_body_bytes)
+  def db_max_bytes, do: env_int("EZTHROTTLE_DB_MAX_BYTES", @default_db_max_bytes)
   def base_retry_after_seconds, do: env_int("EZTHROTTLE_RETRY_AFTER_SECONDS", 5)
 
   @doc "True if at least one limit is actually configured, not just whether this process is running."

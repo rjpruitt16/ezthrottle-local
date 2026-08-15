@@ -2,8 +2,8 @@ defmodule EzthrottleLocalWeb.Plugs.BodyLimit do
   @moduledoc """
   Rejects oversized request bodies with 413 before Plug.Parsers reads them,
   mirroring Aquifer's http.MaxBytesReader-driven behavior. Controlled by
-  EZTHROTTLE_MAX_BODY_BYTES (0/unset = disabled, matching admission
-  control's opt-in pattern).
+  EZTHROTTLE_MAX_BODY_BYTES (defaults to 1MB; explicit 0 disables it — see
+  EzthrottleLocal.Admission).
 
   This checks Content-Length up front rather than counting bytes as the
   body streams in, so it only catches clients that send that header — a

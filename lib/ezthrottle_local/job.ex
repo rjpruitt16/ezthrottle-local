@@ -11,7 +11,8 @@ defmodule EzthrottleLocal.Job do
           id: String.t(),
           user_id: String.t(),
           idempotent_key: String.t(),
-          url: String.t(),
+          url: String.t() | nil,
+          pool_id: String.t() | nil,
           method: String.t(),
           headers: map(),
           body: String.t() | nil,
@@ -25,6 +26,7 @@ defmodule EzthrottleLocal.Job do
     :user_id,
     :idempotent_key,
     :url,
+    :pool_id,
     :method,
     :headers,
     :body,
@@ -35,10 +37,15 @@ defmodule EzthrottleLocal.Job do
 
   @doc """
   Build a Job from validated params. Returns {:ok, job} or {:error, reason}.
+  Exactly one of "url" or "pool_id" must be set -- a job dispatches to a
+  fixed URL or to a registered pool, never both.
   """
   def new(params) do
+    url = blank_to_nil(Map.get(params, "url"))
+    pool_id = blank_to_nil(Map.get(params, "pool_id"))
+
     with {:ok, user_id} <- require_field(params, "user_id"),
-         {:ok, url} <- require_field(params, "url"),
+         :ok <- require_exactly_one_of_url_or_pool_id(url, pool_id),
          {:ok, method} <- require_field(params, "method"),
          {:ok, webhook_url} <- require_field(params, "webhook_url"),
          {:ok, idempotent_key} <- require_field(params, "idempotent_key") do
@@ -48,6 +55,7 @@ defmodule EzthrottleLocal.Job do
          user_id: user_id,
          idempotent_key: idempotent_key,
          url: url,
+         pool_id: pool_id,
          method: String.upcase(method),
          headers: Map.get(params, "headers", %{}),
          body: Map.get(params, "body"),
@@ -57,6 +65,18 @@ defmodule EzthrottleLocal.Job do
        }}
     end
   end
+
+  defp require_exactly_one_of_url_or_pool_id(nil, nil),
+    do: {:error, "either url or pool_id is required"}
+
+  defp require_exactly_one_of_url_or_pool_id(url, pool_id) when url != nil and pool_id != nil,
+    do: {:error, "url and pool_id are mutually exclusive -- a job dispatches to one or the other"}
+
+  defp require_exactly_one_of_url_or_pool_id(_url, _pool_id), do: :ok
+
+  defp blank_to_nil(nil), do: nil
+  defp blank_to_nil(""), do: nil
+  defp blank_to_nil(val), do: val
 
   @doc """
   Extract the API key from job headers to determine which AccountQueue to route to.

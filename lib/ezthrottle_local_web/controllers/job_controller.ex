@@ -70,6 +70,7 @@ defmodule EzthrottleLocalWeb.JobController do
           job_id: job_id,
           status: status,
           url: job.url,
+          pool_id: job.pool_id,
           method: job.method,
           created_at: job.created_at
         })

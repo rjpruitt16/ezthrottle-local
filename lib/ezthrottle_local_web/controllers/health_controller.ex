@@ -6,7 +6,8 @@ defmodule EzthrottleLocalWeb.HealthController do
       status: "ok",
       l8_protocol: "0.1",
       l8_public_key: EzthrottleLocal.L8.pub_b64(),
-      admission: EzthrottleLocal.Admission.snapshot()
+      admission: EzthrottleLocal.Admission.snapshot(),
+      pools: EzthrottleLocal.PoolRegistry.snapshot()
     })
   end
 end
