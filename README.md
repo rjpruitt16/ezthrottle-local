@@ -261,7 +261,7 @@ Traditional webhook security shares a secret between sender and receiver, stored
 3. Trust is cached to disk as `l8-trust/{domain}.json` — the handshake never runs again for that domain
 4. Every delivery carries `X-L8-Signature` headers, verified locally with a single Ed25519 call — no database lookup, no round-trip to any authority, microseconds
 
-Trust stays deliberately pairwise, not transitive, by design. For better security and less latency than a shared-secret scheme, see the [L8 spec](https://rjpruitt16.github.io/l8-protocol/) for the full protocol rationale.
+Trust stays deliberately pairwise, not transitive, by design. For better security and less latency than a shared-secret scheme, see the [L8 spec](https://rjpruitt16.github.io/l8-protocol/) for the full protocol rationale — the same canonical spec [Aquifer](https://github.com/rjpruitt16/aquifer) follows.
 
 Set `L8_PRIVATE_KEY` (base64 Ed25519 private key) for a stable identity across restarts, or let EZThrottle auto-generate one on first start. Delete `l8-trust/{domain}.json` to revoke trust with a domain — the handshake re-runs on next delivery.
 
