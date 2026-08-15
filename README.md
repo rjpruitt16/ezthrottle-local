@@ -55,6 +55,8 @@ Disable it any time by responding with `X-Aqueduct-Account-Queue: disabled`.
 
 Each tenant's own pace is still capped by the upstream's actual budget, though — a background check keeps the *sum* of every active tenant queue's rate within the upstream's configured (or, for a pool-backed upstream, live aggregate) ceiling, throttling proportionally if too many tenants are active at once. Isolation between tenants doesn't mean each one gets its own unbounded copy of the full rate.
 
+**This has a network effect.** The value isn't capped at one deployment: the more tools, agents, and services that speak `X-Aqueduct-*`, the more traffic across the whole internet can coordinate directly with each other instead of every client guessing alone under load. Each new adopter makes the signal more useful to every other adopter, not just to itself.
+
 ---
 
 ## Agent-native load balancing
@@ -264,6 +266,8 @@ EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protoc
 4. Every webhook delivery carries `X-L8-Signature` headers the receiver verifies locally — no database query, no round-trip, microseconds
 
 **Why this keeps things fast:** Verification is a single local Ed25519 `verify()` call against a cached public key. No shared state, no HTTP call.
+
+**This also has a network effect, of a different kind than the pacing headers above.** L8 trust stays deliberately pairwise — a receiver verifies each sender's key directly, on first contact, cached for that pair; there's no transitive "I trust A, A vouches for B, so I trust B" chain, and there shouldn't be, since that's exactly the kind of indirection that makes forged trust possible. The network effect here is protocol standardization, not trust propagation: once a receiver implements the L8 verification endpoint once, *any* sender that speaks L8 can start delivering trustlessly with no new secret to provision or rotate per sender. The marginal cost of the next integration drops as more senders adopt the protocol — the same way supporting HTTPS once means supporting any HTTPS client, not a fresh negotiation per client.
 
 **Key management:**
 
