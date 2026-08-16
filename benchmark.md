@@ -1,4 +1,4 @@
-# Benchmarks — and a comparison against Aquifer
+# Benchmarks
 
 Real runs against a live deployment (`ezthrottle-local.fly.dev`), not simulated numbers — the same `shared-cpu-1x` / 512MB Fly.io tier, same region (`iad`), and the same benchmark methodology used for [Aquifer's own benchmark.md](https://github.com/rjpruitt16/aquifer/blob/main/benchmark.md), Aquifer being the Go/SQLite sibling this project mirrors. Scripts are in [`benchmark/`](benchmark/), ported directly from Aquifer's with only the target defaults changed.
 
@@ -20,9 +20,9 @@ All five are now fixed. Two of them (durability, the race) surfaced genuinely ne
 
 ---
 
-## 1. Mnesia durability — and a real gap Mnesia itself has by default
+## 1. Mnesia durability
 
-Replaced ETS with Mnesia `disc_copies` tables. This was not a drop-in swap — two real problems had to be found and fixed before durability was actually real, not just assumed:
+Replaced ETS with Mnesia `disc_copies` tables. This wasn't a drop-in swap: two real problems had to be found and fixed before durability was actually real, not just assumed, including a gap in Mnesia's own default behavior.
 
 **Startup ordering.** `:mnesia` was listed in `extra_applications`, which OTP auto-starts *before* `EzthrottleLocal.Application.start/2` runs — meaning Mnesia started with its default (unconfigured, effectively RAM-only) directory before our code ever got a chance to set `:dir`. Fixed by moving `:mnesia` to `included_applications` (bundles its code into a release without OTP auto-starting it) and starting it explicitly, after configuring the directory, in `IdempotentStore.ensure_schema!/0`.
 
@@ -45,7 +45,7 @@ dump_log: :dumped
 read_after_crash: {:atomic, [{:foo, "a", "hello"}]}   # survives
 ```
 
-This is not a Mnesia bug — it's Mnesia's actual, documented default trade-off (durability vs. write throughput), and it would have made the crash-durability claim quietly false: "survives a graceful shutdown" is not the same guarantee as "survives a crash," and crash survival is the entire point of switching off ETS.
+This isn't a Mnesia bug. It's Mnesia's actual, documented default trade-off between durability and write throughput. Left unfixed, it would have made the crash-durability claim quietly false: "survives a graceful shutdown" isn't the same guarantee as "survives a crash," and crash survival is the entire point of switching off ETS.
 
 **The cost, and the fix for the cost.** Flushing on every single write reintroduced a real per-request latency tax — see section 3. The final design (`EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS`, default 100ms) batches the flush on a timer instead of forcing it inline per request, bounding the loss window to at most that interval on a true crash rather than eliminating it entirely — the same trade-off SQLite's own `synchronous=NORMAL` already makes (Aquifer doesn't get zero-loss-on-every-write either), and the same one Postgres's `synchronous_commit=off` makes explicitly.
 
@@ -65,11 +65,11 @@ Matches Aquifer's own 30/30 crash-recovery result exactly.
 
 ---
 
-## 2. The concurrency race — found independently, same class of bug as Aquifer's
+## 2. The concurrency race
 
 `check_or_insert`'s lookup-then-insert was non-atomic. Fixed by wrapping both the read and the write in a single `:mnesia.sync_transaction`, which Mnesia's transaction manager serializes correctly (unlike raw `:ets.lookup`/`:ets.insert`, which have no such guarantee). Covered by a new test (`idempotent_store_test.exs`) firing 50 concurrent unique-key inserts and asserting none are misreported as duplicates — stable across repeated runs.
 
-This is the same shape of bug found and fixed in Aquifer's `CheckOrInsert` earlier this session (a `SELECT`-after-`INSERT OR IGNORE` race there, rather than a lookup-then-insert race here) — different mechanism, same underlying lesson: a "check then act" pattern across two separate operations is never actually atomic unless something explicitly makes it so.
+Found independently, but the same shape of bug as Aquifer's `CheckOrInsert` (a `SELECT`-after-`INSERT OR IGNORE` race there, a lookup-then-insert race here). Different mechanism, same lesson: a "check then act" pattern across two separate operations is never actually atomic unless something explicitly makes it so.
 
 ---
 
@@ -102,7 +102,7 @@ Full recovery — mean latency dropped from 11.3s to 76ms.
 
 ---
 
-## 4. Throughput ceiling — and how it compares to Aquifer's
+## 4. Throughput ceiling
 
 With the batched flush in place, a ramp against the same tier:
 
@@ -117,7 +117,7 @@ With the batched flush in place, a ramp against the same tier:
 
 So the real ceiling here sits between 800 and 1000 req/s (1 shared vCPU): still fully successful at 800 (just with materially worse tail latency), genuinely breaking down at 1000.
 
-This is a notably higher ceiling than Aquifer's own post-fix numbers on the identical tier — Aquifer's single-SQLite-connection-pool architecture (even after fixing the `SetMaxOpenConns(1)` bug this session) sits at a real ceiling around 400 req/s, with 200 req/s already showing run-to-run variance. A plausible explanation, not yet fully isolated: BEAM's per-request lightweight-process model has no equivalent to a shared connection pool as the serialization point — each request gets its own process, and Mnesia's RAM-resident table doesn't have SQLite's single-writer lock contention in the same way. This is a real, measured difference, not a design guess — but pinning down exactly which piece of the architecture (process model vs. storage engine vs. something else) accounts for the gap would need further isolation than this session did.
+That's notably higher than Aquifer's own post-fix numbers on the identical tier: Aquifer's single-SQLite-connection-pool architecture (even after fixing the `SetMaxOpenConns(1)` bug this session) sits at a real ceiling around 400 req/s, with 200 req/s already showing run-to-run variance. It's a real, measured difference, though the exact cause isn't fully isolated. A plausible explanation: BEAM's per-request lightweight-process model has no equivalent to a shared connection pool as the serialization point — each request gets its own process, and Mnesia's RAM-resident table doesn't have SQLite's single-writer lock contention in the same way. Pinning down exactly which piece of the architecture (process model vs. storage engine vs. something else) accounts for the gap would need further isolation than this session did.
 
 ### Does the flush interval have a sweet spot, or is "longer is better"?
 
@@ -128,7 +128,7 @@ Tested raising `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` from 100ms to 250ms, expect
 | 800/s | 100% success, mean 1.7s, p99 8.1s | 100% success, mean **3.5s**, p99 **13.0s** |
 | 1000/s | 97.98% success | **88.37%** success, more `502`s |
 
-Not monotonic — there's a sweet spot, not "longer batching is always better." A longer interval means more writes accumulate between flushes, so each individual flush becomes a bigger, more disruptive batch to write out, trading flush *frequency* for flush *size* in a way that made tail latency worse, not better. Same shape of trade-off as Postgres's checkpoint tuning: too-infrequent checkpoints cause bigger I/O spikes at checkpoint time even though they reduce average overhead. 100ms was already on the better side of that curve for this workload; going lower wasn't tested, but going higher clearly wasn't the right direction.
+There's a sweet spot rather than a straight line where longer batching is always better. A longer interval means more writes accumulate between flushes, so each individual flush becomes a bigger, more disruptive batch to write out — trading flush *frequency* for flush *size* in a way that made tail latency worse here, not better. Same shape of trade-off as Postgres's checkpoint tuning: too-infrequent checkpoints cause bigger I/O spikes at checkpoint time even though they reduce average overhead. 100ms was already on the better side of that curve for this workload; going lower wasn't tested, but going higher clearly wasn't the right direction.
 
 ### Scaling with CPU cores (flush interval held at 100ms)
 
@@ -141,15 +141,15 @@ With the ceiling not moving via flush tuning, the next lever tested was raw CPU 
 | 1500/s | *(not tested at 1 vCPU)* | 67.48% success — real failures begin |
 | 2000/s | *(not tested at 1 vCPU)* | **0% success** — total collapse, health check itself stopped responding |
 
-Unlike the flush-interval knob, more cores helped cleanly and substantially — 1000 req/s went from "first cracks appearing" to fully clean, and the real ceiling moved from ~800-1000 req/s to somewhere between 1000-1500 req/s. This is the more promising lever of the two tested: CPU headroom directly addresses the actual bottleneck (BEAM scheduling more concurrent requests across more cores), whereas the flush interval was tuning a cost that was already reasonably well-amortized at 100ms.
+More cores helped cleanly and substantially, unlike the flush-interval knob: 1000 req/s went from "first cracks appearing" to fully clean, and the real ceiling moved from ~800-1000 req/s to somewhere between 1000-1500 req/s. It's the more promising lever of the two tested — CPU headroom directly addresses the actual bottleneck (BEAM scheduling more concurrent requests across more cores), while the flush interval was tuning a cost that was already reasonably well-amortized at 100ms.
 
 **Drain time**: identical story to Aquifer — bound by the configured per-domain dispatch pace (2 RPS default here too), not by machine resources.
 
 ---
 
-## 5. Multi-tenant fairness — a second version of the exact bug Aquifer had
+## 5. Multi-tenant fairness
 
-Running the ported `fairness.sh` first surfaced a gap: sending `X-Aqueduct-Account-Queue: enabled` on the job-creation request had no effect — the quiet tenant's jobs still took 35-52 seconds each, stuck behind the noisy tenant's 100-job flood. Root cause: unlike Aquifer, account-queue mode here could only be toggled by the *upstream's response* header or static config — there was no code path at all for the client's own request header to reach `UrlActor`.
+Running the ported `fairness.sh` surfaced a second version of the exact bug Aquifer had: sending `X-Aqueduct-Account-Queue: enabled` on the job-creation request had no effect. The quiet tenant's jobs still took 35-52 seconds each, stuck behind the noisy tenant's 100-job flood. Root cause: unlike Aquifer, account-queue mode here could only be toggled by the *upstream's response* header or static config — there was no code path at all for the client's own request header to reach `UrlActor`.
 
 Fixed by adding request-header parsing (`X-Aqueduct-Account-Queue`, falling back to `X-EZThrottle-Account-Queue`) in `job_controller.ex`, threaded through `AccountQueueRegistry.enqueue/2` to `UrlActor.enable_account_queue/1`. Verified two ways: a white-box test (`account_queue_header_test.exs`) asserting directly on `UrlActor`'s internal queue-key state, and a live re-run of `fairness.sh`:
 
