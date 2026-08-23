@@ -137,6 +137,27 @@ Matches Aquifer's post-fix result (1-5s) almost exactly.
 
 ---
 
+## 6. GPU inference and the retry tax (RunPod/vLLM)
+
+Ported from Aquifer's identical benchmark (see its `benchmark.md`) after porting the underlying feature: `lib/ezthrottle_local/orca.ex` reads vLLM's `kv_cache_usage_perc` from the `endpoint-load-metrics` response header as a fallback pacing signal, same thresholds as Aquifer's `orca.go`. Same GPU, same vLLM instance, same job payload shape (`POST /jobs` is schema-identical between the two).
+
+**Same offered load (40 req/s for 30s), direct-to-vLLM vs. through EZThrottle:**
+
+| | Direct | Through EZThrottle |
+|---|---|---|
+| Client success | 100% | 100% |
+| Client mean latency | 11.4s | 5.9ms |
+| Peak vLLM-side queue depth | 447 waiting | 0 waiting |
+| Peak `kv_cache_usage_perc` | 70.1% | 1.9% |
+
+Ingest absorbs the burst exactly like Aquifer's — 100% success, single-digit-millisecond latency, full 40 req/s accepted instantly. But actual dispatch to vLLM never went above **1 concurrent request**, and stayed there for the whole run.
+
+**Why, and a real gap this surfaced:** unlike Aquifer, which has a per-upstream `max_concurrent` set via `CONFIG_PATH`, EZThrottle Local's `max_concurrent` has no config knob at all — every `UrlActor` starts at a hardcoded `1` and only rises if the upstream sends back an explicit `X-Aqueduct-Max-Concurrent`/`X-EZTHROTTLE-MAX-CONCURRENT` header. vLLM doesn't send that (it only speaks ORCA), so concurrency never left 1. That's an extremely conservative default in one sense — vLLM was never at real risk here regardless of the burst size — but it also means the ORCA rps signal had no room to matter: with only one in-flight request at a time, `kv_cache_usage_perc` never came close to the 70% threshold that would trigger a pacing cut.
+
+`orca.ex` itself is correct and covered by unit tests (`test/ezthrottle_local/orca_test.exs`, 8 tests mirroring Aquifer's `orca_test.go` exactly) — the mechanism is proven at the unit level; this run just didn't have the concurrency headroom to exercise it end-to-end against a real GPU the way Aquifer's did. Filed as [issue #7](https://github.com/rjpruitt16/ezthrottle-local/issues/7) to add a `default_max_concurrent` config knob (mirroring `default_rps`, which had the same gap and was fixed as part of this port) rather than building it unprompted.
+
+---
+
 ## Reproducing these results
 
 ```bash
@@ -146,6 +167,10 @@ cd benchmark
 ./admission_degradation.sh <target-url> 150 45s
 ./crash_recovery.sh <target-url> <fly-app-name> 30
 ./fairness.sh <target-url> 100
+
+# GPU retry tax -- needs a real vLLM instance (RunPod or otherwise),
+# not part of the regular pass:
+./gpu_retry_tax.sh <vllm-url> <ezthrottle-url> 40 40 300
 ```
 
 Pointed at `ezthrottle-local.fly.dev` by default.

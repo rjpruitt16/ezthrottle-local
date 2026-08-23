@@ -66,6 +66,19 @@ defmodule EzthrottleLocal.PoolTest do
     assert rep3 > rep2 and rep3 < 1.0
   end
 
+  test "heartbeat gradually recovers reputation without resetting to full trust", %{pool: pool} do
+    :ok = Pool.register(pool, "restarted", "http://old", 10.0, 60_000)
+    Pool.record_failure(pool, "restarted")
+    Pool.record_failure(pool, "restarted")
+
+    [%{reputation: before}] = Pool.snapshot(pool)
+    :ok = Pool.register(pool, "restarted", "http://new", 10.0, 60_000)
+    [%{reputation: after_heartbeat}] = Pool.snapshot(pool)
+
+    assert after_heartbeat > before
+    assert after_heartbeat < 1.0
+  end
+
   test "does not evict immediately on reaching the floor", %{pool: pool} do
     :ok = Pool.register(pool, "dying", "http://dying", 10.0, 60_000)
 

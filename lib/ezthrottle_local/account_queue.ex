@@ -19,6 +19,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @idle_timeout_ms 300_000
   @min_rps 0.5
   @position_broadcast_ms 2_000
+  @max_retries 4
 
   defstruct [
     :queue_key,
@@ -123,14 +124,14 @@ defmodule EzthrottleLocal.AccountQueue do
 
       true ->
         case resolve_target(state) do
-          {:no_pool_members, job, remaining_queue} ->
-            # Pool-backed queue with nothing registered -- fail this job
-            # immediately rather than blocking the whole queue behind an
-            # empty pool, then keep processing whatever's next.
-            Metrics.queue_depth(state.upstream, :queue.len(remaining_queue))
-            fail_immediately(job, "no pool members registered")
-            send(self(), :process_next)
-            {:noreply, %{state | queue: remaining_queue}, @idle_timeout_ms}
+          :no_pool_members ->
+            # Pool-backed queue with no live members yet. This can happen
+            # during process restart before workers have had time to
+            # heartbeat back in, so keep the head job queued and retry
+            # later instead of turning temporary absence into terminal
+            # failure.
+            Process.send_after(self(), :process_next, no_pool_members_retry_ms())
+            {:noreply, state, @idle_timeout_ms}
 
           {:ok, job, dispatch_url, member, remaining_queue} ->
             # Enforce RPS with jitter to prevent synchronized bursts across queues
@@ -245,33 +246,14 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   defp resolve_target(%{pool_pid: pool_pid} = state) do
-    {{:value, job}, remaining_queue} = :queue.out(state.queue)
-
     case Pool.pick(pool_pid) do
-      nil -> {:no_pool_members, job, remaining_queue}
-      member -> {:ok, job, member.address, member, remaining_queue}
+      nil ->
+        :no_pool_members
+
+      member ->
+        {{:value, job}, remaining_queue} = :queue.out(state.queue)
+        {:ok, job, member.address, member, remaining_queue}
     end
-  end
-
-  # Fails a job that never even attempted dispatch (e.g. an empty pool) --
-  # mirrors the terminal-failure shape of execute/8's error branch, just
-  # without a request ever having gone out.
-  defp fail_immediately(%Job{} = job, reason) do
-    IdempotentStore.update_status(job.id, :failed)
-    upstream = Metrics.upstream(job.pool_id || job.url || "unknown")
-    Metrics.job_failed(job.user_id, upstream, reason)
-
-    Phoenix.PubSub.broadcast(
-      EzthrottleLocal.PubSub,
-      "job:#{job.id}",
-      {:job_event, %{event: "failed", job_id: job.id, reason: reason}}
-    )
-
-    maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, %{
-      job_id: job.id,
-      status: "failed",
-      reason: reason
-    })
   end
 
   defp execute(
@@ -300,13 +282,24 @@ defmodule EzthrottleLocal.AccountQueue do
        }}
     )
 
-    result = make_request(job, dispatch_url, flow_rate, max_concurrent, queue_key)
+    result =
+      dispatch_with_retries(
+        job,
+        dispatch_url,
+        flow_rate,
+        max_concurrent,
+        queue_key,
+        pool_pid,
+        member_id,
+        0
+      )
 
     case result do
-      {:ok, %{status: status, body: body, headers: resp_headers}} ->
-        record_pool_outcome(pool_pid, member_id, status)
+      {:ok, %{status: status, body: body, headers: resp_headers}, successful_member_id} ->
+        if pool_pid && successful_member_id,
+          do: Pool.record_success(pool_pid, successful_member_id)
 
-        rps = parse_rps_header(resp_headers)
+        rps = parse_rps_header(resp_headers) || EzthrottleLocal.Orca.rps(resp_headers)
         max_concurrent = parse_max_concurrent_header(resp_headers)
         account_queue = parse_account_queue_header(resp_headers)
         GenServer.call(parent, {:job_done, rps, max_concurrent, account_queue})
@@ -338,49 +331,139 @@ defmodule EzthrottleLocal.AccountQueue do
           body: body
         })
 
-      {:error, reason} ->
-        if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
-
+      {:error, reason, response} ->
         GenServer.call(parent, {:job_done, nil, nil, nil})
 
         IdempotentStore.update_status(job.id, :failed)
-        Metrics.job_failed(job.user_id, upstream, inspect(reason))
+        Metrics.job_failed(job.user_id, upstream, to_string(reason))
+
+        failed_event =
+          %{
+            event: "failed",
+            job_id: job.id,
+            reason: to_string(reason)
+          }
+          |> maybe_put_response(response)
 
         Phoenix.PubSub.broadcast(
           EzthrottleLocal.PubSub,
           "job:#{job.id}",
-          {:job_event,
-           %{
-             event: "failed",
-             job_id: job.id,
-             reason: inspect(reason)
-           }}
+          {:job_event, failed_event}
         )
 
-        maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, %{
-          job_id: job.id,
-          status: "failed",
-          reason: inspect(reason)
-        })
+        failed_payload =
+          %{
+            job_id: job.id,
+            status: "failed",
+            reason: to_string(reason)
+          }
+          |> maybe_put_response(response)
+
+        maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, failed_payload)
     end
   end
 
-  # A dispatch attempt that comes back with a 5xx still "succeeded" from
-  # httpc's point of view (a real response, not a connection error) but
-  # is a genuine failure for reputation purposes -- mirrors Aquifer's
-  # execute() checking resp.StatusCode >= 500 after a successful HTTP
-  # round trip, not just the connection-error branch.
-  defp record_pool_outcome(nil, _member_id, _status), do: :ok
-  defp record_pool_outcome(_pool_pid, nil, _status), do: :ok
+  defp dispatch_with_retries(
+         job,
+         dispatch_url,
+         flow_rate,
+         max_concurrent,
+         queue_key,
+         pool_pid,
+         member_id,
+         attempt
+       ) do
+    case make_request(job, dispatch_url, flow_rate, max_concurrent, queue_key) do
+      {:ok, %{status: status} = response} when status >= 500 ->
+        if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
 
-  defp record_pool_outcome(pool_pid, member_id, status) when status >= 500,
-    do: Pool.record_failure(pool_pid, member_id)
+        if attempt < max_retries() do
+          sleep_before_retry(attempt)
 
-  defp record_pool_outcome(pool_pid, member_id, _status),
-    do: Pool.record_success(pool_pid, member_id)
+          case next_dispatch_target(pool_pid, dispatch_url) do
+            {:ok, next_url, next_member_id} ->
+              dispatch_with_retries(
+                job,
+                next_url,
+                flow_rate,
+                max_concurrent,
+                queue_key,
+                pool_pid,
+                next_member_id,
+                attempt + 1
+              )
+
+            :no_pool_members ->
+              {:error, "no pool members registered", nil}
+          end
+        else
+          {:error, "upstream returned #{status}", response}
+        end
+
+      {:ok, %{status: _status} = response} ->
+        {:ok, response, member_id}
+
+      {:error, reason} ->
+        if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
+
+        if attempt < max_retries() do
+          sleep_before_retry(attempt)
+
+          case next_dispatch_target(pool_pid, dispatch_url) do
+            {:ok, next_url, next_member_id} ->
+              dispatch_with_retries(
+                job,
+                next_url,
+                flow_rate,
+                max_concurrent,
+                queue_key,
+                pool_pid,
+                next_member_id,
+                attempt + 1
+              )
+
+            :no_pool_members ->
+              {:error, "no pool members registered", nil}
+          end
+        else
+          {:error, inspect(reason), nil}
+        end
+    end
+  end
+
+  defp next_dispatch_target(nil, dispatch_url), do: {:ok, dispatch_url, nil}
+
+  defp next_dispatch_target(pool_pid, _dispatch_url) do
+    case Pool.pick(pool_pid) do
+      nil -> :no_pool_members
+      member -> {:ok, member.address, member.id}
+    end
+  end
+
+  defp maybe_put_response(payload, nil), do: payload
+
+  defp maybe_put_response(payload, %{status: status, body: body}) do
+    payload
+    |> Map.put(:response_status, status)
+    |> Map.put(:body, body)
+  end
 
   defp maybe_deliver_webhook(:stream, _job, _payload), do: :ok
   defp maybe_deliver_webhook(_mode, job, payload), do: Webhook.deliver(job.webhook_url, payload)
+
+  defp max_retries,
+    do: Application.get_env(:ezthrottle_local, :dispatch_max_retries, @max_retries)
+
+  defp no_pool_members_retry_ms,
+    do: Application.get_env(:ezthrottle_local, :no_pool_members_retry_ms, 1_000)
+
+  defp retry_backoff_ms(attempt), do: trunc(:math.pow(2, attempt) * 1_000)
+
+  defp sleep_before_retry(attempt) do
+    Process.sleep(
+      Application.get_env(:ezthrottle_local, :dispatch_retry_ms, retry_backoff_ms(attempt))
+    )
+  end
 
   defp schedule_position_broadcast do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
@@ -410,8 +493,10 @@ defmodule EzthrottleLocal.AccountQueue do
        if(account_queue_enabled, do: "account", else: "shared")}
     ]
 
-    headers =
-      headers_to_charlist(Enum.map(job.headers, fn {k, v} -> {k, v} end) ++ metric_headers)
+    job_headers = Enum.map(job.headers, fn {k, v} -> {k, v} end)
+    metric_headers = maybe_add_orca_opt_in(metric_headers, job_headers)
+
+    headers = headers_to_charlist(job_headers ++ metric_headers)
 
     method =
       case String.upcase(job.method) do
@@ -443,6 +528,22 @@ defmodule EzthrottleLocal.AccountQueue do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Opts every dispatch into ORCA reporting by default, unless the caller
+  # already set the format header explicitly -- mirrors Aquifer's
+  # account_queue.go, which sends this on every dispatch too.
+  defp maybe_add_orca_opt_in(metric_headers, job_headers) do
+    orca_header = EzthrottleLocal.Orca.request_header_name()
+
+    already_set? =
+      Enum.any?(job_headers, fn {k, _v} -> String.downcase(k) == orca_header end)
+
+    if already_set? do
+      metric_headers
+    else
+      [{orca_header, "TEXT"} | metric_headers]
     end
   end
 

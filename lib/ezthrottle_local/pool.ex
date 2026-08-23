@@ -49,6 +49,10 @@ defmodule EzthrottleLocal.Pool do
   # immediately restore full trust.
   @reputation_recovery_factor 1.5
 
+  # Heartbeats prove liveness, not successful work, so they recover
+  # reputation more slowly than a successful dispatch.
+  @heartbeat_recovery_factor 1.1
+
   # Missing this many consecutive expected heartbeats (relative to the
   # member's own declared interval) evicts it for having gone silent,
   # independent of the reputation/failure path -- catches a member that
@@ -152,7 +156,8 @@ defmodule EzthrottleLocal.Pool do
           | address: address,
             declared_rps: declared_rps,
             heartbeat_interval_ms: heartbeat_interval_ms,
-            last_heartbeat: now
+            last_heartbeat: now,
+            reputation: min(1.0, existing.reputation * @heartbeat_recovery_factor)
         }
 
         {:reply, :ok, %{state | members: Map.put(state.members, id, updated)}}

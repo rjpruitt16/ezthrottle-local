@@ -6,7 +6,7 @@ EZThrottle Local is a self-hosted, agent-native load balancer for internal API t
 
 Kubernetes and modern orchestrators are great at scaling compute — but they were not designed for spiky traffic or tenant fairness. When a burst of agentic requests arrives, your pods get hammered, queues back up unevenly, and noisy tenants crowd out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready.
 
-Real numbers on durability, throughput ceiling, admission shedding, and multi-tenant fairness are in [benchmark.md](benchmark.md) — including a head-to-head comparison against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
+Real numbers on durability, throughput ceiling, admission shedding, multi-tenant fairness, and a [real GPU under load](benchmark.md#6-gpu-inference-and-the-retry-tax-runpodvllm) are in [benchmark.md](benchmark.md) — including a head-to-head comparison against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
 ## How it works
 
@@ -22,7 +22,7 @@ Client → POST /jobs → EZThrottle Local → paced outbound requests → Your 
 
 1. **Submit a job** — POST the request you want forwarded, with a `webhook_url` for the response.
 2. **EZThrottle queues it** — Jobs are held in memory and dispatched at the configured RPS.
-3. **Your API responds** — EZThrottle reads `X-Aqueduct-Rps`/`X-EZTHROTTLE-RPS` and `X-Aqueduct-Max-Concurrent`/`X-EZTHROTTLE-MAX-CONCURRENT` headers from the response and adjusts pace automatically. `X-Aqueduct-*` is read first if both are present — the shared protocol namespace also spoken by [Aquifer](https://github.com/rjpruitt16/aquifer), so a backend already emitting Aqueduct headers works against either implementation unchanged.
+3. **Your API responds** — EZThrottle reads `X-Aqueduct-Rps`/`X-EZTHROTTLE-RPS` and `X-Aqueduct-Max-Concurrent`/`X-EZTHROTTLE-MAX-CONCURRENT` headers from the response and adjusts pace automatically. `X-Aqueduct-*` is read first if both are present — the shared protocol namespace also spoken by [Aquifer](https://github.com/rjpruitt16/aquifer), so a backend already emitting Aqueduct headers works against either implementation unchanged. For backends that speak neither namespace but already report load some other way, EZThrottle falls back to [ORCA](https://github.com/cncf/xds/blob/main/xds/data/orca/v3/orca_load_report.proto) — vLLM supports this natively: EZThrottle sends `endpoint-load-metrics-format: TEXT` on every dispatch, and a response carrying an `endpoint-load-metrics` header with `kv_cache_usage_perc` is used to pace down (full rate below 70% utilization, 2 RPS at 70-90%, 0.5 RPS at 90-97%, 0.25 RPS above that) only when no explicit Aqueduct/EZThrottle header is present.
 4. **Stay on the line or hang up** — open `GET /jobs/:id/stream` to receive live events as the job moves through the queue, or disconnect and the result is delivered to your `webhook_url` when ready.
 
 ## Per-tenant fairness (AccountQueue mode)

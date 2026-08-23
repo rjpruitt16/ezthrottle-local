@@ -20,6 +20,17 @@ if System.get_env("PHX_SERVER") do
   config :ezthrottle_local, EzthrottleLocalWeb.Endpoint, server: true
 end
 
+# default_rps was already read via Application.get_env in url_actor.ex but
+# had no env var wired to it anywhere -- every UrlActor silently used the
+# 2.0 fallback regardless of deployment. Wired here the same way
+# MNESIA_DIR/EZTHROTTLE_MEMORY_LIMIT_MB already are.
+if rps = System.get_env("EZTHROTTLE_DEFAULT_RPS") do
+  case Float.parse(rps) do
+    {value, _} -> config :ezthrottle_local, default_rps: value
+    :error -> :ok
+  end
+end
+
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
