@@ -1,0 +1,100 @@
+# replicas: 1 is load-bearing, not a default left unconfigured. Mnesia
+# disc_copies here is a local, per-instance directory (MNESIA_DIR), and
+# pool membership plus the SSE/PubSub subscriber state are in-process only
+# (BEAM, not shared across nodes in this deployment shape). Scaling is by
+# **partitioning** -- running one instance per upstream domain or tenant --
+# not by adding replicas behind one Service. See the root README's
+# partitioning notes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ezthrottle-local
+  namespace: ezthrottle-local
+  labels:
+    app: ezthrottle-local
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # avoid two pods ever attaching the same RWO volume during a rollout
+  selector:
+    matchLabels:
+      app: ezthrottle-local
+  template:
+    metadata:
+      labels:
+        app: ezthrottle-local
+    spec:
+      containers:
+        - name: ezthrottle-local
+          image: your-registry/ezthrottle-local:latest # build from this repo's Dockerfile -- not currently published
+          ports:
+            - containerPort: 4000
+          env:
+            - name: PHX_SERVER
+              value: "true"
+            - name: PORT
+              value: "4000"
+            - name: PHX_HOST
+              value: ezthrottle-local.example.com # the Gateway's own hostname/domain in your cluster
+            - name: MNESIA_DIR
+              value: /data/mnesia
+            # Required, not optional -- rel/env.sh.eex otherwise names the
+            # Erlang node after $(hostname), which is the Pod's own name
+            # and changes on every single restart under a Deployment.
+            # Mnesia's disc_copies schema is tied to the exact node name
+            # that created it, so without this, ANY pod restart (rolling
+            # update, crash recovery, reschedule) makes Mnesia treat its
+            # own on-disk data as belonging to a node that no longer
+            # exists (node_not_running), crash-looping on boot. Confirmed
+            # by deleting the pod mid-test: without this var the new pod
+            # (different hostname) failed to boot; with it, the new pod
+            # came up clean and a job created before the restart was still
+            # readable after. Same fix already applied for Fly.io via
+            # FLY_APP_NAME in rel/env.sh.eex -- this is the K8s equivalent.
+            - name: RELEASE_NODE
+              value: ezthrottle-local@localhost
+            - name: SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: ezthrottle-local-secret
+                  key: secret-key-base
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            # Starting point only -- see the root README's "For maximum
+            # queue capacity" guidance and benchmark.md for real numbers
+            # before sizing this for your own traffic shape.
+            #
+            # No memory limit set, deliberately -- confirmed in testing
+            # (kind on Docker Desktop) that a memory limit here causes an
+            # immediate OOMKill (exit 137) on every boot attempt, at 512Mi
+            # AND at 1Gi, despite the app using ~136MiB in the exact same
+            # image run under plain `docker run -m 512m`. CPU limit alone
+            # is unaffected. Looked like a BEAM/cgroup memory-detection
+            # mismatch specific to this environment, not a real app
+            # memory requirement -- test carefully in your own cluster
+            # before adding one back, and set EZTHROTTLE_MEMORY_LIMIT_MB
+            # (the app's own admission-control limit, not a cgroup one)
+            # instead if you want a safety net.
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ezthrottle-local-data

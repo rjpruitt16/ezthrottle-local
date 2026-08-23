@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ezthrottle-local
+  namespace: ezthrottle-local
+spec:
+  selector:
+    app: ezthrottle-local
+  ports:
+    - port: 4000
+      targetPort: 4000
