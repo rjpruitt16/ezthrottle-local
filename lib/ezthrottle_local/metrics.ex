@@ -17,6 +17,10 @@ defmodule EzthrottleLocal.Metrics do
   @callback webhook_failed(url(), attempts :: integer()) :: :ok
   @callback queue_depth(upstream(), depth :: integer()) :: :ok
   @callback flow_rate(upstream(), rps :: float()) :: :ok
+  # Only ever fire when drain mode is enabled (see EzthrottleLocal.DrainFlush) --
+  # unreached on a deployment that never turns it on.
+  @callback drain_flush_succeeded(instance_key :: String.t(), ledger_size :: integer()) :: :ok
+  @callback drain_flush_failed(instance_key :: String.t(), ledger_size :: integer()) :: :ok
 
   def job_queued(user_id, upstream), do: call(:job_queued, [user_id, upstream])
   def job_dispatched(user_id, upstream), do: call(:job_dispatched, [user_id, upstream])
@@ -29,6 +33,12 @@ defmodule EzthrottleLocal.Metrics do
   def webhook_failed(url, attempts), do: call(:webhook_failed, [url, attempts])
   def queue_depth(upstream, depth), do: call(:queue_depth, [upstream, depth])
   def flow_rate(upstream, rps), do: call(:flow_rate, [upstream, rps])
+
+  def drain_flush_succeeded(instance_key, ledger_size),
+    do: call(:drain_flush_succeeded, [instance_key, ledger_size])
+
+  def drain_flush_failed(instance_key, ledger_size),
+    do: call(:drain_flush_failed, [instance_key, ledger_size])
 
   def upstream(raw_url) do
     case URI.parse(raw_url) do

@@ -10,8 +10,10 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   alias EzthrottleLocal.UrlActor
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.PoolRegistry
+  alias EzthrottleLocal.DrainFlush
 
   @table :url_actors
+  @idle_check_interval_ms 5_000
 
   # ---- Public API ----
 
@@ -38,7 +40,15 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   @impl true
   def init(_) do
     :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-    {:ok, %{}}
+
+    # Drain mode's watchdog: only scheduled at all if enabled?/0 is true at
+    # startup -- disabled means exactly that no periodic check ever runs,
+    # not a check that runs and no-ops. See EzthrottleLocal.DrainFlush.
+    if DrainFlush.enabled?() do
+      schedule_idle_check()
+    end
+
+    {:ok, %{became_idle_at: nil, handled: false}}
   end
 
   @impl true
@@ -79,7 +89,42 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     {:noreply, state}
   end
 
+  @impl true
+  def handle_info(:idle_check, state) do
+    idle? = :ets.info(@table, :size) == 0
+    new_state = check_idle(idle?, state)
+    schedule_idle_check()
+    {:noreply, new_state}
+  end
+
   # ---- Private ----
+
+  # Mirrors Aquifer's drainWatchdogLoop: not idle resets bookkeeping; newly
+  # idle just records the timestamp; already-handled this idle period skips
+  # a re-flush; otherwise, once idle long enough, attempts a flush -- a
+  # failure leaves handled: false so the next tick retries from scratch,
+  # safely, since a failed attempt never clears anything.
+  defp check_idle(false, _state), do: %{became_idle_at: nil, handled: false}
+
+  defp check_idle(true, %{became_idle_at: nil}) do
+    %{became_idle_at: System.monotonic_time(:millisecond), handled: false}
+  end
+
+  defp check_idle(true, %{handled: true} = state), do: state
+
+  defp check_idle(true, %{became_idle_at: became_idle_at} = state) do
+    elapsed_ms = System.monotonic_time(:millisecond) - became_idle_at
+
+    if elapsed_ms >= DrainFlush.timer_seconds() * 1_000 do
+      %{state | handled: DrainFlush.attempt()}
+    else
+      state
+    end
+  end
+
+  defp schedule_idle_check do
+    Process.send_after(self(), :idle_check, @idle_check_interval_ms)
+  end
 
   defp url_key(url) do
     uri = URI.parse(url)

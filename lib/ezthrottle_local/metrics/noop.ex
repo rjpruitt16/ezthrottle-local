@@ -26,4 +26,10 @@ defmodule EzthrottleLocal.Metrics.Noop do
 
   @impl true
   def flow_rate(_upstream, _rps), do: :ok
+
+  @impl true
+  def drain_flush_succeeded(_instance_key, _ledger_size), do: :ok
+
+  @impl true
+  def drain_flush_failed(_instance_key, _ledger_size), do: :ok
 end

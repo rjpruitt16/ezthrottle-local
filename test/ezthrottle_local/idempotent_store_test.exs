@@ -87,4 +87,51 @@ defmodule EzthrottleLocal.IdempotentStoreTest do
     # fresh, not as a duplicate pointing at a job that no longer exists.
     assert :ok = IdempotentStore.check_or_insert(job)
   end
+
+  # Drain mode's store-level primitives (EzthrottleLocal.DrainFlush):
+  # enumerate returns exactly what was inserted, hash-only, and clear wipes
+  # the whole table so a previously-duplicate key is fresh afterward. Runs
+  # against the same shared Mnesia instance every other test in this file
+  # does, so it explicitly clears first (rather than assuming a clean
+  # table) and only asserts on its own uniquely-stamped entries.
+  test "list_ledger and clear_ledger" do
+    IdempotentStore.clear_ledger()
+
+    stamp = System.unique_integer([:positive])
+
+    job1 = %Job{
+      id: "ledger-#{stamp}-1",
+      user_id: "ledger-user",
+      idempotent_key: "super-secret-plaintext-key-#{stamp}",
+      url: "https://example.com/webhook",
+      method: "POST",
+      headers: %{},
+      body: nil,
+      webhook_url: "https://example.com/callback",
+      status: :queued,
+      created_at: System.system_time(:millisecond)
+    }
+
+    job2 = %{job1 | id: "ledger-#{stamp}-2", idempotent_key: "key2-#{stamp}"}
+
+    assert :ok = IdempotentStore.check_or_insert(job1)
+    assert :ok = IdempotentStore.check_or_insert(job2)
+    IdempotentStore.update_status(job2.id, :completed)
+
+    entries = IdempotentStore.list_ledger()
+    assert length(entries) == 2
+
+    by_job_id = Map.new(entries, &{&1.job_id, &1})
+    assert %{status: :completed} = by_job_id[job2.id]
+    assert %{idempotent_key_hash: hash} = by_job_id[job1.id]
+    assert is_binary(hash) and hash != ""
+    refute hash =~ job1.idempotent_key
+
+    IdempotentStore.clear_ledger()
+    assert IdempotentStore.list_ledger() == []
+
+    # A key that was a duplicate before the clear should now be fresh --
+    # proving the clear actually happened, not just that list returns [].
+    assert :ok = IdempotentStore.check_or_insert(job1)
+  end
 end

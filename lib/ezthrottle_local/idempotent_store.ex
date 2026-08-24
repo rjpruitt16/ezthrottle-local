@@ -232,6 +232,40 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   @doc """
+  Returns every idempotent-key ledger entry currently stored -- hash-only,
+  matching what this table has always stored (the plaintext key is never
+  persisted, only its hash, see hash/1). Backs drain mode's webhook flush
+  (see EzthrottleLocal.DrainFlush) -- an opt-in feature, off by default, so
+  this is only ever called on a deployment that has explicitly enabled it.
+  """
+  def list_ledger do
+    {:atomic, entries} =
+      :mnesia.transaction(fn ->
+        :mnesia.select(@keys_table, [
+          {{@keys_table, :"$1", :"$2", :_, :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
+        ])
+      end)
+
+    Enum.map(entries, fn {hash, job_id, status} ->
+      %{idempotent_key_hash: hash, job_id: job_id, status: status}
+    end)
+  end
+
+  @doc """
+  Wipes all three tables -- only ever called by drain mode's watchdog after
+  a successful ledger-flush webhook delivery, never on a normal
+  (non-drain-mode) deployment. Clears job_delivery_modes too, alongside the
+  ledger and job tables, so a handoff doesn't leave orphaned rows behind.
+  """
+  def clear_ledger do
+    :mnesia.clear_table(@keys_table)
+    :mnesia.clear_table(@jobs_table)
+    :mnesia.clear_table(@delivery_table)
+    if flush_interval_ms() == 0, do: :mnesia.dump_log()
+    :ok
+  end
+
+  @doc """
   Set delivery mode for a job. :webhook (default), :stream, :stream_fallback.
   """
   def set_delivery_mode(job_id, mode) do
