@@ -217,6 +217,18 @@ itself beyond the next flush. That orchestration — durable long-term storage, 
 instances — is entirely up to whatever service you build to receive this webhook. EZThrottle Local
 only detects idle and hands off what it has.
 
+**State machine**, visible via `GET /health` (`"drain": {"state": "..."}`, only present when enabled):
+
+| State | Meaning |
+|---|---|
+| `active` | At least one upstream domain has live work. Normal state, drain mode enabled or not. |
+| `draining` | Every upstream has gone idle, but either the drain timer hasn't elapsed yet or a flush attempt is in flight/being retried. Not yet safe to hand off. |
+| `unassigned` | The ledger was flushed (or there was nothing to flush) and local state is clear — safe to hand off. Reverts to `active` the instant new work arrives. |
+
+`unassigned` is a status label, not an access gate — EZThrottle Local keeps accepting new jobs in
+every state. Nothing stops a job from landing on a node mid-handoff; if your orchestrator needs a hard
+guarantee that never happens, enforce it on your own end before routing traffic there.
+
 **Env vars:**
 
 | Var | Default | Notes |

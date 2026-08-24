@@ -35,6 +35,18 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     GenServer.call(__MODULE__, {:enqueue, job, account_queue_header})
   end
 
+  @doc """
+  Drain mode's current state (:active | :draining | :unassigned) for
+  GET /health, or nil when drain mode isn't enabled -- an instance that
+  never turned this on shouldn't see a new key appear in its health
+  output. See EzthrottleLocal.DrainFlush.
+  """
+  def drain_snapshot do
+    if DrainFlush.enabled?() do
+      %{state: GenServer.call(__MODULE__, :drain_state)}
+    end
+  end
+
   # ---- GenServer Callbacks ----
 
   @impl true
@@ -48,7 +60,12 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
       schedule_idle_check()
     end
 
-    {:ok, %{became_idle_at: nil, handled: false}}
+    {:ok, %{became_idle_at: nil, drain_state: :active}}
+  end
+
+  @impl true
+  def handle_call(:drain_state, _from, state) do
+    {:reply, state.drain_state, state}
   end
 
   @impl true
@@ -99,24 +116,31 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   # ---- Private ----
 
-  # Mirrors Aquifer's drainWatchdogLoop: not idle resets bookkeeping; newly
-  # idle just records the timestamp; already-handled this idle period skips
-  # a re-flush; otherwise, once idle long enough, attempts a flush -- a
-  # failure leaves handled: false so the next tick retries from scratch,
-  # safely, since a failed attempt never clears anything.
-  defp check_idle(false, _state), do: %{became_idle_at: nil, handled: false}
+  # Mirrors Aquifer's drainWatchdogLoop, made explicit as a small state
+  # machine (:active | :draining | :unassigned) rather than two implicit
+  # booleans, both for readability and so it's queryable via drain_snapshot/0
+  # for GET /health: not idle resets to :active; newly idle moves to
+  # :draining; already :unassigned this idle period skips a re-flush;
+  # otherwise, once idle long enough, attempts a flush -- a failure leaves
+  # the state at :draining so the next tick retries from scratch, safely,
+  # since a failed attempt never clears anything.
+  defp check_idle(false, _state), do: %{became_idle_at: nil, drain_state: :active}
 
-  defp check_idle(true, %{became_idle_at: nil}) do
-    %{became_idle_at: System.monotonic_time(:millisecond), handled: false}
+  defp check_idle(true, %{became_idle_at: nil} = state) do
+    %{state | became_idle_at: System.monotonic_time(:millisecond), drain_state: :draining}
   end
 
-  defp check_idle(true, %{handled: true} = state), do: state
+  defp check_idle(true, %{drain_state: :unassigned} = state), do: state
 
   defp check_idle(true, %{became_idle_at: became_idle_at} = state) do
     elapsed_ms = System.monotonic_time(:millisecond) - became_idle_at
 
     if elapsed_ms >= DrainFlush.timer_seconds() * 1_000 do
-      %{state | handled: DrainFlush.attempt()}
+      if DrainFlush.attempt() do
+        %{state | drain_state: :unassigned}
+      else
+        state
+      end
     else
       state
     end
