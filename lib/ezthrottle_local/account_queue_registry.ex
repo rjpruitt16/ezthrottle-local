@@ -12,13 +12,26 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   alias EzthrottleLocal.PoolRegistry
   alias EzthrottleLocal.DrainFlush
 
-  @table :url_actors
+  @default_table :url_actors
   @idle_check_interval_ms 5_000
 
   # ---- Public API ----
 
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  @doc """
+  Starts the registry. In production this is always called with no opts
+  (via the supervision tree), giving the single global instance named
+  `__MODULE__` with ETS table `:url_actors` -- the defaults below exist
+  only so tests can start additional, isolated instances (different
+  `:name`, different `:table`) to deterministically drive the idle
+  watchdog without racing the real singleton's shared, suite-wide state.
+  An isolated test instance is interacted with via raw `GenServer.call`/
+  `send` to its own pid, not through this module's public functions below
+  (which are hardcoded to the production name).
+  """
+  def start_link(opts \\ []) do
+    name = Keyword.get(opts, :name, __MODULE__)
+    table = Keyword.get(opts, :table, @default_table)
+    GenServer.start_link(__MODULE__, %{table: table}, name: name)
   end
 
   @doc """
@@ -50,8 +63,8 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   # ---- GenServer Callbacks ----
 
   @impl true
-  def init(_) do
-    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+  def init(%{table: table}) do
+    :ets.new(table, [:named_table, :public, :set, read_concurrency: true])
 
     # Drain mode's watchdog: only scheduled at all if enabled?/0 is true at
     # startup -- disabled means exactly that no periodic check ever runs,
@@ -60,7 +73,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
       schedule_idle_check()
     end
 
-    {:ok, %{became_idle_at: nil, drain_state: :active}}
+    {:ok, %{table: table, became_idle_at: nil, drain_state: :active}}
   end
 
   @impl true
@@ -73,7 +86,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     {route_key, pool_pid} = route_key_and_pool(job)
 
     pid =
-      case :ets.lookup(@table, route_key) do
+      case :ets.lookup(state.table, route_key) do
         [{^route_key, existing_pid}] ->
           existing_pid
 
@@ -82,7 +95,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
             UrlActor.start_link(url_key: route_key, domain: route_key, pool_pid: pool_pid)
 
           Process.monitor(new_pid)
-          :ets.insert(@table, {route_key, new_pid})
+          :ets.insert(state.table, {route_key, new_pid})
           new_pid
       end
 
@@ -102,13 +115,13 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    :ets.match_delete(@table, {:_, pid})
+    :ets.match_delete(state.table, {:_, pid})
     {:noreply, state}
   end
 
   @impl true
   def handle_info(:idle_check, state) do
-    idle? = :ets.info(@table, :size) == 0
+    idle? = :ets.info(state.table, :size) == 0
     new_state = check_idle(idle?, state)
     schedule_idle_check()
     {:noreply, new_state}
@@ -124,7 +137,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   # otherwise, once idle long enough, attempts a flush -- a failure leaves
   # the state at :draining so the next tick retries from scratch, safely,
   # since a failed attempt never clears anything.
-  defp check_idle(false, _state), do: %{became_idle_at: nil, drain_state: :active}
+  defp check_idle(false, state), do: %{state | became_idle_at: nil, drain_state: :active}
 
   defp check_idle(true, %{became_idle_at: nil} = state) do
     %{state | became_idle_at: System.monotonic_time(:millisecond), drain_state: :draining}
