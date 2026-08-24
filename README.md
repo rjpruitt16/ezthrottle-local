@@ -389,6 +389,12 @@ For maximum queue capacity, use the largest available machine. A 32GB RAM machin
 
 A fourth deployment shape alongside sidecar, standalone, and embedded library: EZThrottle Local as a normal Deployment, reached through a Gateway API proxy (Envoy Gateway) instead of a sidecar. See [`examples/kubernetes/`](examples/kubernetes/) — verified end-to-end against a real `kind` cluster, including a real pod restart proving Mnesia durability survives it (requires a stable `RELEASE_NODE`, documented there).
 
+## Scaling by partitioning
+
+Each node persists to its own Mnesia directory — no external database or coordination service to run, and no shared state between nodes. Scale by partitioning: run one node per upstream domain or tenant, each owning a distinct key space, and total throughput scales with node count. Multiple nodes against the *same* upstream without partitioning multiplies your request rate against it instead — the one setup to avoid. The same applies to pools: a given `pool_id` should belong to exactly one node, since pool state isn't shared across nodes (see the pool-registration note above).
+
+This partitioning is static — decided at deploy time, fixed until you redeploy. [Drain mode](#drain-mode) is a dynamic alternative to the same problem: rather than every node owning a fixed slice forever, an idle node can flush what it's deduped and hand itself back for reassignment, letting an external orchestrator repartition on the fly as load shifts between tenants instead of you doing it by hand at deploy time. The two aren't mutually exclusive — a fleet can partition statically by upstream domain while individual nodes within a partition cycle through tenants dynamically via drain mode. This mirrors [Aquifer's](https://github.com/rjpruitt16/aquifer) identical guidance.
+
 ## Zero-downtime updates
 
 EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloading. Updates to rate limiting logic, routing behavior, or configuration can be deployed to a running node without restarting the process — the in-memory queue is preserved across deploys and no jobs are lost.
