@@ -134,4 +134,68 @@ defmodule EzthrottleLocal.IdempotentStoreTest do
     # proving the clear actually happened, not just that list returns [].
     assert :ok = IdempotentStore.check_or_insert(job1)
   end
+
+  # Regression test for a real cross-tenant collision bug: check_or_insert
+  # used to hash idempotent_key alone, with no user_id scoping, so two
+  # different users submitting the same idempotent_key would collide --
+  # User B's request silently treated as a duplicate of User A's, never
+  # actually running. This was a porting gap relative to Aquifer's
+  # documented contract ("duplicate idempotent_key per user_id returns the
+  # existing job"), not a deliberate difference.
+  test "two different users submitting the same idempotent_key are treated as distinct jobs" do
+    stamp = System.unique_integer([:positive])
+    shared_key = "shared-key-#{stamp}"
+
+    job_a = %Job{
+      id: "collide-a-#{stamp}",
+      user_id: "user-a-#{stamp}",
+      idempotent_key: shared_key,
+      url: "https://example.com/webhook",
+      method: "POST",
+      headers: %{},
+      body: nil,
+      webhook_url: "https://example.com/callback",
+      status: :queued,
+      created_at: System.system_time(:millisecond)
+    }
+
+    job_b = %{job_a | id: "collide-b-#{stamp}", user_id: "user-b-#{stamp}"}
+
+    assert :ok = IdempotentStore.check_or_insert(job_a)
+
+    assert :ok = IdempotentStore.check_or_insert(job_b),
+           "expected User B's request to be treated as fresh, not a duplicate of User A's " <>
+             "just because they share the same idempotent_key"
+
+    assert IdempotentStore.get_job(job_a.id) != nil
+    assert IdempotentStore.get_job(job_b.id) != nil
+  end
+
+  # Cross-implementation parity: ezthrottle-local's hash must match
+  # Aquifer's hashKey(user_id + ":" + idempotent_key) exactly (SHA-256,
+  # lowercase hex) for the two systems' drain-mode ledgers to share one
+  # hash-key namespace. Golden value computed independently
+  # (python3 -c "import hashlib; print(hashlib.sha256(b'u1:k1').hexdigest())").
+  test "idempotent key hash matches Aquifer's hashKey scheme for a known input" do
+    job = %Job{
+      id: "golden-#{System.unique_integer([:positive])}",
+      user_id: "u1",
+      idempotent_key: "k1",
+      url: "https://example.com/webhook",
+      method: "POST",
+      headers: %{},
+      body: nil,
+      webhook_url: "https://example.com/callback",
+      status: :queued,
+      created_at: System.system_time(:millisecond)
+    }
+
+    IdempotentStore.clear_ledger()
+    assert :ok = IdempotentStore.check_or_insert(job)
+
+    [entry] = IdempotentStore.list_ledger()
+
+    assert entry.idempotent_key_hash ==
+             "3140c2d8efe61829e6d590d2309b5a43257b0ad3098e7d8836bef6b91466b064"
+  end
 end

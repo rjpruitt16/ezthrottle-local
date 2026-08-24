@@ -90,7 +90,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   Returns :ok for new jobs or {:duplicate, existing_job_id} for known keys.
   """
   def check_or_insert(%Job{} = job) do
-    hashed = hash(job.idempotent_key)
+    hashed = hash_key(job)
     expires_at = System.system_time(:millisecond) + ttl_ms(:queued)
 
     {:atomic, result} =
@@ -132,7 +132,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   that doesn't really exist.
   """
   def delete_job(%Job{} = job) do
-    hashed = hash(job.idempotent_key)
+    hashed = hash_key(job)
 
     :mnesia.sync_transaction(fn ->
       :mnesia.delete({@jobs_table, job.id})
@@ -153,7 +153,7 @@ defmodule EzthrottleLocal.IdempotentStore do
         new_expires = System.system_time(:millisecond) + ttl_ms(status)
         :mnesia.dirty_write({@jobs_table, job_id, job, new_expires, status})
 
-        hashed = hash(job.idempotent_key)
+        hashed = hash_key(job)
 
         case :mnesia.dirty_read(@keys_table, hashed) do
           [{@keys_table, ^hashed, ^job_id, _key_expires, _}] ->
@@ -343,6 +343,14 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   # ---- Private ----
+
+  # Scoped per user_id, matching Aquifer's hashKey(job.UserID + ":" + job.IdempotentKey) exactly --
+  # without this, two different users submitting the same idempotent_key would collide with each
+  # other (User B's request silently treated as a duplicate of User A's, never actually running).
+  # This was a real porting gap, not a deliberate difference from Aquifer's documented contract
+  # ("duplicate idempotent_key per user_id returns the existing job", README.md) -- found and fixed
+  # while reviewing drain mode's ledger-hash documentation.
+  defp hash_key(%Job{} = job), do: hash(job.user_id <> ":" <> job.idempotent_key)
 
   defp hash(key) do
     :crypto.hash(:sha256, key) |> Base.encode16(case: :lower)

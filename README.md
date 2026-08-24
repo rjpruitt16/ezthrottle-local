@@ -187,7 +187,7 @@ GET /health
 
 ## Idempotency
 
-Every job requires an `idempotent_key`. Submitting the same key twice returns the original job ID without re-executing the request. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS — durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
+Every job requires an `idempotent_key`. Submitting the same key twice **for the same `user_id`** returns the original job ID without re-executing the request — different users can safely use the same `idempotent_key` without colliding with each other. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS — durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
 
 **Delivery semantics:** EZThrottle provides at-least-once dispatch and webhook delivery, not exactly-once execution. If the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches to the upstream again on restart — so it's not just the webhook that can repeat, the upstream call itself can. Make both your upstream endpoint and your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
 
@@ -249,13 +249,14 @@ guarantee that never happens, enforce it on your own end before routing traffic 
 }
 ```
 
-`idempotent_key_hash` is `sha256(idempotent_key)`, hex-encoded lowercase — the exact hash this store
-already computes internally, never the plaintext key. A downstream consumer re-checking a key for a
-duplicate must hash it the same way.
+`idempotent_key_hash` is `sha256(user_id + ":" + idempotent_key)`, hex-encoded lowercase — the exact
+hash this store already computes internally, never the plaintext key. A downstream consumer
+re-checking a key for a duplicate must hash it the same way.
 
-If you're also running [Aquifer](https://github.com/rjpruitt16/aquifer), note its drain mode hashes
-differently — `sha256(user_id + ":" + idempotent_key)`, scoped per user. The two systems' ledgers are
-not interchangeable under one hash-key namespace; hash lookups separately against each.
+If you're also running [Aquifer](https://github.com/rjpruitt16/aquifer), its drain mode hashes the
+identical way — both systems share one hash-key namespace for the same `(user_id, idempotent_key)`
+pair, so a downstream consumer can hash lookups the same way regardless of which system a given
+ledger entry came from.
 
 ## Admission control
 
