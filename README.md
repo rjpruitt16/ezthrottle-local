@@ -412,3 +412,8 @@ EZThrottle Local is a single node: jobs are durable to disk (survives a crash or
 - **Distributed fairness** — per-tenant rate limiting across multiple nodes and regions
 
 EZThrottle Local is the right tool for teams that want to get started immediately with zero infrastructure. When you need durability and cross-region guarantees, EZThrottle Cloud picks up where this leaves off.
+
+## Writing
+
+- [Eliminate GPU Waste by Cutting the Retry Tax](https://rahmipruitt.me/content/gpu-retry-tax/) — the thesis behind [drain mode](#drain-mode) and the ORCA fallback pacing [GPU benchmark](benchmark.md#6-gpu-inference-and-the-retry-tax-runpodvllm) above.
+- [GitHub Outages Show the Limits of Reactive Scaling](https://rahmipruitt.me/content/github-outage-reactive-scaling/) — why reactive scaling and retry storms don't mix, the problem EZThrottle Local absorbs instead.
