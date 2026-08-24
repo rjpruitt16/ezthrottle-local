@@ -1,7 +1,15 @@
 defmodule EzthrottleLocal.Webhook do
   @moduledoc """
-  Webhook delivery with exponential backoff and optional L8 signed headers.
-  Retries up to @max_retries times on non-2xx or connection error.
+  Synchronous webhook delivery with exponential backoff and optional L8
+  signed headers. Retries up to @max_retries times on non-2xx or
+  connection error.
+
+  Used only by drain mode's ledger-flush webhook (EzthrottleLocal.DrainFlush),
+  where clearing the local idempotency ledger must wait on confirmed
+  delivery. Regular per-job completion/failure webhooks go through
+  AccountQueueRegistry.enqueue_webhook/4 instead, which paces delivery
+  through the same account-queue machinery as forward dispatch rather than
+  firing immediately from here.
   """
 
   require Logger

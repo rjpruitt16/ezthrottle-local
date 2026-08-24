@@ -38,7 +38,8 @@ defmodule EzthrottleLocal.AccountQueueHeaderTest do
 
   defp url_actor_state_for(job) do
     uri = URI.parse(job.url)
-    url_key = "#{uri.scheme}://#{uri.host}"
+    port_suffix = if uri.port, do: ":#{uri.port}", else: ""
+    url_key = "#{uri.scheme}://#{uri.host}#{port_suffix}"
     [{^url_key, pid}] = :ets.lookup(:url_actors, url_key)
     :sys.get_state(pid)
   end

@@ -100,6 +100,44 @@ defmodule EzthrottleLocal.Job do
     :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
   end
 
+  @doc """
+  Builds a Job representing a webhook delivery attempt itself, for
+  AccountQueueRegistry.enqueue_webhook/4 to push webhook delivery through
+  the same account-queue pacing as forward dispatch instead of firing
+  immediately with a fixed retry schedule. webhook_url is "" on the
+  resulting job (see webhook_delivery_job?/1), never nil, so it always
+  matches the same check regardless of how the field ends up compared.
+
+  original_job_id scopes the idempotent key so a given job's webhook is
+  enqueued at most once even if this is somehow called twice for it.
+  """
+  def new_webhook_delivery(original_job_id, user_id, webhook_url, payload) do
+    %__MODULE__{
+      id: generate_id(),
+      user_id: user_id,
+      idempotent_key: "webhook:" <> original_job_id,
+      url: webhook_url,
+      pool_id: nil,
+      method: "POST",
+      headers: %{"Content-Type" => "application/json"},
+      body: Jason.encode!(payload),
+      webhook_url: "",
+      status: :queued,
+      created_at: System.system_time(:millisecond)
+    }
+  end
+
+  @doc """
+  Reports whether this job represents a webhook delivery attempt itself
+  (see new_webhook_delivery/4), as opposed to a regular user-submitted
+  job. A regular job always has a non-empty webhook_url -- new/1 requires
+  one -- so an empty webhook_url is a safe, already-enforced signal rather
+  than a separate field: it's what AccountQueue checks to avoid
+  enqueueing a webhook-about-a-webhook, and what make_request checks to
+  decide whether to L8-sign the outbound request.
+  """
+  def webhook_delivery_job?(%__MODULE__{webhook_url: url}), do: url in [nil, ""]
+
   defp require_field(params, key) do
     case Map.get(params, key) do
       nil -> {:error, "#{key} is required"}

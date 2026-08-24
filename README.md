@@ -53,6 +53,8 @@ Each tenant's own pace is still capped by the upstream's actual budget, though �
 
 Long-term protocol goal: if more services emit `X-Aqueduct-*`, agents can respond to capacity signals instead of independently guessing retry and concurrency behavior. EZThrottle works today without ecosystem adoption; broader protocol adoption is the longer-term goal.
 
+**Webhook delivery uses this same pacing, not a separate fire-and-forget path.** A webhook POST is enqueued as its own job, keyed by the receiver's domain, and dispatched through the identical AccountQueue machinery described above — so a webhook receiver can slow EZThrottle down with `X-Aqueduct-Rps`/`X-Aqueduct-Max-Concurrent` response headers exactly the way a real upstream can, instead of just getting hammered on a fixed retry schedule. It's also crash-durable: a webhook still pending when the node restarts is recovered and retried the same way a queued job is. Retries trigger on `5xx` responses, up to 4 attempts with exponential backoff (1s · 2s · 4s · 8s). Drain mode's own ledger-flush webhook is unaffected — it stays synchronous, confirming delivery before clearing the local idempotency ledger.
+
 ---
 
 ## Agent-native load balancing

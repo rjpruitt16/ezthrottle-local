@@ -237,6 +237,11 @@ defmodule EzthrottleLocal.IdempotentStore do
   persisted, only its hash, see hash/1). Backs drain mode's webhook flush
   (see EzthrottleLocal.DrainFlush) -- an opt-in feature, off by default, so
   this is only ever called on a deployment that has explicitly enabled it.
+
+  Excludes webhook-delivery jobs (see Job.webhook_delivery_job?/1) -- those
+  are internal delivery bookkeeping persisted here for durability/dedup via
+  check_or_insert/1, not real user-submitted work, and have no business
+  appearing in a ledger meant for tenant-handoff dedup.
   """
   def list_ledger do
     {:atomic, entries} =
@@ -246,9 +251,18 @@ defmodule EzthrottleLocal.IdempotentStore do
         ])
       end)
 
-    Enum.map(entries, fn {hash, job_id, status} ->
+    entries
+    |> Enum.reject(fn {_hash, job_id, _status} -> webhook_delivery_job_id?(job_id) end)
+    |> Enum.map(fn {hash, job_id, status} ->
       %{idempotent_key_hash: hash, job_id: job_id, status: status}
     end)
+  end
+
+  defp webhook_delivery_job_id?(job_id) do
+    case :mnesia.dirty_read(@jobs_table, job_id) do
+      [{@jobs_table, ^job_id, job, _expires_at, _status}] -> Job.webhook_delivery_job?(job)
+      [] -> false
+    end
   end
 
   @doc """

@@ -2,7 +2,7 @@ defmodule EzthrottleLocalWeb.JobStreamController do
   use EzthrottleLocalWeb, :controller
 
   alias EzthrottleLocal.IdempotentStore
-  alias EzthrottleLocal.Webhook
+  alias EzthrottleLocal.AccountQueueRegistry
 
   def stream(conn, %{"id" => job_id}) do
     case IdempotentStore.get_job(job_id) do
@@ -38,6 +38,7 @@ defmodule EzthrottleLocalWeb.JobStreamController do
       s when s in ["in_flight", "completed", "failed"] ->
         {:ok, conn} = chunk(conn, sse_event("dispatching", %{job_id: job_id}))
         conn
+
       _ ->
         conn
     end
@@ -65,9 +66,12 @@ defmodule EzthrottleLocalWeb.JobStreamController do
     end
   end
 
-  # Stream died on the final event — fire webhook with normalized payload
+  # Stream died on the final event — queue the webhook with normalized
+  # payload through the same paced account-queue delivery AccountQueue
+  # itself uses, rather than firing it synchronously on this connection's
+  # own process.
   defp handle_disconnect(job, "completed", data) do
-    Webhook.deliver(job.webhook_url, %{
+    AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, %{
       job_id: job.id,
       status: "completed",
       response_status: data[:response_status],
@@ -76,7 +80,7 @@ defmodule EzthrottleLocalWeb.JobStreamController do
   end
 
   defp handle_disconnect(job, "failed", data) do
-    Webhook.deliver(job.webhook_url, %{
+    AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, %{
       job_id: job.id,
       status: "failed",
       reason: data[:reason]

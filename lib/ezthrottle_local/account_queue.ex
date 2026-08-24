@@ -13,7 +13,7 @@ defmodule EzthrottleLocal.AccountQueue do
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.IdempotentStore
   alias EzthrottleLocal.Metrics
-  alias EzthrottleLocal.Webhook
+  alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.Pool
 
   @idle_timeout_ms 300_000
@@ -448,8 +448,18 @@ defmodule EzthrottleLocal.AccountQueue do
     |> Map.put(:body, body)
   end
 
+  # A webhook-delivery job (Job.webhook_delivery_job?/1) must never
+  # enqueue its own webhook -- it flows through this same execute/8 path
+  # as a regular job, so without this guard first, its own completion
+  # would recursively enqueue another webhook delivery forever.
+  defp maybe_deliver_webhook(_mode, %Job{webhook_url: url}, _payload) when url in [nil, ""],
+    do: :ok
+
   defp maybe_deliver_webhook(:stream, _job, _payload), do: :ok
-  defp maybe_deliver_webhook(_mode, job, payload), do: Webhook.deliver(job.webhook_url, payload)
+
+  defp maybe_deliver_webhook(_mode, job, payload) do
+    AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, payload)
+  end
 
   defp max_retries,
     do: Application.get_env(:ezthrottle_local, :dispatch_max_retries, @max_retries)
@@ -495,8 +505,9 @@ defmodule EzthrottleLocal.AccountQueue do
 
     job_headers = Enum.map(job.headers, fn {k, v} -> {k, v} end)
     metric_headers = maybe_add_orca_opt_in(metric_headers, job_headers)
+    l8_headers = maybe_l8_headers(job, dispatch_url)
 
-    headers = headers_to_charlist(job_headers ++ metric_headers)
+    headers = headers_to_charlist(job_headers ++ metric_headers ++ l8_headers)
 
     method =
       case String.upcase(job.method) do
@@ -530,6 +541,23 @@ defmodule EzthrottleLocal.AccountQueue do
         {:error, reason}
     end
   end
+
+  # L8 signing proves EZThrottle's identity to the *receiver* of a
+  # webhook -- it has no meaning for forward dispatch to an arbitrary
+  # upstream API, so this only applies when the job being dispatched is
+  # itself a webhook delivery (see Job.webhook_delivery_job?/1). Mirrors
+  # Aquifer's account_queue.go makeRequest.
+  defp maybe_l8_headers(%Job{webhook_url: url} = job, dispatch_url) when url in [nil, ""] do
+    EzthrottleLocal.L8.ensure_trust(dispatch_url)
+
+    if EzthrottleLocal.L8.is_trusted?(dispatch_url) do
+      EzthrottleLocal.L8.sign_headers(job.body || "") |> Map.to_list()
+    else
+      []
+    end
+  end
+
+  defp maybe_l8_headers(_job, _dispatch_url), do: []
 
   # Opts every dispatch into ORCA reporting by default, unless the caller
   # already set the format header explicitly -- mirrors Aquifer's

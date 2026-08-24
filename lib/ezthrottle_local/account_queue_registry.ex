@@ -11,6 +11,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.PoolRegistry
   alias EzthrottleLocal.DrainFlush
+  alias EzthrottleLocal.IdempotentStore
 
   @default_table :url_actors
   @idle_check_interval_ms 5_000
@@ -46,6 +47,34 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   """
   def enqueue(%Job{} = job, account_queue_header \\ nil) do
     GenServer.call(__MODULE__, {:enqueue, job, account_queue_header})
+  end
+
+  @doc """
+  Queues a webhook delivery through the same domain-keyed account-queue
+  pacing and backpressure machinery as forward dispatch (RPS/concurrency
+  limits, X-Aqueduct-*/X-EZThrottle-* response-header throttling) instead
+  of firing immediately with a fixed retry schedule -- a slow or
+  rate-limited webhook receiver can now shed load exactly the way an
+  upstream API already can, and delivery is durable across a restart the
+  same way a real job is (the underlying webhook-delivery Job is
+  persisted via IdempotentStore.check_or_insert/1, not just an in-memory
+  retry loop).
+
+  original_job_id scopes the idempotent key (see Job.new_webhook_delivery/4)
+  so a given job's webhook is enqueued at most once even if this were
+  somehow called twice for it.
+  """
+  def enqueue_webhook(_original_job_id, _user_id, webhook_url, _payload)
+      when webhook_url in [nil, ""],
+      do: :ok
+
+  def enqueue_webhook(original_job_id, user_id, webhook_url, payload) do
+    job = Job.new_webhook_delivery(original_job_id, user_id, webhook_url, payload)
+
+    case IdempotentStore.check_or_insert(job) do
+      :ok -> enqueue(job)
+      {:duplicate, _existing_job_id} -> :ok
+    end
   end
 
   @doc """
@@ -163,9 +192,17 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     Process.send_after(self(), :idle_check, @idle_check_interval_ms)
   end
 
+  # Matches Aquifer's domainKey (url_worker.go) exactly, including the
+  # port -- a real porting gap found while adding webhook-delivery jobs to
+  # this same routing: two backends that differ only by port (e.g.
+  # http://host:8080 and http://host:9090, a common same-host-different-
+  # service topology) were previously collapsing into one shared
+  # rate-limit queue instead of being paced independently, since only
+  # scheme+host was ever compared here.
   defp url_key(url) do
     uri = URI.parse(url)
-    "#{uri.scheme}://#{uri.host}"
+    port_suffix = if uri.port, do: ":#{uri.port}", else: ""
+    "#{uri.scheme}://#{uri.host}#{port_suffix}"
   end
 
   # Pool-backed jobs route by pool_id instead of the destination domain,
