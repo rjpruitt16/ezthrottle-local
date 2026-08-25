@@ -562,6 +562,11 @@ defmodule EzthrottleLocal.AccountQueue do
   # Opts every dispatch into ORCA reporting by default, unless the caller
   # already set the format header explicitly -- mirrors Aquifer's
   # account_queue.go, which sends this on every dispatch too.
+  #
+  # Lowercase "text", not "TEXT": vLLM accepts either (metrics_format.lower()
+  # in orca_metrics.py), but Triton's ORCA support (src/orca_http.cc,
+  # orca_type == "text") is case-sensitive and only accepts the lowercase
+  # literal -- "TEXT" makes Triton log an error and write no header at all.
   defp maybe_add_orca_opt_in(metric_headers, job_headers) do
     orca_header = EzthrottleLocal.Orca.request_header_name()
 
@@ -571,7 +576,7 @@ defmodule EzthrottleLocal.AccountQueue do
     if already_set? do
       metric_headers
     else
-      [{orca_header, "TEXT"} | metric_headers]
+      [{orca_header, "text"} | metric_headers]
     end
   end
 

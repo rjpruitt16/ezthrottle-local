@@ -213,6 +213,38 @@ defmodule EzthrottleLocal.WebhookPacingTest do
     end
   end
 
+  # Regression test for a real cross-backend incompatibility found while
+  # researching Triton's ORCA support: vLLM accepts either case
+  # (metrics_format.lower() in orca_metrics.py), but Triton's ORCA support
+  # (src/orca_http.cc) does a case-sensitive comparison against the
+  # lowercase literal only -- sending "TEXT" makes Triton log an error and
+  # write no header at all. Reuses L8ReceiverPlug purely for its
+  # header-capturing catch-all clause; L8 itself isn't the point here.
+  test "the ORCA opt-in request header is sent lowercase" do
+    receiver_url = start_server(L8ReceiverPlug, test_pid: self())
+
+    job = %Job{
+      id: "orca-casing-#{System.unique_integer([:positive])}",
+      user_id: "user-1",
+      idempotent_key: "orca-casing-key-#{System.unique_integer([:positive])}",
+      url: receiver_url,
+      method: "GET",
+      headers: %{},
+      webhook_url: start_server(OkPlug),
+      status: :queued,
+      created_at: System.system_time(:millisecond)
+    }
+
+    :ok = IdempotentStore.check_or_insert(job)
+    AccountQueueRegistry.enqueue(job)
+
+    assert_receive {:headers, headers}, 3_000
+    header_map = Map.new(headers)
+
+    assert Map.get(header_map, "endpoint-load-metrics-format") == "text",
+           "expected the ORCA opt-in header to be sent lowercase, got: #{inspect(headers)}"
+  end
+
   test "webhook-delivery jobs are excluded from the idempotency ledger" do
     webhook_url = start_server(HitCountingPlug, test_pid: self())
 

@@ -13,16 +13,23 @@ defmodule EzthrottleLocal.Orca do
 
   @header_name "endpoint-load-metrics"
   @request_header_name "endpoint-load-metrics-format"
-  @kv_cache_metric "kv_cache_usage_perc"
+
+  # Different backends report ORCA's KV-cache utilization under different
+  # metric names, tried in order -- "kv_cache_usage_perc" is vLLM's name
+  # (Prometheus vllm:kv_cache_usage_perc, already a 0-1 fraction).
+  # "kv_cache_utilization" is Triton's own ORCA support (src/orca_http.cc,
+  # verified directly against source), reporting the same concept under a
+  # different name.
+  @kv_cache_metric_names ["kv_cache_usage_perc", "kv_cache_utilization"]
 
   def request_header_name, do: @request_header_name
 
   @doc """
   Derives a suggested dispatch rate from an ORCA endpoint-load-metrics
   response header, if present and parseable. Returns nil if there's no
-  ORCA header, no kv_cache_usage_perc metric in it, or the reported load
-  is low enough that no override is warranted -- callers should keep
-  whatever rate is already configured in that case.
+  ORCA header, none of @kv_cache_metric_names appear in it, or the
+  reported load is low enough that no override is warranted -- callers
+  should keep whatever rate is already configured in that case.
 
   This is a fallback signal, not a primary one -- callers should only
   consult it when the response carried no explicit
@@ -31,7 +38,7 @@ defmodule EzthrottleLocal.Orca do
   def rps(headers) when is_map(headers) do
     with raw when is_binary(raw) <- Map.get(headers, @header_name),
          metrics when is_map(metrics) <- parse_header(raw),
-         util when is_number(util) <- Map.get(metrics, @kv_cache_metric) do
+         util when is_number(util) <- find_kv_cache_metric(metrics) do
       load_to_rps(util)
     else
       _ -> nil
@@ -39,6 +46,10 @@ defmodule EzthrottleLocal.Orca do
   end
 
   def rps(_headers), do: nil
+
+  defp find_kv_cache_metric(metrics) do
+    Enum.find_value(@kv_cache_metric_names, fn name -> Map.get(metrics, name) end)
+  end
 
   defp parse_header(raw) do
     case String.split(raw, " ", parts: 2) do

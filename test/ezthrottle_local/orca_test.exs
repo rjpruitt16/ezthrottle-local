@@ -8,10 +8,21 @@ defmodule EzthrottleLocal.OrcaTest do
     assert Orca.rps(headers) == 2.0
   end
 
-  test "parses JSON format" do
+  # Triton's ORCA support (src/orca_http.cc, verified directly against
+  # source) reports the same concept vLLM calls kv_cache_usage_perc under
+  # a different name, kv_cache_utilization.
+  test "parses real Triton TEXT format" do
     headers = %{
       "endpoint-load-metrics" =>
-        ~s(JSON {"named_metrics":{"kv_cache_usage_perc":0.75}})
+        "TEXT named_metrics.kv_cache_utilization=0.850000, named_metrics.max_token_capacity=1024"
+    }
+
+    assert Orca.rps(headers) == 2.0
+  end
+
+  test "parses JSON format" do
+    headers = %{
+      "endpoint-load-metrics" => ~s(JSON {"named_metrics":{"kv_cache_usage_perc":0.75}})
     }
 
     assert Orca.rps(headers) == 2.0
