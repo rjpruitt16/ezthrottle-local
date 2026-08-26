@@ -22,12 +22,15 @@ Client → POST /jobs → EZThrottle Local → paced outbound requests → Your 
 
 1. **Submit a job** — POST the request you want forwarded, with a `webhook_url` for the response.
 2. **EZThrottle queues it** — Jobs are held in memory and dispatched at the configured RPS.
-3. **Your API responds** — EZThrottle reads `X-Aqueduct-Rps`/`X-EZTHROTTLE-RPS` and `X-Aqueduct-Max-Concurrent`/`X-EZTHROTTLE-MAX-CONCURRENT` headers from the response and adjusts pace automatically. `X-Aqueduct-*` is read first if both are present — the shared protocol namespace also spoken by [Aquifer](https://github.com/rjpruitt16/aquifer), so a backend already emitting Aqueduct headers works against either implementation unchanged. For backends that speak neither namespace but already report load some other way, EZThrottle falls back to [ORCA](https://github.com/cncf/xds/blob/main/xds/data/orca/v3/orca_load_report.proto) — vLLM supports this natively: EZThrottle sends `endpoint-load-metrics-format: TEXT` on every dispatch, and a response carrying an `endpoint-load-metrics` header with `kv_cache_usage_perc` is used to pace down (full rate below 70% utilization, 2 RPS at 70-90%, 0.5 RPS at 90-97%, 0.25 RPS above that) only when no explicit Aqueduct/EZThrottle header is present.
+3. **Your API responds** — EZThrottle reads pacing headers from the response and adjusts automatically, falling back to the real [ORCA](https://github.com/cncf/xds/blob/main/xds/data/orca/v3/orca_load_report.proto) standard for backends that report load a different way (vLLM and Triton/TensorRT-LLM both work today) — see [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) below for the full header reference.
 4. **Stay on the line or hang up** — open `GET /jobs/:id/stream` to receive live events as the job moves through the queue, or disconnect and the result is delivered to your `webhook_url` when ready.
 
 ## Per-tenant fairness (AccountQueue mode)
 
-By default all traffic for a destination flows through one shared queue. Isolation can be turned on two ways:
+By default all traffic for a destination flows through one shared queue. Turn on per-tenant isolation via a response header (or set it on submission if you already know a tenant needs it) and each `user_id` + API key gets its own independently paced queue — a heavy user no longer blocks everyone else, and each tenant can run at a genuinely different pace.
+
+<details>
+<summary>Full pacing reference — headers, isolation mechanics, ORCA fallback, webhook pacing</summary>
 
 **By your API's response** — respond to a dispatched request with:
 
@@ -51,15 +54,24 @@ Disable it any time by responding with `X-Aqueduct-Account-Queue: disabled`.
 
 Each tenant's own pace is still capped by the upstream's actual budget, though — a background check keeps the *sum* of every active tenant queue's rate within the upstream's configured (or, for a pool-backed upstream, live aggregate) ceiling, throttling proportionally if too many tenants are active at once. Isolation between tenants doesn't mean each one gets its own unbounded copy of the full rate.
 
+`X-Aqueduct-*` is read first if both namespaces are present — the shared protocol namespace also spoken by [Aquifer](https://github.com/rjpruitt16/aquifer), so a backend already emitting Aqueduct headers works against either implementation unchanged.
+
+**ORCA fallback**, for backends that speak neither namespace but already report load some other way: EZThrottle sends `endpoint-load-metrics-format: text` on every dispatch, and a response carrying an `endpoint-load-metrics` header is used to pace down (full rate below 70% utilization, 2 RPS at 70-90%, 0.5 RPS at 90-97%, 0.25 RPS above that) only when no explicit Aqueduct/EZThrottle header is present. Two backends verified directly against their own source: **vLLM** (metric name `kv_cache_usage_perc`, case-insensitive opt-in) and **Triton/TensorRT-LLM** (metric name `kv_cache_utilization`, case-sensitive lowercase-only opt-in — EZThrottle sends lowercase specifically so both work).
+
 Long-term protocol goal: if more services emit `X-Aqueduct-*`, agents can respond to capacity signals instead of independently guessing retry and concurrency behavior. EZThrottle works today without ecosystem adoption; broader protocol adoption is the longer-term goal.
 
 **Webhook delivery uses this same pacing, not a separate fire-and-forget path.** A webhook POST is enqueued as its own job, keyed by the receiver's domain, and dispatched through the identical AccountQueue machinery described above — so a webhook receiver can slow EZThrottle down with `X-Aqueduct-Rps`/`X-Aqueduct-Max-Concurrent` response headers exactly the way a real upstream can, instead of just getting hammered on a fixed retry schedule. It's also crash-durable: a webhook still pending when the node restarts is recovered and retried the same way a queued job is. Retries trigger on `5xx` responses, up to 4 attempts with exponential backoff (1s · 2s · 4s · 8s). Drain mode's own ledger-flush webhook is unaffected — it stays synchronous, confirming delivery before clearing the local idempotency ledger.
+
+</details>
 
 ---
 
 ## Agent-native load balancing
 
-Instead of dispatching to a fixed `url`, a job can target a named **pool** — a group of registered service instances EZThrottle picks from at dispatch time. Useful when you have several interchangeable backends (or, e.g., a separate group of writers and a separate group of readers) instead of one fixed endpoint. Ported from [Aquifer](https://github.com/rjpruitt16/aquifer)'s Go implementation, built and proven out there first.
+Instead of dispatching to a fixed `url`, a job can target a named **pool** — a group of registered service instances EZThrottle picks from at dispatch time, weighted by declared capacity and live reputation. Ported from [Aquifer](https://github.com/rjpruitt16/aquifer)'s Go implementation, built and proven out there first.
+
+<details>
+<summary>Full pool reference — registration, dispatch, reputation model</summary>
 
 **Registering a member:**
 
@@ -94,9 +106,14 @@ The same call is both initial registration and heartbeat — call it again perio
 
 `GET /health` reports every pool's current members, their declared capacity, and current reputation.
 
+</details>
+
 ## Streaming — stay on the line or get a voicemail
 
-Most queue systems force you to choose: poll for status or hope the webhook lands. EZThrottle gives you a third option — an open SSE stream that tells you exactly what's happening in real time.
+Most queue systems force you to choose: poll for status or hope the webhook lands. EZThrottle gives you a third option — an open SSE stream that tells you exactly what's happening in real time, or a `webhook_url` fallback if you disconnect. Coordination built into the infrastructure, the same way TCP handled it at Layer 4 — at Layer 7, for API workflows, the queue is the protocol.
+
+<details>
+<summary>Full streaming reference — event shapes, queue position for agent fleets</summary>
 
 ```bash
 # Submit a job
@@ -138,9 +155,14 @@ dispatching  → your turn
 
 An agent that sees position 12 can disconnect, pick up other work, and trust the webhook will arrive when the job is done. An agent at position 1 stays on the line and streams the response as tokens arrive.
 
-This is the same pattern TCP brought to packet delivery at Layer 4 — coordination built into the infrastructure so every client doesn't have to solve it independently. At Layer 7, for API workflows, the queue is the protocol.
+</details>
 
 ## API
+
+Full endpoint reference — submit a job, stream events, check status, health check.
+
+<details>
+<summary>Full API reference</summary>
 
 ### Submit a job
 
@@ -187,6 +209,8 @@ GET /jobs/:id
 GET /health
 ```
 
+</details>
+
 ## Idempotency
 
 Every job requires an `idempotent_key`. Submitting the same key twice **for the same `user_id`** returns the original job ID without re-executing the request — different users can safely use the same `idempotent_key` without colliding with each other. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS — durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
@@ -195,16 +219,24 @@ Every job requires an `idempotent_key`. Submitting the same key twice **for the 
 
 ## Durability (Mnesia)
 
-Jobs are written to Mnesia disc-backed tables, not kept purely in memory. Two things matter for what "durable" actually means here:
+Jobs are written to Mnesia disc-backed tables, not kept purely in memory.
+
+<details>
+<summary>Full durability reference — MNESIA_DIR, flush interval tuning</summary>
+
+Two things matter for what "durable" actually means here:
 
 - `MNESIA_DIR` — where the on-disk tables live. **Must point at a persistent volume in production** (defaults to `/data/mnesia` in `fly.toml`, mirroring Aquifer's `DB_PATH`) — without a real volume mount, this data lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
 - `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` (default `100`) — Mnesia's `disc_copies` tables live in RAM by default, with the disk copy caught up via a periodic flush, not on every write. `0` flushes synchronously on every write (zero loss, real per-request latency cost); a positive value batches the flush on a timer instead, bounding the loss window on a true crash to roughly that many milliseconds of writes. 100ms was found empirically to be a good default — see [benchmark.md](benchmark.md) for why going higher made things *worse*, not better.
 
+</details>
+
 ## Drain mode
 
-**Off by default.** A normal deployment (a single long-lived node, or static domain/tenant
-partitioning) is completely unaffected unless you explicitly turn this on — no background check
-runs, no added overhead, nothing about default behavior changes.
+**Off by default.** A normal deployment (a single long-lived node, or static domain/tenant partitioning) is completely unaffected unless you explicitly turn this on — no background check runs, no added overhead, nothing about default behavior changes.
+
+<details>
+<summary>Full drain mode reference — state machine, env vars, webhook payload</summary>
 
 EZThrottle Local's idempotency store exists to dedupe retries while a burst is actively draining, not
 to be a permanent system of record. Drain mode is for a specific deployment pattern: instances get
@@ -260,9 +292,14 @@ identical way — both systems share one hash-key namespace for the same `(user_
 pair, so a downstream consumer can hash lookups the same way regardless of which system a given
 ledger entry came from.
 
+</details>
+
 ## Admission control
 
-Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exceeded, mirroring [Aquifer's](https://github.com/rjpruitt16/aquifer) admission control:
+Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exceeded, mirroring [Aquifer's](https://github.com/rjpruitt16/aquifer) admission control.
+
+<details>
+<summary>Full admission control reference — env vars, defaults</summary>
 
 | Env var | Default | Description |
 |---|---|---|
@@ -279,7 +316,14 @@ your own deployment's memory budget, so it stays disabled until set explicitly; 
 warning on startup if it isn't (benchmarked safe at 400MB on a 512MB instance, as a starting point).
 `GET /health` reports a live `admission` snapshot.
 
+</details>
+
 ## Configuration
+
+Runtime config lives in `config/runtime.exs` — default RPS, account-queue mode, idempotency TTL, and a pluggable metrics adapter.
+
+<details>
+<summary>Full configuration reference — runtime config, metrics adapter behaviour</summary>
 
 ```elixir
 # config/runtime.exs
@@ -312,9 +356,14 @@ end
 
 The default adapter is `EzthrottleLocal.Metrics.Noop`, so existing deployments do not change.
 
+</details>
+
 ## L8 Protocol — trustless webhook delivery
 
-Traditional webhook security shares a secret between sender and receiver, stored in a database on both sides — something that can be stolen, logged by accident, or forgotten to rotate, letting anyone forge deliveries silently once it leaks. EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography — there's no secret to steal from a database.
+Traditional webhook security shares a secret between sender and receiver — something that can be stolen, logged by accident, or forgotten to rotate. EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography — there's no secret to steal from a database.
+
+<details>
+<summary>Full L8 reference — handshake steps, endpoints, key management</summary>
 
 **How it works:**
 
@@ -336,6 +385,8 @@ Set `L8_PRIVATE_KEY` (base64 Ed25519 private key) for a stable identity across r
 | `GET /l8-spec` | Full L8 protocol spec, served locally for an agent/script with only network access to this instance |
 
 **Graceful degradation:** L8 is opt-in. If a receiver doesn't implement `/.well-known/l8`, delivery proceeds unsigned — receivers that don't support L8 are completely unaffected.
+
+</details>
 
 ---
 
@@ -369,7 +420,14 @@ docker run -p 4000:4000 ezthrottle-local
 
 `POST /jobs` takes a `url` field and dispatches a real HTTP request to it. If an arbitrary or untrusted party can set that field, EZThrottle becomes an open relay/SSRF vector — it can be pointed at your internal network, cloud metadata endpoints (`169.254.169.254`), or anything else the machine it runs on can reach, using its own network position and identity. The intended caller is **your own trusted backend or gateway code**, dispatching to a specific microservice or third-party API it already knows about — not an agent, end user, or any other untrusted party choosing the destination itself. Run it on a private network or internal service mesh, not bound to a public address, and if agents need to reach it, put your own authorization and destination allow-listing in front rather than letting them call this API directly.
 
-## Deploy to Fly.io
+## Deployment
+
+Run one node per upstream domain or tenant — each node persists to its own Mnesia directory, no external database or coordination service required, and total throughput scales with node count.
+
+<details>
+<summary>Full deployment reference — Fly.io, Kubernetes, partitioning, zero-downtime updates</summary>
+
+### Deploy to Fly.io
 
 ```bash
 fly launch --config fly.toml
@@ -388,19 +446,21 @@ For maximum queue capacity, use the largest available machine. A 32GB RAM machin
   cpus = 16
 ```
 
-## Deploy to Kubernetes
+### Deploy to Kubernetes
 
 A fourth deployment shape alongside sidecar, standalone, and embedded library: EZThrottle Local as a normal Deployment, reached through a Gateway API proxy (Envoy Gateway) instead of a sidecar. See [`examples/kubernetes/`](examples/kubernetes/) — verified end-to-end against a real `kind` cluster, including a real pod restart proving Mnesia durability survives it (requires a stable `RELEASE_NODE`, documented there).
 
-## Scaling by partitioning
+### Scaling by partitioning
 
-Each node persists to its own Mnesia directory — no external database or coordination service to run, and no shared state between nodes. Scale by partitioning: run one node per upstream domain or tenant, each owning a distinct key space, and total throughput scales with node count. Multiple nodes against the *same* upstream without partitioning multiplies your request rate against it instead — the one setup to avoid. The same applies to pools: a given `pool_id` should belong to exactly one node, since pool state isn't shared across nodes (see the pool-registration note above).
+Multiple nodes against the *same* upstream without partitioning multiplies your request rate against it instead — the one setup to avoid. The same applies to pools: a given `pool_id` should belong to exactly one node, since pool state isn't shared across nodes (see the pool-registration note above).
 
 This partitioning is static — decided at deploy time, fixed until you redeploy. [Drain mode](#drain-mode) is a dynamic alternative to the same problem: rather than every node owning a fixed slice forever, an idle node can flush what it's deduped and hand itself back for reassignment, letting an external orchestrator repartition on the fly as load shifts between tenants instead of you doing it by hand at deploy time. The two aren't mutually exclusive — a fleet can partition statically by upstream domain while individual nodes within a partition cycle through tenants dynamically via drain mode. This mirrors [Aquifer's](https://github.com/rjpruitt16/aquifer) identical guidance.
 
-## Zero-downtime updates
+### Zero-downtime updates
 
 EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloading. Updates to rate limiting logic, routing behavior, or configuration can be deployed to a running node without restarting the process — the in-memory queue is preserved across deploys and no jobs are lost.
+
+</details>
 
 ## EZThrottle Cloud
 
