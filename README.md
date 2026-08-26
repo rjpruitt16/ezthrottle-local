@@ -2,11 +2,16 @@
 
 **Increase your rate limit without DDoSing your backend.**
 
-EZThrottle Local is a self-hosted, agent-native load balancer for internal API traffic. It absorbs bursts into a durable, Mnesia-backed queue, dispatches at a controlled rate, and spreads traffic across a pool of registered backend instances. Your API can dynamically slow EZThrottle down with `X-Aqueduct-*` response headers, so an overloaded service can shed pressure before it starts returning 429s.
+Kubernetes and modern orchestrators are great at scaling compute — but they weren't designed for spiky traffic or tenant fairness. When a burst of requests arrives, your pods get hammered, queues back up unevenly, and one noisy tenant crowds out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready — so retries pile up, and the retries themselves become the outage.
 
-Kubernetes and modern orchestrators are great at scaling compute — but they were not designed for spiky traffic or tenant fairness. When a burst of agentic requests arrives, your pods get hammered, queues back up unevenly, and noisy tenants crowd out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready.
+That's the pattern behind two things I've written:
 
-Real numbers on durability, throughput ceiling, admission shedding, multi-tenant fairness, and a [real GPU under load](benchmark.md#6-gpu-inference-and-the-retry-tax-runpodvllm) are in [benchmark.md](benchmark.md) — including a head-to-head comparison against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
+- [Eliminate GPU Waste by Cutting the Retry Tax](https://rahmipruitt.me/content/gpu-retry-tax/)
+- [GitHub Outages Show the Limits of Reactive Scaling](https://rahmipruitt.me/content/github-outage-reactive-scaling/)
+
+EZThrottle Local is what I built to actually fix it: a self-hosted load balancer that absorbs bursts into a durable queue, dispatches at a controlled rate, and spreads traffic across a pool of backend instances — your API sheds load by talking back, not by getting hammered until it falls over.
+
+Real numbers — durability, throughput ceiling, admission shedding, multi-tenant fairness, a real GPU under load — are in [benchmark.md](benchmark.md), including a head-to-head against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
 ## How it works
 
