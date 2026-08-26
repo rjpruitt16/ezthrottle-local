@@ -159,13 +159,6 @@ An agent that sees position 12 can disconnect, pick up other work, and trust the
 
 ## API
 
-Full endpoint reference — submit a job, stream events, check status, health check.
-
-<details>
-<summary>Full API reference</summary>
-
-### Submit a job
-
 ```bash
 POST /jobs
 Content-Type: application/json
@@ -181,35 +174,7 @@ Content-Type: application/json
 }
 ```
 
-**Response headers your API can return to control pacing:**
-
-| Header | Effect |
-|---|---|
-| `X-EZTHROTTLE-RPS: 10` | Raise or lower requests per second |
-| `X-EZTHROTTLE-MAX-CONCURRENT: 5` | Change max in-flight requests |
-| `X-EZTHROTTLE-ACCOUNT-QUEUE: enabled` | Switch to per-tenant queue isolation |
-
-### Stream job events (SSE)
-
-```bash
-GET /jobs/:id/stream
-```
-
-Opens a server-sent event stream. Events: `queued`, `position`, `dispatching`, `completed`, `failed`. Keepalive pings sent every 30 seconds. If you disconnect before completion, the result is delivered to your `webhook_url`.
-
-### Check job status
-
-```bash
-GET /jobs/:id
-```
-
-### Health check
-
-```bash
-GET /health
-```
-
-</details>
+**[API.md](API.md)** has the full reference: streaming events, checking job status, the health check, and the response headers your API can return to control pacing.
 
 ## Idempotency
 
@@ -233,66 +198,9 @@ Two things matter for what "durable" actually means here:
 
 ## Drain mode
 
-**Off by default.** A normal deployment (a single long-lived node, or static domain/tenant partitioning) is completely unaffected unless you explicitly turn this on — no background check runs, no added overhead, nothing about default behavior changes.
+**Off by default**, opt-in for a specific deployment pattern: instances get handed to a tenant, absorb and drain their burst, then get freed for reassignment to a different tenant. A normal single-node or statically-partitioned deployment is completely unaffected unless you turn this on. When idle for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, a node flushes its deduped idempotency ledger to a webhook and clears local state, moving through an `active` → `draining` → `unassigned` state machine visible via `GET /health`.
 
-<details>
-<summary>Full drain mode reference — state machine, env vars, webhook payload</summary>
-
-EZThrottle Local's idempotency store exists to dedupe retries while a burst is actively draining, not
-to be a permanent system of record. Drain mode is for a specific deployment pattern: instances get
-handed to a tenant, absorb and drain their burst, then get freed for reassignment to a different
-tenant. When enabled, and this node goes completely idle (no requests anywhere on the whole node, not
-just one tenant's queue) for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, it flushes everything it's deduped
-since the last flush to a webhook, and only on confirmed delivery, clears its local ledger — making
-the node safe to hand to someone else.
-
-**EZThrottle Local does not decide who gets a freed instance next**, and does not retain the ledger
-itself beyond the next flush. That orchestration — durable long-term storage, and assigning tenants to
-instances — is entirely up to whatever service you build to receive this webhook. EZThrottle Local
-only detects idle and hands off what it has.
-
-**State machine**, visible via `GET /health` (`"drain": {"state": "..."}`, only present when enabled):
-
-| State | Meaning |
-|---|---|
-| `active` | At least one upstream domain has live work. Normal state, drain mode enabled or not. |
-| `draining` | Every upstream has gone idle, but either the drain timer hasn't elapsed yet or a flush attempt is in flight/being retried. Not yet safe to hand off. |
-| `unassigned` | The ledger was flushed (or there was nothing to flush) and local state is clear — safe to hand off. Reverts to `active` the instant new work arrives. |
-
-`unassigned` is a status label, not an access gate — EZThrottle Local keeps accepting new jobs in
-every state. Nothing stops a job from landing on a node mid-handoff; if your orchestrator needs a hard
-guarantee that never happens, enforce it on your own end before routing traffic there.
-
-**Env vars:**
-
-| Var | Default | Notes |
-|---|---|---|
-| `EZTHROTTLE_DRAIN_ENABLED` | `false` | The real gate — the other two vars are only read when this is `true`. |
-| `EZTHROTTLE_DRAIN_TIMER_SECONDS` | `45` | How long the whole node must be idle before flushing. Deliberately separate from the unrelated 5-minute per-tenant-queue self-teardown timer (`@idle_timeout_ms`), which reclaims one queue's process and has nothing to do with node-wide handoff. |
-| `EZTHROTTLE_DRAIN_WEBHOOK_URL` | *(none)* | Required if enabled — if unset, drain mode logs a warning and stays off rather than flushing with nowhere to send it. |
-
-**Webhook payload:**
-
-```json
-{
-  "event": "instance_idle",
-  "flushed_at": "2026-08-23T14:02:11Z",
-  "ledger": [
-    { "idempotent_key_hash": "3fa9c1...", "job_id": "a3f9...", "status": "completed" }
-  ]
-}
-```
-
-`idempotent_key_hash` is `sha256(user_id + ":" + idempotent_key)`, hex-encoded lowercase — the exact
-hash this store already computes internally, never the plaintext key. A downstream consumer
-re-checking a key for a duplicate must hash it the same way.
-
-If you're also running [Aquifer](https://github.com/rjpruitt16/aquifer), its drain mode hashes the
-identical way — both systems share one hash-key namespace for the same `(user_id, idempotent_key)`
-pair, so a downstream consumer can hash lookups the same way regardless of which system a given
-ledger entry came from.
-
-</details>
+See **[DRAIN_MODE.md](DRAIN_MODE.md)** for the full state machine, env vars, and webhook payload shape.
 
 ## Admission control
 
@@ -360,33 +268,9 @@ The default adapter is `EzthrottleLocal.Metrics.Noop`, so existing deployments d
 
 ## L8 Protocol — trustless webhook delivery
 
-Traditional webhook security shares a secret between sender and receiver — something that can be stolen, logged by accident, or forgotten to rotate. EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography — there's no secret to steal from a database.
+Traditional webhook security shares an HMAC secret between sender and receiver, stored in a database on both sides — something that can be stolen, logged accidentally, or forgotten during rotation, letting anyone forge deliveries forever once it leaks. EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography: the receiver publishes a public key, a one-time handshake proves both sides own their private keys, and every delivery afterward carries a signature verified locally in microseconds — no database lookup, no round-trip to any authority.
 
-<details>
-<summary>Full L8 reference — handshake steps, endpoints, key management</summary>
-
-**How it works:**
-
-1. Your webhook receiver publishes a public key at `GET /.well-known/l8`
-2. Before the first delivery, EZThrottle challenges the receiver to prove ownership of the corresponding private key — a one-time handshake per domain
-3. Trust is cached to disk as `l8-trust/{domain}.json` — the handshake never runs again for that domain
-4. Every delivery carries `X-L8-Signature` headers, verified locally with a single Ed25519 call — no database lookup, no round-trip to any authority, microseconds
-
-Trust stays deliberately pairwise, not transitive, by design. For better security and less latency than a shared-secret scheme, see the [L8 spec](https://rjpruitt16.github.io/l8-protocol/) for the full protocol rationale — the same canonical spec [Aquifer](https://github.com/rjpruitt16/aquifer) follows.
-
-Set `L8_PRIVATE_KEY` (base64 Ed25519 private key) for a stable identity across restarts, or let EZThrottle auto-generate one on first start. Delete `l8-trust/{domain}.json` to revoke trust with a domain — the handshake re-runs on next delivery.
-
-**EZThrottle exposes:**
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /.well-known/l8` | EZThrottle's public key — receivers discover it here |
-| `POST /l8/challenge` | Handles incoming challenges from receivers verifying EZThrottle's identity |
-| `GET /l8-spec` | Full L8 protocol spec, served locally for an agent/script with only network access to this instance |
-
-**Graceful degradation:** L8 is opt-in. If a receiver doesn't implement `/.well-known/l8`, delivery proceeds unsigned — receivers that don't support L8 are completely unaffected.
-
-</details>
+The full protocol rationale, wire format, and a reference receiver implementation live at the **[L8 spec](https://rjpruitt16.github.io/l8-protocol/)** — the same canonical spec [Aquifer](https://github.com/rjpruitt16/aquifer) follows — also served locally at `GET /l8-spec` for an agent/script with only network access to this instance. Set `L8_PRIVATE_KEY` for a stable identity across restarts, or let EZThrottle auto-generate one on first start.
 
 ---
 
