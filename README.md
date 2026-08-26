@@ -13,6 +13,8 @@ EZThrottle Local is what I built to actually fix it: a self-hosted load balancer
 
 Real numbers — durability, throughput ceiling, admission shedding, multi-tenant fairness, a real GPU under load — are in [benchmark.md](benchmark.md), including a head-to-head against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
+---
+
 ## How it works
 
 ```
@@ -29,6 +31,8 @@ Client → POST /jobs → EZThrottle Local → paced outbound requests → Your 
 2. **EZThrottle queues it** — Jobs are held in memory and dispatched at the configured RPS.
 3. **Your API responds** — EZThrottle reads pacing headers from the response and adjusts automatically, falling back to the real [ORCA](https://github.com/cncf/xds/blob/main/xds/data/orca/v3/orca_load_report.proto) standard for backends that report load a different way (vLLM and Triton/TensorRT-LLM both work today) — see [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) below for the full header reference.
 4. **Stay on the line or hang up** — open `GET /jobs/:id/stream` to receive live events as the job moves through the queue, or disconnect and the result is delivered to your `webhook_url` when ready.
+
+---
 
 ## Per-tenant fairness (AccountQueue mode)
 
@@ -113,6 +117,8 @@ The same call is both initial registration and heartbeat — call it again perio
 
 </details>
 
+---
+
 ## Streaming — stay on the line or get a voicemail
 
 Most queue systems force you to choose: poll for status or hope the webhook lands. EZThrottle gives you a third option — an open SSE stream that tells you exactly what's happening in real time, or a `webhook_url` fallback if you disconnect. Coordination built into the infrastructure, the same way TCP handled it at Layer 4 — at Layer 7, for API workflows, the queue is the protocol.
@@ -162,6 +168,8 @@ An agent that sees position 12 can disconnect, pick up other work, and trust the
 
 </details>
 
+---
+
 ## API
 
 ```bash
@@ -181,11 +189,15 @@ Content-Type: application/json
 
 **[API.md](API.md)** has the full reference: streaming events, checking job status, the health check, and the response headers your API can return to control pacing.
 
+---
+
 ## Idempotency
 
 Every job requires an `idempotent_key`. Submitting the same key twice **for the same `user_id`** returns the original job ID without re-executing the request — different users can safely use the same `idempotent_key` without colliding with each other. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS — durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
 
 **Delivery semantics:** EZThrottle provides at-least-once dispatch and webhook delivery, not exactly-once execution. If the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches to the upstream again on restart — so it's not just the webhook that can repeat, the upstream call itself can. Make both your upstream endpoint and your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
+
+---
 
 ## Durability (Mnesia)
 
@@ -201,11 +213,15 @@ Two things matter for what "durable" actually means here:
 
 </details>
 
+---
+
 ## Drain mode
 
 **Off by default**, opt-in for a specific deployment pattern: instances get handed to a tenant, absorb and drain their burst, then get freed for reassignment to a different tenant. A normal single-node or statically-partitioned deployment is completely unaffected unless you turn this on. When idle for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, a node flushes its deduped idempotency ledger to a webhook and clears local state, moving through an `active` → `draining` → `unassigned` state machine visible via `GET /health`.
 
 See **[DRAIN_MODE.md](DRAIN_MODE.md)** for the full state machine, env vars, and webhook payload shape.
+
+---
 
 ## Admission control
 
@@ -230,6 +246,8 @@ warning on startup if it isn't (benchmarked safe at 400MB on a 512MB instance, a
 `GET /health` reports a live `admission` snapshot.
 
 </details>
+
+---
 
 ## Configuration
 
@@ -271,6 +289,8 @@ The default adapter is `EzthrottleLocal.Metrics.Noop`, so existing deployments d
 
 </details>
 
+---
+
 ## L8 Protocol — trustless webhook delivery
 
 Traditional webhook security shares an HMAC secret between sender and receiver, stored in a database on both sides — something that can be stolen, logged accidentally, or forgotten during rotation, letting anyone forge deliveries forever once it leaks. EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography: the receiver publishes a public key, a one-time handshake proves both sides own their private keys, and every delivery afterward carries a signature verified locally in microseconds — no database lookup, no round-trip to any authority.
@@ -298,6 +318,8 @@ L8 protocol tests (verifies handshake, signed delivery, and cryptographic signat
 make l8-test
 ```
 
+---
+
 ## Docker
 
 ```bash
@@ -305,9 +327,13 @@ docker build -t ezthrottle-local .
 docker run -p 4000:4000 ezthrottle-local
 ```
 
+---
+
 ## Do not expose this directly to untrusted callers
 
 `POST /jobs` takes a `url` field and dispatches a real HTTP request to it. If an arbitrary or untrusted party can set that field, EZThrottle becomes an open relay/SSRF vector — it can be pointed at your internal network, cloud metadata endpoints (`169.254.169.254`), or anything else the machine it runs on can reach, using its own network position and identity. The intended caller is **your own trusted backend or gateway code**, dispatching to a specific microservice or third-party API it already knows about — not an agent, end user, or any other untrusted party choosing the destination itself. Run it on a private network or internal service mesh, not bound to a public address, and if agents need to reach it, put your own authorization and destination allow-listing in front rather than letting them call this API directly.
+
+---
 
 ## Deployment
 
@@ -351,21 +377,10 @@ EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloa
 
 </details>
 
-## EZThrottle Cloud
+---
 
-EZThrottle Local is a single node: jobs are durable to disk (survives a crash or restart of that machine — see [benchmark.md](benchmark.md)) and webhook delivery already retries with backoff, but there's no cross-machine or cross-region replication — if the machine itself is destroyed (not just restarted) before its volume can be recovered, or the whole region goes down, that's outside what a single node can promise.
+## License
 
-**[EZThrottle Cloud](https://ezthrottle.network)** handles the cases this cannot:
+MIT
 
-- **Multi-step workflows** — chain dependent API calls with conditional branching
-- **Cross-region durability** — jobs survive not just a node restart but a full region failure
-- **Regional delivery guarantee** — if a region is healthy, your job will be delivered, with dead-letter queues for visibility when it isn't
-- **Internal + external traffic** — protect both your own services and third-party APIs from the same control plane
-- **Distributed fairness** — per-tenant rate limiting across multiple nodes and regions
-
-EZThrottle Local is the right tool for teams that want to get started immediately with zero infrastructure. When you need durability and cross-region guarantees, EZThrottle Cloud picks up where this leaves off.
-
-## Writing
-
-- [Eliminate GPU Waste by Cutting the Retry Tax](https://rahmipruitt.me/content/gpu-retry-tax/) — the thesis behind [drain mode](#drain-mode) and the ORCA fallback pacing [GPU benchmark](benchmark.md#6-gpu-inference-and-the-retry-tax-runpodvllm) above.
-- [GitHub Outages Show the Limits of Reactive Scaling](https://rahmipruitt.me/content/github-outage-reactive-scaling/) — why reactive scaling and retry storms don't mix, the problem EZThrottle Local absorbs instead.
+Built by [Rahmi Pruitt](https://rahmipruitt.me) — open to AI infra consulting, founding engineer, and contract work.
