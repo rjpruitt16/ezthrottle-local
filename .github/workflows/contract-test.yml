@@ -38,7 +38,7 @@ jobs:
           path: aqueduct-runner
 
       - name: Contract test -- shared suite (health, lifecycle, idempotency, proxy, L8)
-        uses: dagger/dagger-for-github@v8
+        uses: dagger/dagger-for-github@v8.4.1
         with:
           version: "0.21.8"
           module: ./aqueduct-runner
@@ -49,7 +49,7 @@ jobs:
             --recorder-dir=./aqueduct-runner/recorder
 
       - name: Contract test -- admission rejection
-        uses: dagger/dagger-for-github@v8
+        uses: dagger/dagger-for-github@v8.4.1
         with:
           version: "0.21.8"
           module: ./aqueduct-runner
