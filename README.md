@@ -1,4 +1,4 @@
-# EZThrottle Local
+# EZThrottle Local — Load balancer for agentic workloads
 
 **Increase your rate limit without DDoSing your backend.**
 
