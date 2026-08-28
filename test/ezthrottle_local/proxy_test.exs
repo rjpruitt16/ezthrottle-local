@@ -63,6 +63,46 @@ defmodule EzthrottleLocal.ProxyTest do
     end
   end
 
+  defmodule QueueActiveHeaderPlug do
+    import Plug.Conn
+
+    def init(opts), do: opts
+
+    def call(conn, _opts) do
+      conn
+      |> put_resp_header("x-aqueduct-queue-active", "true")
+      |> send_resp(200, "still a real answer")
+    end
+  end
+
+  # First hit trips the breaker (429); every hit after that blocks until
+  # released, reporting its own pid to test_pid so the test can unblock it
+  # once it's done asserting -- used to simulate a fallback job that's
+  # genuinely still in flight after the breaker's own cooldown has elapsed.
+  defmodule TripThenBlockPlug do
+    import Plug.Conn
+
+    def init(opts), do: opts
+
+    def call(conn, opts) do
+      counter = Keyword.fetch!(opts, :counter)
+      test_pid = Keyword.fetch!(opts, :test_pid)
+      n = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+
+      if n == 1 do
+        send_resp(conn, 429, "")
+      else
+        send(test_pid, {:blocked, self()})
+
+        receive do
+          :release -> :ok
+        end
+
+        send_resp(conn, 200, "")
+      end
+    end
+  end
+
   defp start_server(plug, opts \\ []) do
     port = Enum.random(20_000..60_000)
     child_id = :"proxy_test_#{port}"
@@ -189,5 +229,66 @@ defmodule EzthrottleLocal.ProxyTest do
     assert {:duplicate, existing} = Proxy.attempt_direct(params)
     assert existing.id == first_job.id
     assert IdempotentStore.get_status(existing.id) == "completed"
+  end
+
+  test "X-Aqueduct-Queue-Active: true still relays the response but trips the breaker" do
+    url = start_server(QueueActiveHeaderPlug)
+    key = "queue-active-#{System.unique_integer([:positive])}"
+
+    assert {:direct, job, response} = Proxy.attempt_direct(job_params("user-1", key, url))
+    assert response.status == 200
+    assert response.body == "still a real answer"
+    assert AccountQueueRegistry.breaker_open?(job)
+  end
+
+  test "falls back while the queue still has backlog, even after the breaker cooldown elapses" do
+    Application.put_env(:ezthrottle_local, :proxy_breaker_default_cooldown_seconds, 1)
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+    test_pid = self()
+    url = start_server(TripThenBlockPlug, counter: counter, test_pid: test_pid)
+    key_a = "backlog-a-#{System.unique_integer([:positive])}"
+    key_b = "backlog-b-#{System.unique_integer([:positive])}"
+
+    assert {:fallback, job} = Proxy.attempt_direct(job_params("user-1", key_a, url))
+    # Simulate what the real controller does on fallback (job_controller.ex
+    # proxy/2): actually enqueue the job, so the domain's queue has real
+    # backlog, not just a persisted-but-untouched job record.
+    AccountQueueRegistry.enqueue(job, nil)
+
+    assert wait_until(fn -> AccountQueueRegistry.queue_active?(job) end, 2_000),
+           "expected the dispatched fallback job to show up as queue backlog"
+
+    blocked_pid =
+      receive do
+        {:blocked, pid} -> pid
+      after
+        2_000 -> flunk("expected the fallback job's own request to reach the upstream")
+      end
+
+    Process.sleep(1_100)
+    refute AccountQueueRegistry.breaker_open?(job), "test setup: expected the cooldown to have elapsed"
+
+    # The breaker itself is closed now, but the domain still has a real
+    # backlog draining (the blocked in-flight request from the first
+    # fallback) -- a third request should still fall back, not attempt
+    # direct, since the cooldown expiring doesn't mean the backlog it
+    # caused has actually finished.
+    assert {:fallback, _} = Proxy.attempt_direct(job_params("user-1", key_b, url))
+    assert Agent.get(counter, & &1) == 2
+
+    send(blocked_pid, :release)
+  end
+
+  defp wait_until(fun, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_until(fun, deadline)
+  end
+
+  defp do_wait_until(fun, deadline) do
+    cond do
+      fun.() -> true
+      System.monotonic_time(:millisecond) >= deadline -> false
+      true -> (Process.sleep(10); do_wait_until(fun, deadline))
+    end
   end
 end

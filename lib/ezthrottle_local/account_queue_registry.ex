@@ -104,6 +104,11 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     UrlActor.breaker_open?(actor_for(job))
   end
 
+  @doc "See UrlActor.queue_active?/1 -- resolves the actor for this job first."
+  def queue_active?(%Job{} = job) do
+    UrlActor.queue_active?(actor_for(job))
+  end
+
   @doc "See UrlActor.trip_breaker/2 -- resolves the actor for this job first."
   def trip_breaker(%Job{} = job, cooldown_ms) do
     UrlActor.trip_breaker(actor_for(job), cooldown_ms)

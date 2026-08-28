@@ -64,6 +64,15 @@ defmodule EzthrottleLocal.AccountQueue do
   @doc "Current dispatch rate -- used by UrlActor's aggregate-budget check to read every sibling queue's live rate."
   def get_rps(pid), do: GenServer.call(pid, :get_rps)
 
+  @doc """
+  Whether this queue currently has real backlog (queued or in-flight work).
+  Used by proxy mode to decide whether a domain should keep routing through
+  the durable queue even after its circuit breaker's cooldown has elapsed --
+  a cooldown timer alone doesn't know whether the backlog it caused has
+  actually finished draining yet.
+  """
+  def active?(pid), do: GenServer.call(pid, :active?)
+
   def update_max_concurrent(pid, max) do
     GenServer.cast(pid, {:update_max_concurrent, max})
   end
@@ -234,6 +243,12 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_call(:get_rps, _from, state), do: {:reply, state.rps, state}
+
+  @impl true
+  def handle_call(:active?, _from, state) do
+    active? = not (:queue.is_empty(state.queue) and state.in_flight == 0)
+    {:reply, active?, state}
+  end
 
   # ---- Private ----
 
@@ -599,18 +614,21 @@ defmodule EzthrottleLocal.AccountQueue do
     end)
   end
 
-  # Reads X-Aqueduct-<name> first, falling back to X-EZThrottle-<name> —
-  # same dual-namespace precedence Aquifer uses (X-Aqueduct-* is the
-  # protocol name, X-Aquifer-*/X-EZThrottle-* are product aliases), so a
-  # backend speaking either protocol's headers is understood.
-  defp pacing_header(headers, name) when is_map(headers) do
+  @doc """
+  Reads X-Aqueduct-<name> first, falling back to X-EZThrottle-<name> — same
+  dual-namespace precedence Aquifer uses (X-Aqueduct-* is the protocol name,
+  X-Aquifer-*/X-EZThrottle-* are product aliases), so a backend speaking
+  either protocol's headers is understood. Public so Proxy can reuse it for
+  the same inbound-signal parsing on the direct-attempt path.
+  """
+  def pacing_header(headers, name) when is_map(headers) do
     case Map.get(headers, "x-aqueduct-#{name}") do
       nil -> Map.get(headers, "x-ezthrottle-#{name}")
       val -> val
     end
   end
 
-  defp pacing_header(_headers, _name), do: nil
+  def pacing_header(_headers, _name), do: nil
 
   defp parse_rps_header(headers) do
     case pacing_header(headers, "rps") do

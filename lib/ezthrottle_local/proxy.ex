@@ -69,7 +69,7 @@ defmodule EzthrottleLocal.Proxy do
   end
 
   defp attempt_dispatch_or_fallback(%Job{} = job) do
-    if AccountQueueRegistry.breaker_open?(job) do
+    if AccountQueueRegistry.breaker_open?(job) or AccountQueueRegistry.queue_active?(job) do
       {:fallback, job}
     else
       case AccountQueue.make_request(job, job.url, 0, 0, :direct, direct_attempt_timeout_ms()) do
@@ -87,6 +87,16 @@ defmodule EzthrottleLocal.Proxy do
       AccountQueueRegistry.trip_breaker(job, breaker_cooldown(response.headers))
       {:fallback, job}
     else
+      # The upstream can proactively ask to be routed through the durable
+      # queue going forward -- X-Aqueduct-Queue-Active: true -- even on an
+      # otherwise-healthy response, e.g. "I'm nearing capacity, stop firing
+      # directly at me." Unlike overload?/1, this response is still a real,
+      # valid answer already in hand: it's relayed to the caller as normal
+      # below, only future requests to this domain start queuing.
+      if AccountQueue.pacing_header(response.headers, "queue-active") == "true" do
+        AccountQueueRegistry.trip_breaker(job, breaker_cooldown(response.headers))
+      end
+
       IdempotentStore.update_status(job.id, :completed)
 
       Phoenix.PubSub.broadcast(

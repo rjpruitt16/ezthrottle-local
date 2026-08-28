@@ -93,6 +93,21 @@ defmodule EzthrottleLocal.UrlActor do
     GenServer.cast(pid, {:trip_breaker, cooldown_ms})
   end
 
+  @doc """
+  Whether any of this domain's account queues currently has real backlog
+  (queued or in-flight work). Distinct from breaker_open?/1: a breaker
+  cooldown is a fixed clock that can expire while a real backlog is still
+  draining, letting proxy mode resume direct dispatch against an upstream
+  that's still catching up from the very overload that tripped the breaker.
+  queue_active?/1 self-corrects instead -- it stays true for exactly as
+  long as there's real work in flight, independent of any timer, and goes
+  false the instant the backlog is actually empty. Mirrors Aquifer's
+  URLWorker.QueueActive.
+  """
+  def queue_active?(pid) do
+    GenServer.call(pid, :queue_active?)
+  end
+
   # ---- GenServer Callbacks ----
 
   @impl true
@@ -146,6 +161,12 @@ defmodule EzthrottleLocal.UrlActor do
       end
 
     {:reply, open?, state, @idle_timeout_ms}
+  end
+
+  @impl true
+  def handle_call(:queue_active?, _from, state) do
+    active? = state.queues |> Map.values() |> Enum.any?(&AccountQueue.active?/1)
+    {:reply, active?, state, @idle_timeout_ms}
   end
 
   @impl true
