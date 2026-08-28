@@ -10,6 +10,30 @@ Real numbers — durability, throughput ceiling, admission shedding, multi-tenan
 
 ---
 
+## Use cases
+
+**Protect your API**
+```
+agents / clients  →  POST /jobs to EZThrottle  →  your backend (at controlled RPS)
+```
+Agents or clients hammering your API over HTTP? EZThrottle queues their requests and drains them to your backend at a pace it can handle. Your backend returns `X-Aqueduct-Rps` headers to signal how fast it wants traffic in real time.
+
+**A durable checkpoint in front of a rate-limited resource**
+```
+your app  →  POST /jobs to EZThrottle  →  database / CI runner / OpenAI / Stripe / any rate-limited API
+```
+Calling something with its own capacity limit — a database read replica, a CI runner, a third-party API? EZThrottle queues the calls durably and dispatches them at your configured rate, so a burst from your own side never becomes the thing that takes the downstream down. Works especially well closed-loop: if the downstream already speaks `X-Aqueduct-*` headers, it can tell EZThrottle to back off in real time instead of you guessing a static rate.
+
+**Edge load balancer → gateway — pace and route at the edge**
+```
+your users  →  POST /proxy to EZThrottle  →  your resources (paced, routed, at the speed you can handle)
+```
+Point EZThrottle at your resources like a normal reverse proxy, close to the caller. It tries the request directly first — a healthy resource sees no queue at all — and only falls back to durable queuing when something's actually overloaded, on the same connection. For low-latency cross-region failover on top of that: Fly.io's own [`fly-replay`](https://fly.io/docs/networking/dynamic-request-routing/) is a response header *your* app returns to tell Fly's edge "redeliver this request in a different region" — your own logic in front of EZThrottle can watch for the same overload signal the circuit breaker already uses (429, 5xx, an ORCA threshold) and respond with `fly-replay` instead of just falling back locally, rerouting at Fly's edge rather than adding a round trip through your own infrastructure. Not something EZThrottle implements itself — the same overload classification just composes naturally with it.
+
+In all three, the upstream can lower the dispatch pace via response headers — see [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) for how the ceiling, backoff, and recovery actually work.
+
+---
+
 ## How it works
 
 ```
@@ -182,7 +206,7 @@ Content-Type: application/json
 }
 ```
 
-**[API.md](API.md)** has the full reference: streaming events, checking job status, the health check, and the response headers your API can return to control pacing.
+**[API.md](API.md)** has the full reference: streaming events, checking job status, `POST /proxy` (edge-gateway mode — see [Use cases](#use-cases)), the health check, and the response headers your API can return to control pacing.
 
 ---
 
@@ -210,11 +234,15 @@ Two things matter for what "durable" actually means here:
 
 ---
 
-## Drain mode
+## Partitioning strategies
 
-**Off by default**, opt-in for a specific deployment pattern: instances get handed to a tenant, absorb and drain their burst, then get freed for reassignment to a different tenant. A normal single-node or statically-partitioned deployment is completely unaffected unless you turn this on. When idle for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, a node flushes its deduped idempotency ledger to a webhook and clears local state, moving through an `active` → `draining` → `unassigned` state machine visible via `GET /health`.
+Running one node for everything works fine until you have multiple tenants or multiple upstreams sharing it — then one tenant's burst, or one upstream's own rate limit, ends up affecting everyone else on that same node. Two ways to split traffic apart so that doesn't happen, not mutually exclusive:
 
-See **[DRAIN_MODE.md](DRAIN_MODE.md)** for the full state machine, env vars, and webhook payload shape.
+**Static partitioning** — decided once, at deploy time: dedicate one node to a single protected resource — a CI runner, a database, a GPU, or a rate-limited external API you want to be nice to — so that resource only ever sees traffic paced the way you configured, up to whatever it can actually bear. Multiple tenants can safely share that same node: turn on [AccountQueue mode](#per-tenant-fairness-accountqueue-mode) and each tenant gets their own independently-paced queue, so one tenant's burst doesn't starve another's, and the resource itself never sees more aggregate load than it's rated for. The mistake to avoid: pointing multiple *nodes* at the *same* resource instead of routing everyone through this one pacing checkpoint — that just multiplies your total request rate against it. Same rule for pools: a given `pool_id` should belong to exactly one node, since pool state isn't shared across nodes.
+
+**Dynamic partitioning (drain mode)** — off by default, for a more specific shape: instead of deciding every assignment up front, a node gets handed to one tenant at a time, absorbs and drains whatever burst that tenant sends, then frees itself up to be handed to a *different* tenant next — useful when you want dedicated capacity per user without hand-assigning it at deploy time. A normal single-node or statically-partitioned deployment is completely unaffected unless you turn this on. When idle for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, the node flushes its deduped idempotency ledger to a webhook and clears local state, moving through an `active` → `draining` → `unassigned` state machine visible via `GET /health`. See **[DRAIN_MODE.md](DRAIN_MODE.md)** for the full state machine, env vars, and webhook payload shape.
+
+The two combine: a fleet can partition statically by upstream domain, while individual nodes within a partition cycle through tenants dynamically via drain mode. This mirrors [Aquifer's](https://github.com/rjpruitt16/aquifer) identical guidance.
 
 ---
 
@@ -362,9 +390,7 @@ A fourth deployment shape alongside sidecar, standalone, and embedded library: E
 
 ### Scaling by partitioning
 
-Multiple nodes against the *same* upstream without partitioning multiplies your request rate against it instead — the one setup to avoid. The same applies to pools: a given `pool_id` should belong to exactly one node, since pool state isn't shared across nodes (see the pool-registration note above).
-
-This partitioning is static — decided at deploy time, fixed until you redeploy. [Drain mode](#drain-mode) is a dynamic alternative to the same problem: rather than every node owning a fixed slice forever, an idle node can flush what it's deduped and hand itself back for reassignment, letting an external orchestrator repartition on the fly as load shifts between tenants instead of you doing it by hand at deploy time. The two aren't mutually exclusive — a fleet can partition statically by upstream domain while individual nodes within a partition cycle through tenants dynamically via drain mode. This mirrors [Aquifer's](https://github.com/rjpruitt16/aquifer) identical guidance.
+See [Partitioning strategies](#partitioning-strategies) above for how to assign tenants to nodes, statically or dynamically.
 
 ### Zero-downtime updates
 
@@ -376,7 +402,7 @@ EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloa
 
 ## Writing
 
-- [Eliminate GPU Waste by Cutting the Retry Tax](https://rahmipruitt.me/content/gpu-retry-tax/) — the thesis behind [drain mode](#drain-mode) and the ORCA fallback pacing [GPU benchmark](benchmark.md#6-gpu-inference-and-the-retry-tax-runpodvllm) above.
+- [Eliminate GPU Waste by Cutting the Retry Tax](https://rahmipruitt.me/content/gpu-retry-tax/) — the thesis behind [drain mode](#partitioning-strategies) and the ORCA fallback pacing [GPU benchmark](benchmark.md#6-gpu-inference-and-the-retry-tax-runpodvllm) above.
 - [GitHub Outages Show the Limits of Reactive Scaling](https://rahmipruitt.me/content/github-outage-reactive-scaling/) — why reactive scaling and retry storms don't mix, the problem EZThrottle Local absorbs instead.
 
 ## License
