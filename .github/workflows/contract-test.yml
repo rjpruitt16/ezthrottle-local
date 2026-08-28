@@ -1,0 +1,60 @@
+name: Contract tests (Aqueduct Runner)
+
+# Cross-repo contract tests against the real, unmodified ezthrottle-local
+# image -- proves at the wire level that the shared
+# X-Aqueduct-*/X-EZTHROTTLE-* contract with aquifer still holds, not just
+# that ezthrottle-local's own tests pass. See
+# github.com/rjpruitt16/aqueduct-runner.
+#
+# No drain-mode job here (unlike aquifer's equivalent workflow):
+# ezthrottle-local's drain mode has a confirmed, currently-unfixed bug
+# (two always-on heartbeats in account_queue.ex and url_actor.ex each
+# prevent their own GenServer idle-timeout from ever firing, so it can
+# never flush) -- see aqueduct-runner's README "Known caveat" section and
+# hurl/shared/test_drain_ledger_ezthrottle.hurl for the full citation.
+# Running it here would just be permanent, known-red CI. Re-add a drain
+# job (mirroring aquifer's contract-test-drain) once that's fixed
+# upstream, and re-run `make contract-test-ezthrottle-drain` in
+# aqueduct-runner to confirm before wiring it back in.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  contract-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ezthrottle-local
+        uses: actions/checkout@v4
+        with:
+          path: ezthrottle-local
+
+      - name: Checkout aqueduct-runner
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/aqueduct-runner
+          path: aqueduct-runner
+
+      - name: Contract test -- shared suite (health, lifecycle, idempotency, proxy, L8)
+        uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-ezthrottle
+            --source=./ezthrottle-local
+            --hurl-dir=./aqueduct-runner/hurl
+            --recorder-dir=./aqueduct-runner/recorder
+
+      - name: Contract test -- admission rejection
+        uses: dagger/dagger-for-github@v8
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-ezthrottle-admission
+            --source=./ezthrottle-local
+            --hurl-dir=./aqueduct-runner/hurl
+            --recorder-dir=./aqueduct-runner/recorder
