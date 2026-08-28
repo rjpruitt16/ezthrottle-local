@@ -19,6 +19,10 @@ defmodule EzthrottleLocalWeb.Router do
 
   scope "/", EzthrottleLocalWeb do
     get "/jobs/:id/stream", JobStreamController, :stream
+    # Own scope, not the :api pipeline's plug :accepts, ["json"] -- like
+    # the stream route above, a fallback response here is
+    # text/event-stream, not JSON.
+    post "/proxy", JobController, :proxy
   end
 
   # Enable LiveDashboard in development

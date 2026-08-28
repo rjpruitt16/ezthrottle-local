@@ -12,22 +12,32 @@ defmodule EzthrottleLocalWeb.JobStreamController do
         |> json(%{error: "job not found"})
 
       job ->
-        IdempotentStore.set_delivery_mode(job_id, :stream)
-        Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, "job:#{job_id}")
-
-        conn =
-          conn
-          |> put_resp_content_type("text/event-stream")
-          |> put_resp_header("cache-control", "no-cache")
-          |> put_resp_header("connection", "keep-alive")
-          |> send_chunked(200)
-
-        # Send catchup events for any states already passed before client connected
-        status = IdempotentStore.get_status(job_id)
-        conn = send_catchup_events(conn, job_id, status)
-
-        listen_loop(conn, job)
+        stream_events(conn, job)
     end
+  end
+
+  @doc """
+  Subscribes to this job's events and streams them via SSE on the given
+  connection -- stream/2's actual behavior, extracted so proxy mode's
+  fallback path (JobController.proxy/2) can reuse it verbatim
+  ("automatically start streaming") instead of reimplementing it.
+  """
+  def stream_events(conn, job) do
+    IdempotentStore.set_delivery_mode(job.id, :stream)
+    Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, "job:#{job.id}")
+
+    conn =
+      conn
+      |> put_resp_content_type("text/event-stream")
+      |> put_resp_header("cache-control", "no-cache")
+      |> put_resp_header("connection", "keep-alive")
+      |> send_chunked(200)
+
+    # Send catchup events for any states already passed before client connected
+    status = IdempotentStore.get_status(job.id)
+    conn = send_catchup_events(conn, job.id, status)
+
+    listen_loop(conn, job)
   end
 
   # Send synthetic events for states the client missed by connecting late

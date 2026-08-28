@@ -6,6 +6,8 @@ defmodule EzthrottleLocalWeb.JobController do
   alias EzthrottleLocal.Metrics
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.Admission
+  alias EzthrottleLocal.Proxy
+  alias EzthrottleLocalWeb.JobStreamController
 
   def create(conn, params) do
     case Job.new(params) do
@@ -53,6 +55,64 @@ defmodule EzthrottleLocalWeb.JobController do
                 })
             end
         end
+    end
+  end
+
+  @doc """
+  Proxy mode: try the upstream directly and synchronously first; fall back
+  to the same durable-queue-and-SSE path create/2 + stream/2 always use,
+  on this same connection, only on failure/overload/an already-open
+  circuit breaker. See EzthrottleLocal.Proxy for the actual decision
+  logic -- this action is HTTP glue only.
+  """
+  def proxy(conn, params) do
+    case Proxy.attempt_direct(params) do
+      {:error, reason} ->
+        conn
+        |> put_status(:bad_request)
+        |> json(%{error: reason})
+
+      {:admission_rejected, reason, limit, current} ->
+        retry_after = Admission.retry_after_seconds()
+
+        conn
+        |> put_resp_header("retry-after", to_string(retry_after))
+        |> put_status(429)
+        |> json(%{
+          error: "admission rejected: #{reason} at #{current} exceeds limit #{limit}",
+          limit_reason: reason,
+          limit: limit,
+          current: current
+        })
+
+      {:duplicate, existing_job} ->
+        stream_or_status_for_duplicate(conn, existing_job)
+
+      {:direct, _job, response} ->
+        conn = Enum.reduce(response.headers, conn, fn {k, v}, c -> put_resp_header(c, k, v) end)
+        send_resp(conn, response.status, response.body)
+
+      {:fallback, job} ->
+        AccountQueueRegistry.enqueue(job, account_queue_header(conn))
+        JobStreamController.stream_events(conn, job)
+    end
+  end
+
+  # A duplicate of an already-terminal job has no cached response body to
+  # replay (Job never persists it past the transient SSE/webhook payload)
+  # -- opening a stream for it would just keepalive forever, since its
+  # completed/failed event already fired before this request ever
+  # subscribed. Return its current status synchronously instead; only a
+  # still-in-flight duplicate gets a real stream. existing_job's own
+  # :status field is frozen at construction time (always :queued) --
+  # IdempotentStore.get_status/1 is the actual current status.
+  defp stream_or_status_for_duplicate(conn, job) do
+    case IdempotentStore.get_status(job.id) do
+      status when status in ["completed", "failed"] ->
+        json(conn, %{job_id: job.id, status: status, duplicate: true})
+
+      _ ->
+        JobStreamController.stream_events(conn, job)
     end
   end
 

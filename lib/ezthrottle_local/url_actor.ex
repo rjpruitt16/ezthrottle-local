@@ -38,7 +38,8 @@ defmodule EzthrottleLocal.UrlActor do
     rps: 2.0,
     max_concurrent: 1,
     account_queue_enabled: false,
-    queues: %{}
+    queues: %{},
+    breaker_until_ms: nil
   ]
 
   # ---- Public API ----
@@ -68,6 +69,28 @@ defmodule EzthrottleLocal.UrlActor do
 
   def disable_account_queue(pid) do
     GenServer.cast(pid, :disable_account_queue)
+  end
+
+  @doc """
+  Reports whether proxy mode should skip a direct dispatch attempt to this
+  domain entirely and fall straight back to the durable queue -- set by
+  trip_breaker/2 after an overload signal, cleared automatically once the
+  cooldown elapses. Mirrors Aquifer's URLWorker.BreakerOpen.
+  """
+  def breaker_open?(pid) do
+    GenServer.call(pid, :breaker_open?)
+  end
+
+  @doc """
+  Opens the breaker for cooldown_ms. No separate half-open state is
+  needed: once the cooldown elapses, breaker_open?/1 naturally returns
+  false again, so the next request is itself a real probe against the
+  live upstream -- success leaves the breaker closed, a repeat overload
+  signal re-trips it via another trip_breaker/2 call. Mirrors Aquifer's
+  URLWorker.TripBreaker.
+  """
+  def trip_breaker(pid, cooldown_ms) do
+    GenServer.cast(pid, {:trip_breaker, cooldown_ms})
   end
 
   # ---- GenServer Callbacks ----
@@ -115,6 +138,17 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   @impl true
+  def handle_call(:breaker_open?, _from, state) do
+    open? =
+      case state.breaker_until_ms do
+        nil -> false
+        until_ms -> System.monotonic_time(:millisecond) < until_ms
+      end
+
+    {:reply, open?, state, @idle_timeout_ms}
+  end
+
+  @impl true
   def handle_cast({:update_rps, rps}, state) do
     Enum.each(state.queues, fn {_key, pid} ->
       AccountQueue.update_rps(pid, rps)
@@ -140,6 +174,12 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_cast(:disable_account_queue, state) do
     {:noreply, %{state | account_queue_enabled: false}, @idle_timeout_ms}
+  end
+
+  @impl true
+  def handle_cast({:trip_breaker, cooldown_ms}, state) do
+    until_ms = System.monotonic_time(:millisecond) + cooldown_ms
+    {:noreply, %{state | breaker_until_ms: until_ms}, @idle_timeout_ms}
   end
 
   @impl true

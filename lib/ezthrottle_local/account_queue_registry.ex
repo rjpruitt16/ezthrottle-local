@@ -89,6 +89,26 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     end
   end
 
+  @doc """
+  Resolves (spawning if necessary) the UrlActor pid that would handle this
+  job's dispatch, without enqueueing anything onto it. Used by proxy
+  mode's circuit breaker (EzthrottleLocal.Proxy) to check/trip breaker
+  state before a job is ever actually queued.
+  """
+  def actor_for(%Job{} = job) do
+    GenServer.call(__MODULE__, {:actor_for, job})
+  end
+
+  @doc "See UrlActor.breaker_open?/1 -- resolves the actor for this job first."
+  def breaker_open?(%Job{} = job) do
+    UrlActor.breaker_open?(actor_for(job))
+  end
+
+  @doc "See UrlActor.trip_breaker/2 -- resolves the actor for this job first."
+  def trip_breaker(%Job{} = job, cooldown_ms) do
+    UrlActor.trip_breaker(actor_for(job), cooldown_ms)
+  end
+
   # ---- GenServer Callbacks ----
 
   @impl true
@@ -112,21 +132,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   @impl true
   def handle_call({:enqueue, job, account_queue_header}, _from, state) do
-    {route_key, pool_pid} = route_key_and_pool(job)
-
-    pid =
-      case :ets.lookup(state.table, route_key) do
-        [{^route_key, existing_pid}] ->
-          existing_pid
-
-        [] ->
-          {:ok, new_pid} =
-            UrlActor.start_link(url_key: route_key, domain: route_key, pool_pid: pool_pid)
-
-          Process.monitor(new_pid)
-          :ets.insert(state.table, {route_key, new_pid})
-          new_pid
-      end
+    pid = resolve_actor(state, job)
 
     if account_queue_header do
       mode = account_queue_header |> to_string() |> String.trim() |> String.downcase()
@@ -140,6 +146,11 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
     UrlActor.enqueue(pid, job)
     {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:actor_for, job}, _from, state) do
+    {:reply, resolve_actor(state, job), state}
   end
 
   @impl true
@@ -190,6 +201,27 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   defp schedule_idle_check do
     Process.send_after(self(), :idle_check, @idle_check_interval_ms)
+  end
+
+  # Resolves (spawning if necessary) the UrlActor pid for a job's routing
+  # key -- the exact lookup-or-spawn logic {:enqueue, ...} always did
+  # inline, now shared with {:actor_for, ...} so proxy mode's breaker check
+  # can resolve the same actor without enqueueing anything onto it.
+  defp resolve_actor(state, job) do
+    {route_key, pool_pid} = route_key_and_pool(job)
+
+    case :ets.lookup(state.table, route_key) do
+      [{^route_key, existing_pid}] ->
+        existing_pid
+
+      [] ->
+        {:ok, new_pid} =
+          UrlActor.start_link(url_key: route_key, domain: route_key, pool_pid: pool_pid)
+
+        Process.monitor(new_pid)
+        :ets.insert(state.table, {route_key, new_pid})
+        new_pid
+    end
   end
 
   # Matches Aquifer's domainKey (url_worker.go) exactly, including the

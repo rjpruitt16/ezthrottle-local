@@ -373,7 +373,7 @@ defmodule EzthrottleLocal.AccountQueue do
          member_id,
          attempt
        ) do
-    case make_request(job, dispatch_url, flow_rate, max_concurrent, queue_key) do
+    case make_request(job, dispatch_url, flow_rate, max_concurrent, queue_key, :infinity) do
       {:ok, %{status: status} = response} when status >= 500 ->
         if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
 
@@ -479,7 +479,16 @@ defmodule EzthrottleLocal.AccountQueue do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
   end
 
-  defp make_request(%Job{} = job, dispatch_url, flow_rate, max_concurrent, queue_key) do
+  @doc """
+  Performs the actual synchronous HTTP dispatch to an upstream -- shared by
+  the paced retry loop above (dispatch_with_retries/8, timeout: :infinity,
+  its historical behavior) and EzthrottleLocal.Proxy's direct-attempt fast
+  path (a short, caller-supplied timeout_ms, since the whole point there
+  is failing fast rather than tying up the caller's connection). Exported
+  (not defp) so Proxy can call it directly without duplicating the
+  header-building/L8/ORCA logic below.
+  """
+  def make_request(%Job{} = job, dispatch_url, flow_rate, max_concurrent, queue_key, timeout \\ :infinity) do
     %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()
     url = String.to_charlist(dispatch_url)
     account_queue_enabled = queue_key != :shared
@@ -528,7 +537,7 @@ defmodule EzthrottleLocal.AccountQueue do
         {url, headers}
       end
 
-    case :httpc.request(method, request, [], []) do
+    case :httpc.request(method, request, [{:timeout, timeout}], []) do
       {:ok, {{_, status, _}, resp_headers, resp_body}} ->
         {:ok,
          %{
