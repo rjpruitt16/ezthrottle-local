@@ -32,8 +32,14 @@ defmodule EzthrottleLocal.Proxy do
       own :status field is frozen at construction time (see Job)
     * `{:direct, job, response}` -- completed synchronously, response is
       `%{status:, body:, headers:}` for the caller to relay verbatim
-    * `{:fallback, job}` -- persisted but not dispatched; caller should
-      AccountQueueRegistry.enqueue/2 it and stream the result normally
+    * `{:fallback, job, reason}` -- persisted but not dispatched; caller
+      should AccountQueueRegistry.enqueue/2 it and stream the result
+      normally. reason is `%{reason: string, status: integer | nil}` --
+      status is only set when a real upstream response was actually
+      received (an overload signal), nil for a skipped or timed-out
+      attempt -- surfaced to the caller as a proxy_fallback SSE event
+      before the normal queued/dispatching/terminal sequence, mirrors
+      Aquifer's ProxyOutcome.FallbackReason/FallbackStatus.
   """
   def attempt_direct(params) do
     case Job.new(params) do
@@ -65,19 +71,19 @@ defmodule EzthrottleLocal.Proxy do
   # straight back to queue+stream, same as any job the caller couldn't
   # attempt directly.
   defp attempt_dispatch_or_fallback(%Job{pool_id: pool_id} = job) when is_binary(pool_id) do
-    {:fallback, job}
+    {:fallback, job, %{reason: "pool_routed", status: nil}}
   end
 
   defp attempt_dispatch_or_fallback(%Job{} = job) do
     if AccountQueueRegistry.breaker_open?(job) or AccountQueueRegistry.queue_active?(job) do
-      {:fallback, job}
+      {:fallback, job, %{reason: "domain_degraded", status: nil}}
     else
       case AccountQueue.make_request(job, job.url, 0, 0, :direct, direct_attempt_timeout_ms()) do
         {:ok, response} ->
           handle_direct_response(job, response)
 
         {:error, _reason} ->
-          {:fallback, job}
+          {:fallback, job, %{reason: "upstream_unreachable", status: nil}}
       end
     end
   end
@@ -85,7 +91,7 @@ defmodule EzthrottleLocal.Proxy do
   defp handle_direct_response(job, response) do
     if overload?(response) do
       AccountQueueRegistry.trip_breaker(job, breaker_cooldown(response.headers))
-      {:fallback, job}
+      {:fallback, job, %{reason: "upstream_overloaded", status: response.status}}
     else
       # The upstream can proactively ask to be routed through the durable
       # queue going forward -- X-Aqueduct-Queue-Active: true -- even on an

@@ -21,8 +21,16 @@ defmodule EzthrottleLocalWeb.JobStreamController do
   connection -- stream/2's actual behavior, extracted so proxy mode's
   fallback path (JobController.proxy/2) can reuse it verbatim
   ("automatically start streaming") instead of reimplementing it.
+
+  proxy_fallback is nil for a plain GET /jobs/:id/stream -- this job never
+  had a direct attempt to explain. When set (proxy mode's fallback path
+  only, `%{reason: string, status: integer | nil}`), one extra event is
+  written first: a client watching the stream (a browser, an agent with no
+  server of its own to learn this any other way) sees explicitly why it's
+  in the queue instead of just "queued" with no context. Mirrors Aquifer's
+  streamEvents/ProxyFallbackInfo.
   """
-  def stream_events(conn, job) do
+  def stream_events(conn, job, proxy_fallback \\ nil) do
     IdempotentStore.set_delivery_mode(job.id, :stream)
     Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, "job:#{job.id}")
 
@@ -32,6 +40,18 @@ defmodule EzthrottleLocalWeb.JobStreamController do
       |> put_resp_header("cache-control", "no-cache")
       |> put_resp_header("connection", "keep-alive")
       |> send_chunked(200)
+
+    conn =
+      case proxy_fallback do
+        nil ->
+          conn
+
+        %{reason: reason, status: status} ->
+          data = %{job_id: job.id, reason: reason}
+          data = if status, do: Map.put(data, :upstream_status, status), else: data
+          {:ok, conn} = chunk(conn, sse_event("proxy_fallback", data))
+          conn
+      end
 
     # Send catchup events for any states already passed before client connected
     status = IdempotentStore.get_status(job.id)

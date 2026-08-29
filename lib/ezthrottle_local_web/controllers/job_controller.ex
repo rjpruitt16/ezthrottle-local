@@ -92,9 +92,9 @@ defmodule EzthrottleLocalWeb.JobController do
         conn = Enum.reduce(response.headers, conn, fn {k, v}, c -> put_resp_header(c, k, v) end)
         send_resp(conn, response.status, response.body)
 
-      {:fallback, job} ->
+      {:fallback, job, reason} ->
         AccountQueueRegistry.enqueue(job, account_queue_header(conn))
-        JobStreamController.stream_events(conn, job)
+        JobStreamController.stream_events(conn, job, reason)
     end
   end
 

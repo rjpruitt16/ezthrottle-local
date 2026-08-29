@@ -185,7 +185,9 @@ defmodule EzthrottleLocal.ProxyTest do
     url = start_server(ErrorPlug, status: 500)
     key = "direct-500-#{System.unique_integer([:positive])}"
 
-    assert {:fallback, job} = Proxy.attempt_direct(job_params("user-1", key, url))
+    assert {:fallback, job, %{reason: "upstream_overloaded", status: 500}} =
+             Proxy.attempt_direct(job_params("user-1", key, url))
+
     assert IdempotentStore.get_status(job.id) == "queued"
   end
 
@@ -194,14 +196,17 @@ defmodule EzthrottleLocal.ProxyTest do
     url = start_server(SlowPlug)
     key = "direct-timeout-#{System.unique_integer([:positive])}"
 
-    assert {:fallback, _job} = Proxy.attempt_direct(job_params("user-1", key, url))
+    assert {:fallback, _job, %{reason: "upstream_unreachable", status: nil}} =
+             Proxy.attempt_direct(job_params("user-1", key, url))
   end
 
   test "429 trips the circuit breaker for that domain" do
     url = start_server(ErrorPlug, status: 429, headers: [{"retry-after", "1"}])
     key = "direct-429-#{System.unique_integer([:positive])}"
 
-    assert {:fallback, job} = Proxy.attempt_direct(job_params("user-1", key, url))
+    assert {:fallback, job, %{reason: "upstream_overloaded", status: 429}} =
+             Proxy.attempt_direct(job_params("user-1", key, url))
+
     assert AccountQueueRegistry.breaker_open?(job)
   end
 
@@ -210,13 +215,17 @@ defmodule EzthrottleLocal.ProxyTest do
     key1 = "breaker-1-#{System.unique_integer([:positive])}"
     key2 = "breaker-2-#{System.unique_integer([:positive])}"
 
-    assert {:fallback, _} = Proxy.attempt_direct(job_params("user-1", key1, url))
+    assert {:fallback, _, %{reason: "upstream_overloaded", status: 429}} =
+             Proxy.attempt_direct(job_params("user-1", key1, url))
+
     assert_receive :hit, 1_000
 
     # Second request to the SAME domain (different idempotent key, so it
     # isn't deduped) should skip the direct attempt entirely -- the
     # breaker tripped for 60s x the default multiplier.
-    assert {:fallback, _} = Proxy.attempt_direct(job_params("user-1", key2, url))
+    assert {:fallback, _, %{reason: "domain_degraded", status: nil}} =
+             Proxy.attempt_direct(job_params("user-1", key2, url))
+
     refute_receive :hit, 300
   end
 
@@ -249,7 +258,9 @@ defmodule EzthrottleLocal.ProxyTest do
     key_a = "backlog-a-#{System.unique_integer([:positive])}"
     key_b = "backlog-b-#{System.unique_integer([:positive])}"
 
-    assert {:fallback, job} = Proxy.attempt_direct(job_params("user-1", key_a, url))
+    assert {:fallback, job, %{reason: "upstream_overloaded", status: 429}} =
+             Proxy.attempt_direct(job_params("user-1", key_a, url))
+
     # Simulate what the real controller does on fallback (job_controller.ex
     # proxy/2): actually enqueue the job, so the domain's queue has real
     # backlog, not just a persisted-but-untouched job record.
@@ -273,7 +284,9 @@ defmodule EzthrottleLocal.ProxyTest do
     # fallback) -- a third request should still fall back, not attempt
     # direct, since the cooldown expiring doesn't mean the backlog it
     # caused has actually finished.
-    assert {:fallback, _} = Proxy.attempt_direct(job_params("user-1", key_b, url))
+    assert {:fallback, _, %{reason: "domain_degraded", status: nil}} =
+             Proxy.attempt_direct(job_params("user-1", key_b, url))
+
     assert Agent.get(counter, & &1) == 2
 
     send(blocked_pid, :release)
