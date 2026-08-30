@@ -16,7 +16,7 @@ defmodule EzthrottleLocal.AccountQueue do
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.Pool
 
-  @idle_timeout_ms 300_000
+  @default_idle_timeout_ms 300_000
   @min_rps 0.5
   @position_broadcast_ms 2_000
   @max_retries 4
@@ -108,7 +108,7 @@ defmodule EzthrottleLocal.AccountQueue do
     # handle_info(:broadcast_positions, ...) below for the other half of
     # the fix). Confirmed via aqueduct-runner: this is why drain mode could
     # never flush.
-    {:ok, state, @idle_timeout_ms}
+    {:ok, state, idle_timeout_ms()}
   end
 
   @impl true
@@ -122,29 +122,29 @@ defmodule EzthrottleLocal.AccountQueue do
     # transition from genuinely idle to having real work again.
     if was_empty, do: schedule_position_broadcast()
     send(self(), :process_next)
-    {:noreply, new_state, @idle_timeout_ms}
+    {:noreply, new_state, idle_timeout_ms()}
   end
 
   @impl true
   def handle_cast({:update_rps, rps}, state) do
     safe_rps = max(rps, @min_rps)
     Metrics.flow_rate(state.upstream, safe_rps)
-    {:noreply, %{state | rps: safe_rps}, @idle_timeout_ms}
+    {:noreply, %{state | rps: safe_rps}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_cast({:update_max_concurrent, max}, state) do
-    {:noreply, %{state | max_concurrent: max}, @idle_timeout_ms}
+    {:noreply, %{state | max_concurrent: max}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_info(:process_next, state) do
     cond do
       state.in_flight >= state.max_concurrent ->
-        {:noreply, state, @idle_timeout_ms}
+        {:noreply, state, idle_timeout_ms()}
 
       :queue.is_empty(state.queue) ->
-        {:noreply, state, @idle_timeout_ms}
+        {:noreply, state, idle_timeout_ms()}
 
       true ->
         case resolve_target(state) do
@@ -155,7 +155,7 @@ defmodule EzthrottleLocal.AccountQueue do
             # later instead of turning temporary absence into terminal
             # failure.
             Process.send_after(self(), :process_next, no_pool_members_retry_ms())
-            {:noreply, state, @idle_timeout_ms}
+            {:noreply, state, idle_timeout_ms()}
 
           {:ok, job, dispatch_url, member, remaining_queue} ->
             # Enforce RPS with jitter to prevent synchronized bursts across queues
@@ -195,7 +195,7 @@ defmodule EzthrottleLocal.AccountQueue do
               )
             end)
 
-            {:noreply, new_state, @idle_timeout_ms}
+            {:noreply, new_state, idle_timeout_ms()}
         end
     end
   end
@@ -210,7 +210,7 @@ defmodule EzthrottleLocal.AccountQueue do
     new_state = apply_job_done(state, rps_header, max_concurrent_header, account_queue_header)
 
     send(self(), :process_next)
-    {:noreply, new_state, @idle_timeout_ms}
+    {:noreply, new_state, idle_timeout_ms()}
   end
 
   @impl true
@@ -240,7 +240,7 @@ defmodule EzthrottleLocal.AccountQueue do
       schedule_position_broadcast()
     end
 
-    {:noreply, state, @idle_timeout_ms}
+    {:noreply, state, idle_timeout_ms()}
   end
 
   @impl true
@@ -248,7 +248,7 @@ defmodule EzthrottleLocal.AccountQueue do
     if :queue.is_empty(state.queue) and state.in_flight == 0 do
       {:stop, :normal, state}
     else
-      {:noreply, state, @idle_timeout_ms}
+      {:noreply, state, idle_timeout_ms()}
     end
   end
 
@@ -261,7 +261,7 @@ defmodule EzthrottleLocal.AccountQueue do
     new_state = apply_job_done(state, rps_header, max_concurrent_header, account_queue_header)
 
     send(self(), :process_next)
-    {:reply, :ok, new_state, @idle_timeout_ms}
+    {:reply, :ok, new_state, idle_timeout_ms()}
   end
 
   @impl true
@@ -515,6 +515,28 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp schedule_position_broadcast do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
+  end
+
+  @doc """
+  How long this queue can sit genuinely idle before self-terminating --
+  300_000ms (5min) by default, overridable via EZTHROTTLE_IDLE_TIMEOUT_MS.
+  Exists mainly so contract tests (aqueduct-runner) don't have to burn 5+
+  real minutes per drain-mode run; production should leave this at the
+  default. Read live via System.get_env rather than Application config so
+  a container-level env var (set the same way EZTHROTTLE_DRAIN_TIMER_SECONDS
+  already is) takes effect with no code/config-file change.
+  """
+  def idle_timeout_ms, do: env_int("EZTHROTTLE_IDLE_TIMEOUT_MS", @default_idle_timeout_ms)
+
+  defp env_int(key, default) do
+    case System.get_env(key) do
+      nil -> default
+      "" -> default
+      val -> case Integer.parse(val) do
+        {n, _} -> n
+        :error -> default
+      end
+    end
   end
 
   @doc """

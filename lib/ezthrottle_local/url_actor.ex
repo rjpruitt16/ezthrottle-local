@@ -17,7 +17,7 @@ defmodule EzthrottleLocal.UrlActor do
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.Pool
 
-  @idle_timeout_ms 300_000
+  @default_idle_timeout_ms 300_000
   @shared_queue_key :shared
   @min_rps 0.5
 
@@ -131,7 +131,7 @@ defmodule EzthrottleLocal.UrlActor do
     # process's own 5-minute idle-timeout from ever elapsing, the same way
     # AccountQueue's schedule_position_broadcast/0 did one level down --
     # confirmed via aqueduct-runner as why drain mode could never flush.
-    {:ok, state, @idle_timeout_ms}
+    {:ok, state, idle_timeout_ms()}
   end
 
   @impl true
@@ -151,17 +151,17 @@ defmodule EzthrottleLocal.UrlActor do
     # itself -- a transition from genuinely idle to having real work again.
     if was_empty, do: schedule_budget_check()
 
-    {:reply, :ok, new_state, @idle_timeout_ms}
+    {:reply, :ok, new_state, idle_timeout_ms()}
   end
 
   @impl true
   def handle_call({:account_queue_header, "enabled"}, _from, state) do
-    {:reply, :ok, %{state | account_queue_enabled: true}, @idle_timeout_ms}
+    {:reply, :ok, %{state | account_queue_enabled: true}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_call({:account_queue_header, "disabled"}, _from, state) do
-    {:reply, :ok, %{state | account_queue_enabled: false}, @idle_timeout_ms}
+    {:reply, :ok, %{state | account_queue_enabled: false}, idle_timeout_ms()}
   end
 
   @impl true
@@ -172,13 +172,13 @@ defmodule EzthrottleLocal.UrlActor do
         until_ms -> System.monotonic_time(:millisecond) < until_ms
       end
 
-    {:reply, open?, state, @idle_timeout_ms}
+    {:reply, open?, state, idle_timeout_ms()}
   end
 
   @impl true
   def handle_call(:queue_active?, _from, state) do
     active? = state.queues |> Map.values() |> Enum.any?(&AccountQueue.active?/1)
-    {:reply, active?, state, @idle_timeout_ms}
+    {:reply, active?, state, idle_timeout_ms()}
   end
 
   @impl true
@@ -187,7 +187,7 @@ defmodule EzthrottleLocal.UrlActor do
       AccountQueue.update_rps(pid, rps)
     end)
 
-    {:noreply, %{state | rps: rps}, @idle_timeout_ms}
+    {:noreply, %{state | rps: rps}, idle_timeout_ms()}
   end
 
   @impl true
@@ -196,39 +196,39 @@ defmodule EzthrottleLocal.UrlActor do
       AccountQueue.update_max_concurrent(pid, max)
     end)
 
-    {:noreply, %{state | max_concurrent: max}, @idle_timeout_ms}
+    {:noreply, %{state | max_concurrent: max}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_cast(:enable_account_queue, state) do
-    {:noreply, %{state | account_queue_enabled: true}, @idle_timeout_ms}
+    {:noreply, %{state | account_queue_enabled: true}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_cast(:disable_account_queue, state) do
-    {:noreply, %{state | account_queue_enabled: false}, @idle_timeout_ms}
+    {:noreply, %{state | account_queue_enabled: false}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_cast({:trip_breaker, cooldown_ms}, state) do
     until_ms = System.monotonic_time(:millisecond) + cooldown_ms
-    {:noreply, %{state | breaker_until_ms: until_ms}, @idle_timeout_ms}
+    {:noreply, %{state | breaker_until_ms: until_ms}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_info({:account_queue_header, "enabled"}, state) do
-    {:noreply, %{state | account_queue_enabled: true}, @idle_timeout_ms}
+    {:noreply, %{state | account_queue_enabled: true}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_info({:account_queue_header, "disabled"}, state) do
-    {:noreply, %{state | account_queue_enabled: false}, @idle_timeout_ms}
+    {:noreply, %{state | account_queue_enabled: false}, idle_timeout_ms()}
   end
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     queues = Enum.reject(state.queues, fn {_key, p} -> p == pid end) |> Map.new()
-    {:noreply, %{state | queues: queues}, @idle_timeout_ms}
+    {:noreply, %{state | queues: queues}, idle_timeout_ms()}
   end
 
   @impl true
@@ -236,7 +236,7 @@ defmodule EzthrottleLocal.UrlActor do
     if map_size(state.queues) == 0 do
       {:stop, :normal, state}
     else
-      {:noreply, state, @idle_timeout_ms}
+      {:noreply, state, idle_timeout_ms()}
     end
   end
 
@@ -272,7 +272,7 @@ defmodule EzthrottleLocal.UrlActor do
     if map_size(state.queues) > 0 do
       schedule_budget_check()
     end
-    {:noreply, state, @idle_timeout_ms}
+    {:noreply, state, idle_timeout_ms()}
   end
 
   # ---- Private ----
@@ -301,6 +301,24 @@ defmodule EzthrottleLocal.UrlActor do
 
   defp schedule_budget_check do
     Process.send_after(self(), :check_aggregate_budget, @budget_check_ms)
+  end
+
+  # How long this actor can sit genuinely idle before self-terminating --
+  # same env var and default as AccountQueue.idle_timeout_ms/0 (one shared
+  # knob for both levels of the same concept), overridable via
+  # EZTHROTTLE_IDLE_TIMEOUT_MS so contract tests don't have to burn 5+ real
+  # minutes per level per drain-mode run.
+  defp idle_timeout_ms, do: env_int("EZTHROTTLE_IDLE_TIMEOUT_MS", @default_idle_timeout_ms)
+
+  defp env_int(key, default) do
+    case System.get_env(key) do
+      nil -> default
+      "" -> default
+      val -> case Integer.parse(val) do
+        {n, _} -> n
+        :error -> default
+      end
+    end
   end
 
   # Live pool capacity if pool-backed, otherwise the statically
