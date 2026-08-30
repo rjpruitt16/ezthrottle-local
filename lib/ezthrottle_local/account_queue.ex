@@ -97,15 +97,30 @@ defmodule EzthrottleLocal.AccountQueue do
       pool_pid: pool_pid
     }
 
-    schedule_position_broadcast()
+    # No schedule_position_broadcast/0 here -- a fresh queue is always
+    # immediately enqueued into (find_or_spawn_queue's one caller does both
+    # in the same handler), and handle_cast({:enqueue, ...}) below is what
+    # actually starts the broadcast loop. Starting it here unconditionally
+    # was the root cause of a real bug: the loop had no matching "stop
+    # rescheduling once idle" check, so it ran forever regardless of
+    # whether the queue ever had anything in it, which permanently blocked
+    # this process's own idle-timeout from ever elapsing (see
+    # handle_info(:broadcast_positions, ...) below for the other half of
+    # the fix). Confirmed via aqueduct-runner: this is why drain mode could
+    # never flush.
     {:ok, state, @idle_timeout_ms}
   end
 
   @impl true
   def handle_cast({:enqueue, job}, state) do
+    was_empty = :queue.is_empty(state.queue)
     new_queue = :queue.in(job, state.queue)
     new_state = %{state | queue: new_queue}
     Metrics.queue_depth(state.upstream, :queue.len(new_queue))
+    # Restart the position-broadcast loop exactly when it would have
+    # stopped itself (see handle_info(:broadcast_positions, ...)) -- a
+    # transition from genuinely idle to having real work again.
+    if was_empty, do: schedule_position_broadcast()
     send(self(), :process_next)
     {:noreply, new_state, @idle_timeout_ms}
   end
@@ -216,7 +231,15 @@ defmodule EzthrottleLocal.AccountQueue do
       )
     end)
 
-    schedule_position_broadcast()
+    # Only keep rescheduling while there's still something to report --
+    # otherwise this loop never stops, and every 2s message it sends itself
+    # resets the GenServer receive-timeout that :timeout below needs a real
+    # 5-minute gap in to ever fire. handle_cast({:enqueue, ...}) is what
+    # restarts this once the queue has real work again.
+    if not :queue.is_empty(state.queue) do
+      schedule_position_broadcast()
+    end
+
     {:noreply, state, @idle_timeout_ms}
   end
 

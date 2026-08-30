@@ -123,12 +123,21 @@ defmodule EzthrottleLocal.UrlActor do
       account_queue_enabled: account_queue_enabled
     }
 
-    schedule_budget_check()
+    # No schedule_budget_check/0 here -- see handle_call({:enqueue, ...})
+    # below, which is what actually starts it, and
+    # handle_info(:check_aggregate_budget, ...) for the matching "stop
+    # rescheduling once idle" half of the fix. Starting this unconditionally
+    # at init, forever, was a real bug: it permanently blocked this
+    # process's own 5-minute idle-timeout from ever elapsing, the same way
+    # AccountQueue's schedule_position_broadcast/0 did one level down --
+    # confirmed via aqueduct-runner as why drain mode could never flush.
     {:ok, state, @idle_timeout_ms}
   end
 
   @impl true
   def handle_call({:enqueue, job}, _from, state) do
+    was_empty = map_size(state.queues) == 0
+
     queue_key =
       if state.account_queue_enabled do
         Job.queue_key(job)
@@ -138,6 +147,9 @@ defmodule EzthrottleLocal.UrlActor do
 
     {queue_pid, new_state} = find_or_spawn_queue(queue_key, state)
     AccountQueue.enqueue(queue_pid, job)
+    # Restart the aggregate-budget check exactly when it would have stopped
+    # itself -- a transition from genuinely idle to having real work again.
+    if was_empty, do: schedule_budget_check()
 
     {:reply, :ok, new_state, @idle_timeout_ms}
   end
@@ -252,7 +264,14 @@ defmodule EzthrottleLocal.UrlActor do
       end
     end
 
-    schedule_budget_check()
+    # Only keep rescheduling while there's still at least one queue --
+    # otherwise this loop never stops, and every 3s message it sends itself
+    # resets the GenServer receive-timeout that :timeout needs a real
+    # 5-minute gap in to ever fire. handle_call({:enqueue, ...}) is what
+    # restarts this once a queue exists again.
+    if map_size(state.queues) > 0 do
+      schedule_budget_check()
+    end
     {:noreply, state, @idle_timeout_ms}
   end
 
