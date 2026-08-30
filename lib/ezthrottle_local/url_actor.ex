@@ -228,7 +228,17 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     queues = Enum.reject(state.queues, fn {_key, p} -> p == pid end) |> Map.new()
-    {:noreply, %{state | queues: queues}, idle_timeout_ms()}
+    new_state = %{state | queues: queues}
+
+    # A child AccountQueue dying is exactly the signal that this actor
+    # might now be empty -- check right here and self-terminate
+    # immediately rather than waiting out a separate idle timeout of our
+    # own just to reconfirm the same fact later.
+    if map_size(queues) == 0 do
+      {:stop, :normal, new_state}
+    else
+      {:noreply, new_state, idle_timeout_ms()}
+    end
   end
 
   @impl true

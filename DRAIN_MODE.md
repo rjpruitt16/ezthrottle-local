@@ -34,9 +34,9 @@ guarantee that never happens, enforce it on your own end before routing traffic 
 | Var | Default | Notes |
 |---|---|---|
 | `EZTHROTTLE_DRAIN_ENABLED` | `false` | The real gate — the other two vars are only read when this is `true`. |
-| `EZTHROTTLE_DRAIN_TIMER_SECONDS` | `45` | How long the whole node must be idle before flushing. Deliberately separate from the per-tenant-queue self-teardown timer below (`@idle_timeout_ms`) — but drain mode's own countdown only starts once every AccountQueue *and* UrlActor has already self-torn-down via that timer (two nested waits, one per level), so a real drain flush is gated by both. |
+| `EZTHROTTLE_DRAIN_TIMER_SECONDS` | `45` | How long the whole node must be idle before flushing. Deliberately separate from the per-tenant-queue self-teardown timer below (`@idle_timeout_ms`) — but drain mode's own countdown only starts once every AccountQueue and UrlActor has already self-torn-down via that timer, so a real drain flush is gated by both. |
 | `EZTHROTTLE_DRAIN_WEBHOOK_URL` | *(none)* | Required if enabled — if unset, drain mode logs a warning and stays off rather than flushing with nowhere to send it. |
-| `EZTHROTTLE_IDLE_TIMEOUT_MS` | `300000` (5min) | The per-tenant-queue self-teardown timer itself (`@idle_timeout_ms`) — controls both AccountQueue's and UrlActor's idle-teardown, one shared knob. Exists mainly so contract tests don't have to burn 10+ real minutes to prove a real drain flush (two nested 5min waits) — leave this at the default in production. |
+| `EZTHROTTLE_IDLE_TIMEOUT_MS` | `300000` (5min) | The per-tenant-queue self-teardown timer itself (`@idle_timeout_ms`) — AccountQueue uses it directly; UrlActor tears itself down immediately once its last AccountQueue is gone, so this is the one real wait that gates a drain flush. Exists mainly so contract tests don't have to burn real minutes to prove one — leave this at the default in production. |
 
 **Webhook payload:**
 
