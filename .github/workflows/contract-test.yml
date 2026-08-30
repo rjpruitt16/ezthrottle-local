@@ -6,16 +6,15 @@ name: Contract tests (Aqueduct Runner)
 # that ezthrottle-local's own tests pass. See
 # github.com/rjpruitt16/aqueduct-runner.
 #
-# No drain-mode job here (unlike aquifer's equivalent workflow):
-# ezthrottle-local's drain mode has a confirmed, currently-unfixed bug
-# (two always-on heartbeats in account_queue.ex and url_actor.ex each
-# prevent their own GenServer idle-timeout from ever firing, so it can
-# never flush) -- see aqueduct-runner's README "Known caveat" section and
-# hurl/shared/test_drain_ledger_ezthrottle.hurl for the full citation.
-# Running it here would just be permanent, known-red CI. Re-add a drain
-# job (mirroring aquifer's contract-test-drain) once that's fixed
-# upstream, and re-run `make contract-test-ezthrottle-drain` in
-# aqueduct-runner to confirm before wiring it back in.
+# contract-test-drain mirrors aquifer's equivalent job -- both run in
+# parallel with the fast checks above so a slow drain-mode regression
+# doesn't hold up fast feedback. Confirmed passing end-to-end at ~10m10s
+# (roughly double aquifer's ~5m10s, a genuine two-level nested idle wait
+# aquifer doesn't have -- see aqueduct-runner's README "Known caveat"
+# section). This used to be permanently excluded here: drain mode had a
+# real bug (two always-on heartbeats blocking their own idle-timeout from
+# ever firing) found via aqueduct-runner's contract tests and fixed in
+# commit a65e516.
 
 on:
   push:
@@ -55,6 +54,36 @@ jobs:
           module: ./aqueduct-runner
           call: >-
             test-ezthrottle-admission
+            --source=./ezthrottle-local
+            --hurl-dir=./aqueduct-runner/hurl
+            --recorder-dir=./aqueduct-runner/recorder
+
+  # Separate job so a slow drain-mode regression doesn't hold up the fast
+  # checks above -- both start immediately, no `needs:` dependency.
+  contract-test-drain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ezthrottle-local
+        uses: actions/checkout@v4
+        with:
+          path: ezthrottle-local
+
+      - name: Checkout aqueduct-runner
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/aqueduct-runner
+          path: aqueduct-runner
+
+      # Genuinely takes ~10 minutes -- roughly double aquifer's ~5, a
+      # genuine two-level nested idle wait aquifer doesn't have. See
+      # aqueduct-runner's README "Known caveat" section.
+      - name: Contract test -- drain-mode ledger (~10 min)
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-ezthrottle-drain
             --source=./ezthrottle-local
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder
