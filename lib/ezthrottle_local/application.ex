@@ -38,13 +38,13 @@ defmodule EzthrottleLocal.Application do
     end
   end
 
-  # Cross-region /proxy redirect (EzthrottleLocal.Redirect) -- both the
-  # region poller and the redirect gate stay entirely out of the
-  # supervision tree unless EZTHROTTLE_FLY_REGIONS is actually set,
-  # mirroring Aquifer's NewFlyRegionAdapter returning nil so the feature is
-  # off unless explicitly configured. Also flips the RegionAdapter
-  # dispatcher (EzthrottleLocal.RegionAdapter) over to the real
-  # implementation, the same way :metrics_adapter is wired.
+  # Cross-region /proxy redirect (EzthrottleLocal.Redirect) -- the region
+  # poller, the redirect gate, and the IPv6 listener below all stay
+  # entirely out of the supervision tree unless EZTHROTTLE_FLY_REGIONS is
+  # actually set, mirroring Aquifer's NewFlyRegionAdapter returning nil so
+  # the feature is off unless explicitly configured. Also flips the
+  # RegionAdapter dispatcher (EzthrottleLocal.RegionAdapter) over to the
+  # real implementation, the same way :metrics_adapter is wired.
   defp region_redirect_children do
     case EzthrottleLocal.RegionAdapter.Fly.configured_regions() do
       [] ->
@@ -52,8 +52,49 @@ defmodule EzthrottleLocal.Application do
 
       _regions ->
         Application.put_env(:ezthrottle_local, :region_adapter, EzthrottleLocal.RegionAdapter.Fly)
-        [EzthrottleLocal.RegionAdapter.Fly, EzthrottleLocal.Redirect.gate_child_spec()]
+
+        [
+          EzthrottleLocal.RegionAdapter.Fly,
+          EzthrottleLocal.Redirect.gate_child_spec(),
+          ipv6_listener_child_spec()
+        ]
     end
+  end
+
+  # The main EzthrottleLocalWeb.Endpoint listener binds IPv4-only
+  # (config/runtime.exs's ip: {0, 0, 0, 0}) -- deliberately, because Fly's
+  # own health-check/process scanning for the *public* [http_service] port
+  # explicitly looks for a raw IPv4 listener and flags the app unreachable
+  # otherwise (see that config's own comment). But Fly's private 6PN
+  # network -- what sibling-region health checks and redirect hops both
+  # arrive over -- is IPv6-only, so an IPv4-only bind means those
+  # connections get reset even though the app is otherwise perfectly
+  # healthy (confirmed this exact failure mode in aqueduct-runner's
+  # recorder while testing Aquifer's version of this feature: Flask's
+  # host="0.0.0.0" had the identical problem). Rather than touch the
+  # existing, deliberately-IPv4 public listener at all, run a second,
+  # independent Bandit listener bound IPv6-any on the same port, serving
+  # the exact same Endpoint plug -- private 6PN traffic (both /health and
+  # /proxy hops) gets a working path in, the public listener and its
+  # already-solved Fly-scanning behavior are completely untouched.
+  #
+  # ipv6_v6only: true is the critical piece -- confirmed by an actual local
+  # boot (not assumed): without it, this listener claims the IPv4 space too
+  # under this OS's dual-stack default, and the *existing* IPv4-only
+  # listener then fails to bind at all (:eaddrinuse), crashing the whole
+  # app. With it, the two listeners are genuinely independent sockets.
+  defp ipv6_listener_child_spec do
+    port = String.to_integer(System.get_env("PORT", "4000"))
+
+    Supervisor.child_spec(
+      {Bandit,
+       plug: EzthrottleLocalWeb.Endpoint,
+       scheme: :http,
+       ip: {0, 0, 0, 0, 0, 0, 0, 0},
+       port: port,
+       thousand_island_options: [transport_options: [ipv6_v6only: true]]},
+      id: EzthrottleLocalWeb.Endpoint.IPv6Listener
+    )
   end
 
   # Mnesia's :dir is read at :mnesia.start()/:mnesia.create_schema() time,
