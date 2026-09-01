@@ -7,6 +7,7 @@ defmodule EzthrottleLocalWeb.JobController do
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.Admission
   alias EzthrottleLocal.Proxy
+  alias EzthrottleLocal.Redirect
   alias EzthrottleLocalWeb.JobStreamController
 
   def create(conn, params) do
@@ -66,7 +67,7 @@ defmodule EzthrottleLocalWeb.JobController do
   logic -- this action is HTTP glue only.
   """
   def proxy(conn, params) do
-    case Proxy.attempt_direct(params) do
+    case Proxy.attempt_direct(params, account_queue_header(conn)) do
       {:error, reason} ->
         conn
         |> put_status(:bad_request)
@@ -95,6 +96,27 @@ defmodule EzthrottleLocalWeb.JobController do
       {:fallback, job, reason} ->
         AccountQueueRegistry.enqueue(job, account_queue_header(conn))
         JobStreamController.stream_events(conn, job, reason)
+
+      {:redirected, {:direct, status, headers, body, region}} ->
+        conn =
+          Enum.reduce(headers, conn, fn {k, v}, c -> put_resp_header(c, k, v) end)
+          |> put_resp_header("x-aquifer-served-by-region", region)
+
+        send_resp(conn, status, body)
+
+      {:redirected, {:relay, request_id, region}} ->
+        JobStreamController.relay_stream(conn, request_id, region)
+
+      {:redirect_exhausted, job_id} ->
+        retry_after = Redirect.exhausted_retry_after_seconds()
+
+        conn
+        |> put_resp_header("retry-after", to_string(retry_after))
+        |> put_status(429)
+        |> json(%{
+          error: "job #{job_id}: cross-region redirect exhausted, no known-live region could help",
+          limit_reason: "redirect_exhausted"
+        })
     end
   end
 

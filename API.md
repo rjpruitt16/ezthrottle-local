@@ -45,6 +45,20 @@ Content-Type: application/json
 { ... same shape as POST /jobs ... }
 ```
 
+### Cross-region redirect (Fly.io)
+
+If `EZTHROTTLE_FLY_REGIONS` is set, a `domain_degraded`/`upstream_unreachable`/`upstream_overloaded` fallback tries other regions this app is deployed to — live, over Fly's private network — before falling back to this instance's own local queue. Off by default; unset, `/proxy` behaves exactly as described above with zero change. Direct port of Aquifer's own cross-region redirect (see [Aquifer's API.md](https://github.com/rjpruitt16/aquifer/blob/main/API.md#post-proxy)), kept in sync feature-for-feature.
+
+When it triggers: every known-live region is tried for a fast direct success first, nearest (lowest measured round-trip time from the same health check that determines a region is live — Fly doesn't publish a region distance/latency table, so this doubles as the only real proximity signal available) first, except that two callers racing the same job always try one particular region first regardless of latency, so they tend to converge on the same region rather than each racing off after their own nearest option. If none can serve it directly, that same region is the one chosen to accept it into its own durable queue, and its live event stream is relayed back onto your original connection, so you see one continuous stream regardless of which region actually ends up handling the job.
+
+A reroute is never silent to the caller — same principle as `proxy_fallback` above: a client with no server of its own to explain this shouldn't have to wonder why its connection is still open or where the response actually came from.
+- **Direct success via redirect:** the response carries an `X-Aquifer-Served-By-Region` header naming which region actually served it, alongside the relayed status/headers/body.
+- **Queued on another region:** before relaying that region's own stream, origin fires `event: rerouted`, `data: {"region"}` — arriving *before* that region's own `proxy_fallback`/`queued`/`dispatching` sequence, the same ordering `proxy_fallback` itself already uses relative to `queued`.
+
+If literally no known-live region can help either — none live at all, or every one tried and failed — the request is **rejected**, not queued locally: **429**, `Retry-After` set to `EZTHROTTLE_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` (default 900 — a real regional outage, not a transient blip), `limit_reason: "redirect_exhausted"`, same response shape as an admission-control rejection. Queueing locally instead was never actually decided, so the default is to fail loudly rather than have the request land unnoticed on one struggling instance's queue. Separate from `EZTHROTTLE_REDIRECT_GATE_COOLDOWN_SECONDS` (default 500) — that one is purely internal probe-retry throttling, not what's told to the caller.
+
+**Honest limitation, not silently glossed over:** this instance's idempotency check remains per-instance (Mnesia), unchanged by this feature. If the exact same `idempotent_key` is independently submitted to two different regions at nearly the same moment (a real scenario — a caller's own client retrying after a timeout can land on a different region via Fly's anycast), each region may independently begin its own redirect tour, and in rare cases the job could end up durably queued in two places. The deterministic region selection above narrows this window but does not close it. During cross-region redirect specifically, treat delivery as at-least-once, not exactly-once.
+
 ## Stream job events (SSE)
 
 ```bash

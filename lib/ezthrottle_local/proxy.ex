@@ -16,6 +16,7 @@ defmodule EzthrottleLocal.Proxy do
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.AccountQueue
   alias EzthrottleLocal.Orca
+  alias EzthrottleLocal.Redirect
 
   @default_breaker_retry_multiplier 3
   @default_breaker_cooldown_seconds 5
@@ -40,8 +41,19 @@ defmodule EzthrottleLocal.Proxy do
       attempt -- surfaced to the caller as a proxy_fallback SSE event
       before the normal queued/dispatching/terminal sequence, mirrors
       Aquifer's ProxyOutcome.FallbackReason/FallbackStatus.
+    * `{:redirected, outcome}` -- cross-region redirect (EzthrottleLocal.Redirect)
+      found a sibling region that could help. `outcome` is
+      `{:direct, status, headers, body, region}` (relay verbatim, tag with
+      X-Aquifer-Served-By-Region) or `{:relay, request_id, region}` (target
+      accepted it into its own queue -- caller should relay that live
+      stream, announcing a "rerouted" event first).
+    * `{:redirect_exhausted, job_id}` -- cross-region redirect is
+      configured but no known-live region could help either. Caller must
+      hard-error (429 + Retry-After), never a silent local queue.
   """
-  def attempt_direct(params) do
+  def attempt_direct(params), do: attempt_direct(params, nil)
+
+  def attempt_direct(params, account_queue_header) do
     case Job.new(params) do
       {:error, reason} ->
         {:error, reason}
@@ -59,7 +71,7 @@ defmodule EzthrottleLocal.Proxy do
 
               :ok ->
                 Metrics.job_queued(job.user_id, Metrics.upstream(job.url))
-                attempt_dispatch_or_fallback(job)
+                attempt_dispatch_or_fallback(job, account_queue_header)
             end
         end
     end
@@ -69,29 +81,64 @@ defmodule EzthrottleLocal.Proxy do
   # pool routing's whole premise (spread across members, one might be
   # unhealthy) is in tension with "there's one upstream, try it". Fall
   # straight back to queue+stream, same as any job the caller couldn't
-  # attempt directly.
-  defp attempt_dispatch_or_fallback(%Job{pool_id: pool_id} = job) when is_binary(pool_id) do
+  # attempt directly. Also skips cross-region redirect consideration: a
+  # redirected target instance has no reason to share the same pool
+  # membership, so there's no single canonical destination to even try
+  # there either.
+  defp attempt_dispatch_or_fallback(%Job{pool_id: pool_id} = job, _account_queue_header)
+       when is_binary(pool_id) do
     {:fallback, job, %{reason: "pool_routed", status: nil}}
   end
 
-  defp attempt_dispatch_or_fallback(%Job{} = job) do
+  defp attempt_dispatch_or_fallback(%Job{} = job, account_queue_header) do
     if AccountQueueRegistry.breaker_open?(job) or AccountQueueRegistry.queue_active?(job) do
-      {:fallback, job, %{reason: "domain_degraded", status: nil}}
+      maybe_redirect_or_fallback(job, account_queue_header, "domain_degraded", nil)
     else
       case AccountQueue.make_request(job, job.url, 0, 0, :direct, direct_attempt_timeout_ms()) do
         {:ok, response} ->
-          handle_direct_response(job, response)
+          handle_direct_response(job, account_queue_header, response)
 
         {:error, _reason} ->
-          {:fallback, job, %{reason: "upstream_unreachable", status: nil}}
+          maybe_redirect_or_fallback(job, account_queue_header, "upstream_unreachable", nil)
       end
     end
   end
 
-  defp handle_direct_response(job, response) do
+  # Tries cross-region redirect first (EzthrottleLocal.Redirect) so a
+  # caller only ever falls back to its own local queue after a sibling
+  # region genuinely couldn't take the job either (or redirect isn't
+  # configured/available/gated at all, in which case attempt_redirect/2
+  # returns :not_applicable immediately with no side effects). Mirrors
+  # Aquifer's fallbackOutcome exactly, including the direct_only cleanup:
+  # direct_only is only ever true on an internal cross-region redirect hop
+  # (a real caller never sets it) -- when set, this instance has been
+  # explicitly told not to commit to its own local queue, so the job row
+  # check_or_insert already wrote gets deleted, mirroring the
+  # admission-rejection cleanup above. Without this, an origin's redirect
+  # tour trying several regions in sequence could leave the SAME job
+  # durably committed in more than one place.
+  defp maybe_redirect_or_fallback(job, account_queue_header, reason, status) do
+    case Redirect.attempt_redirect(job, account_queue_header) do
+      {:succeeded, outcome} ->
+        {:redirected, outcome}
+
+      :exhausted ->
+        IdempotentStore.delete_job(job)
+        {:redirect_exhausted, job.id}
+
+      :not_applicable ->
+        if job.direct_only do
+          IdempotentStore.delete_job(job)
+        end
+
+        {:fallback, job, %{reason: reason, status: status}}
+    end
+  end
+
+  defp handle_direct_response(job, account_queue_header, response) do
     if overload?(response) do
       AccountQueueRegistry.trip_breaker(job, breaker_cooldown(response.headers))
-      {:fallback, job, %{reason: "upstream_overloaded", status: response.status}}
+      maybe_redirect_or_fallback(job, account_queue_header, "upstream_overloaded", response.status)
     else
       # The upstream can proactively ask to be routed through the durable
       # queue going forward -- X-Aqueduct-Queue-Active: true -- even on an

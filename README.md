@@ -310,6 +310,19 @@ end
 
 The default adapter is `EzthrottleLocal.Metrics.Noop`, so existing deployments do not change.
 
+### Region adapter (cross-region /proxy redirect)
+
+Off by default. Set `EZTHROTTLE_FLY_REGIONS` (comma-separated Fly region codes this app is deployed to) to enable `/proxy`'s cross-region redirect on Fly — see [API.md's "Cross-region redirect" section](API.md#cross-region-redirect-flyio) for the full behavior. Direct port of Aquifer's `RegionAdapter`/`FlyRegionAdapter`.
+
+| Env var | Default | Description |
+|---|---|---|
+| `EZTHROTTLE_FLY_REGIONS` | _(none, feature off)_ | Comma-separated Fly region codes this app is deployed to |
+| `EZTHROTTLE_FLY_POLL_INTERVAL_SECONDS` | `30` | How often to poll sibling regions over Fly's private network for liveness |
+| `EZTHROTTLE_REDIRECT_GATE_COOLDOWN_SECONDS` | `500` | How long to stop attempting cross-region redirect after a tour finds no reachable region at all — internal probe throttling, not what's told to the caller |
+| `EZTHROTTLE_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` | `900` (15min) | `Retry-After` sent to the caller when cross-region redirect is configured but exhausted — request is rejected (429), not queued locally |
+
+Custom implementations plug in via `:region_adapter`, implementing the `EzthrottleLocal.RegionAdapter` behaviour (`live_regions/0`, `self_region/0`) — same pattern as the metrics adapter above.
+
 </details>
 
 ---

@@ -18,7 +18,12 @@ defmodule EzthrottleLocal.Job do
           body: String.t() | nil,
           webhook_url: String.t(),
           status: status(),
-          created_at: integer()
+          created_at: integer(),
+          origin_machine_id: String.t() | nil,
+          origin_region: String.t() | nil,
+          visited_regions: [String.t()],
+          reroute_count: integer(),
+          direct_only: boolean()
         }
 
   defstruct [
@@ -32,7 +37,12 @@ defmodule EzthrottleLocal.Job do
     :body,
     :webhook_url,
     status: :queued,
-    created_at: nil
+    created_at: nil,
+    origin_machine_id: nil,
+    origin_region: nil,
+    visited_regions: [],
+    reroute_count: 0,
+    direct_only: false
   ]
 
   @doc """
@@ -61,7 +71,12 @@ defmodule EzthrottleLocal.Job do
          body: Map.get(params, "body"),
          webhook_url: webhook_url,
          status: :queued,
-         created_at: System.system_time(:millisecond)
+         created_at: System.system_time(:millisecond),
+         origin_machine_id: blank_to_nil(Map.get(params, "origin_machine_id")),
+         origin_region: blank_to_nil(Map.get(params, "origin_region")),
+         visited_regions: Map.get(params, "visited_regions", []),
+         reroute_count: Map.get(params, "reroute_count", 0),
+         direct_only: Map.get(params, "direct_only", false)
        }}
     end
   end

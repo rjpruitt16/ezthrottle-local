@@ -12,17 +12,17 @@ defmodule EzthrottleLocal.Application do
     configure_mnesia_dir()
     EzthrottleLocal.IdempotentStore.ensure_schema!()
 
-    children = [
-      EzthrottleLocalWeb.Telemetry,
-      {DNSCluster, query: Application.get_env(:ezthrottle_local, :dns_cluster_query) || :ignore},
-      {Phoenix.PubSub, name: EzthrottleLocal.PubSub},
-      EzthrottleLocal.L8,
-      EzthrottleLocal.Admission,
-      EzthrottleLocal.IdempotentStore,
-      EzthrottleLocal.PoolRegistry,
-      EzthrottleLocal.AccountQueueRegistry,
-      EzthrottleLocalWeb.Endpoint
-    ]
+    children =
+      [
+        EzthrottleLocalWeb.Telemetry,
+        {DNSCluster, query: Application.get_env(:ezthrottle_local, :dns_cluster_query) || :ignore},
+        {Phoenix.PubSub, name: EzthrottleLocal.PubSub},
+        EzthrottleLocal.L8,
+        EzthrottleLocal.Admission,
+        EzthrottleLocal.IdempotentStore,
+        EzthrottleLocal.PoolRegistry,
+        EzthrottleLocal.AccountQueueRegistry
+      ] ++ region_redirect_children() ++ [EzthrottleLocalWeb.Endpoint]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
@@ -35,6 +35,24 @@ defmodule EzthrottleLocal.Application do
 
       other ->
         other
+    end
+  end
+
+  # Cross-region /proxy redirect (EzthrottleLocal.Redirect) -- both the
+  # region poller and the redirect gate stay entirely out of the
+  # supervision tree unless EZTHROTTLE_FLY_REGIONS is actually set,
+  # mirroring Aquifer's NewFlyRegionAdapter returning nil so the feature is
+  # off unless explicitly configured. Also flips the RegionAdapter
+  # dispatcher (EzthrottleLocal.RegionAdapter) over to the real
+  # implementation, the same way :metrics_adapter is wired.
+  defp region_redirect_children do
+    case EzthrottleLocal.RegionAdapter.Fly.configured_regions() do
+      [] ->
+        []
+
+      _regions ->
+        Application.put_env(:ezthrottle_local, :region_adapter, EzthrottleLocal.RegionAdapter.Fly)
+        [EzthrottleLocal.RegionAdapter.Fly, EzthrottleLocal.Redirect.gate_child_spec()]
     end
   end
 

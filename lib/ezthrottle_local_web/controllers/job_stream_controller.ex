@@ -125,4 +125,63 @@ defmodule EzthrottleLocalWeb.JobStreamController do
   defp sse_event(event, data) do
     "event: #{event}\ndata: #{Jason.encode!(data)}\n\n"
   end
+
+  @doc """
+  Forwards a redirected region's own SSE response byte-for-byte onto the
+  original caller's connection in real time -- a pure relay, not a
+  re-parse/re-emit, since preserving the target's own event framing exactly
+  is both simpler and more faithful than reconstructing it. Used only when
+  EzthrottleLocal.Redirect found a sibling region that accepted the job
+  into its own durable queue; the caller sees one continuous stream
+  regardless of which region actually ends up handling the job. Mirrors
+  Aquifer's relaySSE.
+
+  region is announced via a synthetic "rerouted" event before the relay
+  starts -- same rationale as proxy_fallback: a client with no server of
+  its own to explain this (a browser, an agent) should know why its
+  connection is still open and where the response is actually coming from,
+  not just start seeing target's own queued/dispatching events with no
+  context.
+  """
+  def relay_stream(conn, request_id, region) do
+    conn =
+      conn
+      |> put_resp_content_type("text/event-stream")
+      |> put_resp_header("cache-control", "no-cache")
+      |> put_resp_header("connection", "keep-alive")
+      |> send_chunked(200)
+
+    case chunk(conn, sse_event("rerouted", %{region: region})) do
+      {:ok, conn} ->
+        relay_loop(conn, request_id)
+
+      {:error, :closed} ->
+        :httpc.cancel_request(request_id)
+        conn
+    end
+  end
+
+  defp relay_loop(conn, request_id) do
+    receive do
+      {:http, {^request_id, :stream, part}} ->
+        case chunk(conn, part) do
+          {:ok, conn} ->
+            relay_loop(conn, request_id)
+
+          {:error, :closed} ->
+            :httpc.cancel_request(request_id)
+            conn
+        end
+
+      {:http, {^request_id, :stream_end, _final_headers}} ->
+        conn
+
+      {:http, {^request_id, {:error, _reason}}} ->
+        conn
+    after
+      60_000 ->
+        :httpc.cancel_request(request_id)
+        conn
+    end
+  end
 end
