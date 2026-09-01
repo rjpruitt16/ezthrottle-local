@@ -120,6 +120,15 @@ defmodule EzthrottleLocal.Proxy do
   defp maybe_redirect_or_fallback(job, account_queue_header, reason, status) do
     case Redirect.attempt_redirect(job, account_queue_header) do
       {:succeeded, outcome} ->
+        # The real job now lives on the target region under its own ID --
+        # this instance's own row is moot the moment a sibling takes it, the
+        # same way :exhausted's cleanup below is. Without this, the row
+        # sits at status :queued forever: a later retry of the same
+        # idempotent_key would find it via check_or_insert, see :queued
+        # (never :completed -- nothing here ever transitions it), and open
+        # a stream subscribed to a PubSub topic nothing will ever broadcast
+        # to again, hanging on keepalives indefinitely.
+        IdempotentStore.delete_job(job)
         {:redirected, outcome}
 
       :exhausted ->

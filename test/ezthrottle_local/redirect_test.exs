@@ -152,6 +152,17 @@ defmodule EzthrottleLocal.RedirectTest do
     assert conn.resp_body == ~s({"ok":true})
     assert get_resp_header(conn, "x-served-by") == ["target-region"]
     assert get_resp_header(conn, "x-aquifer-served-by-region") == ["target-region"]
+
+    # Origin's own job row must be gone -- the real job now lives on the
+    # target region under its own ID. Without this cleanup, the row sits
+    # at status :queued forever, and a later retry of the same
+    # idempotent_key would find it via check_or_insert, open a stream, and
+    # hang forever waiting on a PubSub topic nothing will ever broadcast
+    # to again. check_or_insert on the identical user_id/idempotent_key
+    # returning :ok (not :duplicate) proves the row is actually gone.
+    {:ok, retry_job} = EzthrottleLocal.Job.new(params)
+    assert EzthrottleLocal.IdempotentStore.check_or_insert(retry_job) == :ok
+    EzthrottleLocal.IdempotentStore.delete_job(retry_job)
   end
 
   defmodule QueueStreamPlug do
@@ -206,6 +217,13 @@ defmodule EzthrottleLocal.RedirectTest do
     assert String.contains?(body, "event: proxy_fallback")
     assert String.contains?(body, "event: queued")
     assert reroute_idx < fallback_idx
+
+    # Same cleanup requirement as the direct-success case: the real job now
+    # lives on the target region under its own ID, so origin's own row must
+    # be gone too, not just in the direct-success path.
+    {:ok, retry_job} = EzthrottleLocal.Job.new(params)
+    assert EzthrottleLocal.IdempotentStore.check_or_insert(retry_job) == :ok
+    EzthrottleLocal.IdempotentStore.delete_job(retry_job)
   end
 
   defmodule AlreadyRedirectedPlug do
