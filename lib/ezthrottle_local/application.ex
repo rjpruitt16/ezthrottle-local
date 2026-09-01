@@ -9,6 +9,7 @@ defmodule EzthrottleLocal.Application do
 
   @impl true
   def start(_type, _args) do
+    configure_httpc_ipfamily()
     configure_mnesia_dir()
     EzthrottleLocal.IdempotentStore.ensure_schema!()
 
@@ -95,6 +96,22 @@ defmodule EzthrottleLocal.Application do
        thousand_island_options: [transport_options: [ipv6_v6only: true]]},
       id: EzthrottleLocalWeb.Endpoint.IPv6Listener
     )
+  end
+
+  # Erlang's :httpc defaults to IPv4-only resolution (ipfamily: :inet) --
+  # confirmed live against real Fly infrastructure while testing this
+  # feature: a region-prefixed .internal hostname (AAAA-only, no A record,
+  # since Fly's 6PN is IPv6-only) got :nxdomain from :httpc even though the
+  # OS-level resolver (getent) found it fine, and even a literal IPv6
+  # address string still failed the same way, because :httpc's own connect
+  # logic defaults to :inet family regardless of what the address looks
+  # like. :inet6fb4 (try IPv6, fall back to IPv4) fixes reachability for
+  # RegionAdapter.Fly's health checks and Redirect's hop calls without
+  # narrowing anything IPv4/dual-stack (account_queue.ex's make_request)
+  # already reaches -- applies globally to the default httpc profile since
+  # both code paths share it.
+  defp configure_httpc_ipfamily do
+    :httpc.set_options(ipfamily: :inet6fb4)
   end
 
   # Mnesia's :dir is read at :mnesia.start()/:mnesia.create_schema() time,

@@ -1,4 +1,5 @@
-.PHONY: server test integration-test l8-test start-server stop-server start-webhook stop-webhook start-l8-receiver stop-l8-receiver release
+.PHONY: server test integration-test l8-test start-server stop-server start-webhook stop-webhook start-l8-receiver stop-l8-receiver release \
+	region-redirect-deploy region-redirect-test region-redirect-destroy region-redirect-e2e
 
 # Start the Phoenix server
 server:
@@ -81,3 +82,24 @@ release:
 	@git push origin v$(VERSION)
 	@gh release create v$(VERSION) --title "v$(VERSION)" --generate-notes
 	@echo "Released v$(VERSION)!"
+
+# Real, multi-region cross-region /proxy redirect test against actual
+# Fly.io infrastructure -- see test/region_redirect/ and API.md's
+# "Cross-region redirect" section. Requires `flyctl auth login` first and
+# FLY_ORG set. Deploys two ephemeral, private-only (no public exposure)
+# Fly apps; region-redirect-destroy always tears them down, never leaves
+# them merely scaled-to-zero.
+region-redirect-deploy:
+	@./test/region_redirect/deploy.sh
+
+region-redirect-test:
+	@./test/region_redirect/test.sh
+
+region-redirect-destroy:
+	@./test/region_redirect/destroy.sh
+
+region-redirect-e2e: region-redirect-deploy
+	@./test/region_redirect/test.sh; \
+	status=$$?; \
+	$(MAKE) region-redirect-destroy; \
+	exit $$status

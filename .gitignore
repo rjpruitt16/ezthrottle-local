@@ -34,3 +34,9 @@ ezthrottle_local-*.tar
 /priv/mnesia/
 /priv/mnesia_dev/
 
+# region-redirect e2e test — deployment state, local to whoever ran it
+test/region_redirect/.state
+test/region_redirect/.app_proxy.*
+test/region_redirect/.recorder_proxy.*
+/fly.region-redirect-test.toml
+
