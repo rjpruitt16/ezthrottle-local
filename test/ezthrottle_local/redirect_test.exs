@@ -265,6 +265,36 @@ defmodule EzthrottleLocal.RedirectTest do
     refute String.contains?(body, "event: rerouted")
   end
 
+  test "a queue-kind breaker trip never attempts redirect, even with a live reachable region" do
+    target_url = start_server(DirectSuccessPlug)
+    configure_origin(target_url)
+
+    upstream_url = start_server(AlreadyRedirectedPlug)
+    key = "redirect-queue-kind-#{System.unique_integer([:positive])}"
+
+    params = %{
+      "user_id" => "user-1",
+      "idempotent_key" => key,
+      "url" => upstream_url,
+      "method" => "GET",
+      "webhook_url" => "https://example.com/callback"
+    }
+
+    {:ok, job} = EzthrottleLocal.Job.new(params)
+    EzthrottleLocal.AccountQueueRegistry.trip_breaker(job, 60_000, :queue)
+
+    conn = build_conn(:post, "/proxy", params)
+    conn = JobController.proxy(conn, params)
+
+    # A queue-kind trip must never redirect -- if it wrongly did, this
+    # would succeed directly against target (DirectSuccessPlug) instead of
+    # falling to origin's own local queue.
+    assert get_resp_header(conn, "content-type") |> hd() |> String.starts_with?("text/event-stream")
+    body = conn.resp_body
+    assert String.contains?(body, ~s("reason":"domain_degraded"))
+    refute String.contains?(body, "event: rerouted")
+  end
+
   defmodule UnreachablePlug do
   end
 

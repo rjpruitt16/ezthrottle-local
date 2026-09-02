@@ -39,7 +39,8 @@ defmodule EzthrottleLocal.UrlActor do
     max_concurrent: 1,
     account_queue_enabled: false,
     queues: %{},
-    breaker_until_ms: nil
+    breaker_until_ms: nil,
+    breaker_kind: nil
   ]
 
   # ---- Public API ----
@@ -82,15 +83,30 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   @doc """
-  Opens the breaker for cooldown_ms. No separate half-open state is
-  needed: once the cooldown elapses, breaker_open?/1 naturally returns
-  false again, so the next request is itself a real probe against the
-  live upstream -- success leaves the breaker closed, a repeat overload
-  signal re-trips it via another trip_breaker/2 call. Mirrors Aquifer's
+  Which kind of signal tripped the breaker last -- "queue" or "reroute"
+  (see EzthrottleLocal.Proxy.classify_overload/2) -- only meaningful while
+  breaker_open?/1 is true. A subsequent request arriving while the breaker
+  is still open has no fresh response of its own to classify, so it
+  reuses whichever kind actually tripped it: a domain breaker-tripped by a
+  429 stays queue-only on every retry during that cooldown, not
+  reroute-eligible just because SOME overload happened. Mirrors Aquifer's
+  URLWorker.BreakerKind.
+  """
+  def breaker_kind(pid) do
+    GenServer.call(pid, :breaker_kind)
+  end
+
+  @doc """
+  Opens the breaker for cooldown_ms, recording which kind of signal
+  caused it (see breaker_kind/1). No separate half-open state is needed:
+  once the cooldown elapses, breaker_open?/1 naturally returns false
+  again, so the next request is itself a real probe against the live
+  upstream -- success leaves the breaker closed, a repeat overload signal
+  re-trips it via another trip_breaker/3 call. Mirrors Aquifer's
   URLWorker.TripBreaker.
   """
-  def trip_breaker(pid, cooldown_ms) do
-    GenServer.cast(pid, {:trip_breaker, cooldown_ms})
+  def trip_breaker(pid, cooldown_ms, kind) do
+    GenServer.cast(pid, {:trip_breaker, cooldown_ms, kind})
   end
 
   @doc """
@@ -176,6 +192,11 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   @impl true
+  def handle_call(:breaker_kind, _from, state) do
+    {:reply, state.breaker_kind, state, idle_timeout_ms()}
+  end
+
+  @impl true
   def handle_call(:queue_active?, _from, state) do
     active? = state.queues |> Map.values() |> Enum.any?(&AccountQueue.active?/1)
     {:reply, active?, state, idle_timeout_ms()}
@@ -210,9 +231,9 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   @impl true
-  def handle_cast({:trip_breaker, cooldown_ms}, state) do
+  def handle_cast({:trip_breaker, cooldown_ms, kind}, state) do
     until_ms = System.monotonic_time(:millisecond) + cooldown_ms
-    {:noreply, %{state | breaker_until_ms: until_ms}, idle_timeout_ms()}
+    {:noreply, %{state | breaker_until_ms: until_ms, breaker_kind: kind}, idle_timeout_ms()}
   end
 
   @impl true

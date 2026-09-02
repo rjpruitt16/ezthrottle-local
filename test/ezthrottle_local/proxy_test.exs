@@ -134,28 +134,70 @@ defmodule EzthrottleLocal.ProxyTest do
     :ok
   end
 
-  describe "overload?/1" do
+  describe "classify_overload/2" do
     test "200 is not overload" do
-      refute Proxy.overload?(%{status: 200, headers: %{}})
+      assert Proxy.classify_overload(%{}, 200) == nil
     end
 
-    test "429 is overload" do
-      assert Proxy.overload?(%{status: 429, headers: %{}})
+    test "429 defaults to queue" do
+      assert Proxy.classify_overload(%{}, 429) == :queue
     end
 
-    test "500 and 503 are overload" do
-      assert Proxy.overload?(%{status: 500, headers: %{}})
-      assert Proxy.overload?(%{status: 503, headers: %{}})
+    test "503 defaults to reroute" do
+      assert Proxy.classify_overload(%{}, 503) == :reroute
     end
 
-    test "an ORCA overload header on a 200 is overload" do
+    # Deliberate narrowing from earlier behavior (every 5xx used to mean
+    # the same thing): 500/502 aren't in either default set, so they're
+    # not overload signals at all unless the upstream configures them
+    # explicitly -- relayed to the caller as a normal, if unfortunate,
+    # direct response.
+    test "500 is not overload by default" do
+      assert Proxy.classify_overload(%{}, 500) == nil
+    end
+
+    test "502 is not overload by default" do
+      assert Proxy.classify_overload(%{}, 502) == nil
+    end
+
+    test "an ORCA overload header on a 200 is reroute-eligible" do
       headers = %{"endpoint-load-metrics" => "TEXT named_metrics.kv_cache_usage_perc=0.95"}
-      assert Proxy.overload?(%{status: 200, headers: headers})
+      assert Proxy.classify_overload(headers, 200) == :reroute
     end
 
     test "an ORCA healthy header on a 200 is not overload" do
       headers = %{"endpoint-load-metrics" => "TEXT named_metrics.kv_cache_usage_perc=0.10"}
-      refute Proxy.overload?(%{status: 200, headers: headers})
+      assert Proxy.classify_overload(headers, 200) == nil
+    end
+
+    test "upstream widens reroute codes to 5xx" do
+      headers = %{"x-aqueduct-reroute-codes" => "5xx"}
+      assert Proxy.classify_overload(headers, 500) == :reroute
+    end
+
+    test "upstream configures a custom queue code" do
+      headers = %{"x-aqueduct-queue-codes" => "429,529"}
+      assert Proxy.classify_overload(headers, 529) == :queue
+    end
+  end
+
+  describe "parse_code_list/1 and code_list_matches?/2" do
+    test "parses a literal code" do
+      assert Proxy.code_list_matches?(Proxy.parse_code_list("503"), 503)
+      refute Proxy.code_list_matches?(Proxy.parse_code_list("503"), 500)
+    end
+
+    test "parses an HTTP status class" do
+      assert Proxy.code_list_matches?(Proxy.parse_code_list("5xx"), 500)
+      assert Proxy.code_list_matches?(Proxy.parse_code_list("5xx"), 599)
+      refute Proxy.code_list_matches?(Proxy.parse_code_list("5xx"), 429)
+    end
+
+    test "mixes literals and classes, comma-separated" do
+      matchers = Proxy.parse_code_list("429, 5xx")
+      assert Proxy.code_list_matches?(matchers, 429)
+      assert Proxy.code_list_matches?(matchers, 503)
+      refute Proxy.code_list_matches?(matchers, 404)
     end
   end
 
@@ -181,14 +223,29 @@ defmodule EzthrottleLocal.ProxyTest do
     assert IdempotentStore.get_status(job.id) == "completed"
   end
 
-  test "falls back on 5xx without completing the job" do
-    url = start_server(ErrorPlug, status: 500)
-    key = "direct-500-#{System.unique_integer([:positive])}"
+  test "falls back on 503 without completing the job" do
+    # 503 is the default reroute-eligible code (classify_overload/2) -- a
+    # plain 500 deliberately no longer triggers fallback by default, see
+    # the companion test below.
+    url = start_server(ErrorPlug, status: 503)
+    key = "direct-503-#{System.unique_integer([:positive])}"
 
-    assert {:fallback, job, %{reason: "upstream_overloaded", status: 500}} =
+    assert {:fallback, job, %{reason: "upstream_overloaded", status: 503}} =
              Proxy.attempt_direct(job_params("user-1", key, url))
 
     assert IdempotentStore.get_status(job.id) == "queued"
+  end
+
+  test "does not fall back on a plain 500 by default" do
+    # Deliberate narrowing from earlier behavior: a bare 500 isn't in
+    # either default classification set (queue: 429, reroute: 503), so
+    # it's relayed to the caller as a normal, if unfortunate, direct
+    # response -- not treated as an overload signal at all.
+    url = start_server(ErrorPlug, status: 500)
+    key = "direct-plain-500-#{System.unique_integer([:positive])}"
+
+    assert {:direct, _job, response} = Proxy.attempt_direct(job_params("user-1", key, url))
+    assert response.status == 500
   end
 
   test "a short timeout triggers a fallback" do
