@@ -244,6 +244,8 @@ Running one node for everything works fine until you have multiple tenants or mu
 
 The two combine: a fleet can partition statically by upstream domain, while individual nodes within a partition cycle through tenants dynamically via drain mode. This mirrors [Aquifer's](https://github.com/rjpruitt16/aquifer) identical guidance.
 
+**External registration** — off by default, and orthogonal to the above: `EZTHROTTLE_REGISTRY_URL` makes a node periodically report its own listening port to an external control plane (deciding tenant assignment, scaling, etc. is entirely that service's job, not this node's). See **[REGISTRATION.md](REGISTRATION.md)** for the env vars and ping payload shape.
+
 ---
 
 ## Admission control

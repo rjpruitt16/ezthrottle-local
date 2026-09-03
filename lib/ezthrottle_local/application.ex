@@ -23,7 +23,7 @@ defmodule EzthrottleLocal.Application do
         EzthrottleLocal.IdempotentStore,
         EzthrottleLocal.PoolRegistry,
         EzthrottleLocal.AccountQueueRegistry
-      ] ++ region_redirect_children() ++ [EzthrottleLocalWeb.Endpoint]
+      ] ++ region_redirect_children() ++ registration_children() ++ [EzthrottleLocalWeb.Endpoint]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
@@ -59,6 +59,18 @@ defmodule EzthrottleLocal.Application do
           EzthrottleLocal.Redirect.gate_child_spec(),
           ipv6_listener_child_spec()
         ]
+    end
+  end
+
+  # EzthrottleLocal.Registration stays entirely out of the supervision
+  # tree unless EZTHROTTLE_REGISTRY_URL is actually set -- same
+  # opt-in-means-no-process-at-all convention region_redirect_children/0
+  # already follows.
+  defp registration_children do
+    if EzthrottleLocal.Registration.enabled?() do
+      [EzthrottleLocal.Registration]
+    else
+      []
     end
   end
 
