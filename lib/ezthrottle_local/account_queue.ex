@@ -27,6 +27,7 @@ defmodule EzthrottleLocal.AccountQueue do
     :url_actor,
     :pool_pid,
     rps: 2.0,
+    configured_rps: 2.0,
     max_concurrent: 1,
     queue: :queue.new(),
     in_flight: 0,
@@ -42,6 +43,7 @@ defmodule EzthrottleLocal.AccountQueue do
     max_concurrent = Keyword.get(opts, :max_concurrent, 1)
     url_actor = Keyword.get(opts, :url_actor)
     pool_pid = Keyword.get(opts, :pool_pid)
+    slow_start = Keyword.get(opts, :slow_start, false)
 
     GenServer.start_link(__MODULE__, %{
       queue_key: queue_key,
@@ -49,7 +51,8 @@ defmodule EzthrottleLocal.AccountQueue do
       url_actor: url_actor,
       rps: rps,
       max_concurrent: max_concurrent,
-      pool_pid: pool_pid
+      pool_pid: pool_pid,
+      slow_start: slow_start
     })
   end
 
@@ -86,13 +89,22 @@ defmodule EzthrottleLocal.AccountQueue do
         url_actor: url_actor,
         rps: rps,
         max_concurrent: max_concurrent,
-        pool_pid: pool_pid
+        pool_pid: pool_pid,
+        slow_start: slow_start
       }) do
+    # A fresh queue's first dispatch has no prior response to read a pacing
+    # signal from, so slow-start's starting point has to be decided up
+    # front -- configured_rps keeps the real ceiling around so
+    # maybe_update_rps/2's creep-back-up (below) has something to ramp
+    # toward, since rps itself gets overwritten as pacing changes live.
+    starting_rps = if slow_start, do: @min_rps, else: rps
+
     state = %__MODULE__{
       queue_key: queue_key,
       upstream: upstream,
       url_actor: url_actor,
-      rps: rps,
+      rps: starting_rps,
+      configured_rps: rps,
       max_concurrent: max_concurrent,
       pool_pid: pool_pid
     }
@@ -207,7 +219,16 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info({:job_done, rps_header, max_concurrent_header, account_queue_header}, state) do
-    new_state = apply_job_done(state, rps_header, max_concurrent_header, account_queue_header)
+    handle_info({:job_done, rps_header, max_concurrent_header, account_queue_header, nil}, state)
+  end
+
+  @impl true
+  def handle_info(
+        {:job_done, rps_header, max_concurrent_header, account_queue_header, slow_start_header},
+        state
+      ) do
+    new_state =
+      apply_job_done(state, rps_header, max_concurrent_header, account_queue_header, slow_start_header)
 
     send(self(), :process_next)
     {:noreply, new_state, idle_timeout_ms()}
@@ -254,11 +275,12 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_call(
-        {:job_done, rps_header, max_concurrent_header, account_queue_header},
+        {:job_done, rps_header, max_concurrent_header, account_queue_header, slow_start_header},
         _from,
         state
       ) do
-    new_state = apply_job_done(state, rps_header, max_concurrent_header, account_queue_header)
+    new_state =
+      apply_job_done(state, rps_header, max_concurrent_header, account_queue_header, slow_start_header)
 
     send(self(), :process_next)
     {:reply, :ok, new_state, idle_timeout_ms()}
@@ -340,7 +362,8 @@ defmodule EzthrottleLocal.AccountQueue do
         rps = parse_rps_header(resp_headers) || EzthrottleLocal.Orca.rps(resp_headers)
         max_concurrent = parse_max_concurrent_header(resp_headers)
         account_queue = parse_account_queue_header(resp_headers)
-        GenServer.call(parent, {:job_done, rps, max_concurrent, account_queue})
+        slow_start = parse_slow_start_header(resp_headers)
+        GenServer.call(parent, {:job_done, rps, max_concurrent, account_queue, slow_start})
 
         IdempotentStore.update_status(job.id, :completed)
 
@@ -370,7 +393,7 @@ defmodule EzthrottleLocal.AccountQueue do
         })
 
       {:error, reason, response} ->
-        GenServer.call(parent, {:job_done, nil, nil, nil})
+        GenServer.call(parent, {:job_done, nil, nil, nil, nil})
 
         IdempotentStore.update_status(job.id, :failed)
         Metrics.job_failed(job.user_id, upstream, to_string(reason))
@@ -714,14 +737,39 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
+  defp parse_slow_start_header(headers) do
+    case pacing_header(headers, "slow-start") do
+      nil ->
+        nil
+
+      val ->
+        case val |> String.trim() |> String.downcase() do
+          "true" -> true
+          "false" -> false
+          _ -> nil
+        end
+    end
+  end
+
+  # No explicit rate signal on this response -- creep back up toward the
+  # configured ceiling instead of staying wherever a previous throttle (or
+  # slow start) left it. Mirrors Aquifer's account_queue.go run() (the
+  # `else if rps < configuredRPS` branch); this is also the actual ramp
+  # mechanism slow start depends on, not new logic invented for it.
+  defp maybe_update_rps(%{rps: rps, configured_rps: configured_rps} = state, nil)
+       when rps < configured_rps do
+    %{state | rps: min(rps * 1.05, configured_rps)}
+  end
+
   defp maybe_update_rps(state, nil), do: state
   defp maybe_update_rps(state, rps), do: %{state | rps: max(rps, @min_rps)}
 
   defp maybe_update_max_concurrent(state, nil), do: state
   defp maybe_update_max_concurrent(state, max), do: %{state | max_concurrent: max}
 
-  defp apply_job_done(state, rps_header, max_concurrent_header, account_queue_header) do
+  defp apply_job_done(state, rps_header, max_concurrent_header, account_queue_header, slow_start_header) do
     maybe_update_account_queue_mode(state, account_queue_header)
+    maybe_propagate_slow_start(state, slow_start_header)
 
     new_state =
       state
@@ -741,6 +789,17 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp maybe_update_account_queue_mode(%{url_actor: url_actor}, mode) do
     GenServer.call(url_actor, {:account_queue_header, mode})
+    :ok
+  end
+
+  # Applies to the *next* new queue created for this domain, not this one
+  # (which is already running -- its starting rate already happened) and
+  # not retroactively. Mirrors Aquifer's URLWorker.slowStart/onSlowStartSignal.
+  defp maybe_propagate_slow_start(%{url_actor: nil}, _enabled), do: :ok
+  defp maybe_propagate_slow_start(_state, nil), do: :ok
+
+  defp maybe_propagate_slow_start(%{url_actor: url_actor}, enabled) do
+    GenServer.call(url_actor, {:slow_start_header, enabled})
     :ok
   end
 end

@@ -24,6 +24,9 @@ Content-Type: application/json
 | `X-EZTHROTTLE-RPS: 10` | Raise or lower requests per second |
 | `X-EZTHROTTLE-MAX-CONCURRENT: 5` | Change max in-flight requests |
 | `X-EZTHROTTLE-ACCOUNT-QUEUE: enabled` | Switch to per-tenant queue isolation |
+| `X-EZTHROTTLE-SLOW-START: true` | New queues ramp up instead of firing at full rate immediately |
+
+With `X-EZTHROTTLE-SLOW-START: true` (or `X-Aqueduct-Slow-Start`), a new queue starts at a low floor rate and climbs toward its configured ceiling using the same gradual-recovery pacing that already brings a throttled queue back up, rather than firing at full speed on its very first dispatch. Applies per domain: a queue's first-ever dispatch has no prior response to read the signal from, so this takes effect on the *next* new queue created for that domain once any response has carried it — not the request that carried the header, and not retroactively for queues already running.
 
 ## POST /proxy
 

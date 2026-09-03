@@ -40,7 +40,8 @@ defmodule EzthrottleLocal.UrlActor do
     account_queue_enabled: false,
     queues: %{},
     breaker_until_ms: nil,
-    breaker_kind: nil
+    breaker_kind: nil,
+    slow_start_enabled: false
   ]
 
   # ---- Public API ----
@@ -178,6 +179,18 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_call({:account_queue_header, "disabled"}, _from, state) do
     {:reply, :ok, %{state | account_queue_enabled: false}, idle_timeout_ms()}
+  end
+
+  @doc """
+  Set by an upstream's X-Aqueduct-Slow-Start response header. Applies to
+  the *next* new queue spawned for this domain (find_or_spawn_queue/2
+  reads it), not the queue whose response carried the header -- that one's
+  already running past the point where a starting rate matters -- and not
+  retroactively. Mirrors Aquifer's URLWorker.slowStart.
+  """
+  @impl true
+  def handle_call({:slow_start_header, enabled}, _from, state) do
+    {:reply, :ok, %{state | slow_start_enabled: enabled}, idle_timeout_ms()}
   end
 
   @impl true
@@ -318,7 +331,8 @@ defmodule EzthrottleLocal.UrlActor do
             url_actor: self(),
             rps: state.rps,
             max_concurrent: state.max_concurrent,
-            pool_pid: state.pool_pid
+            pool_pid: state.pool_pid,
+            slow_start: state.slow_start_enabled
           )
 
         Process.monitor(pid)
