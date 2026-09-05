@@ -17,6 +17,13 @@ itself beyond the next flush. That orchestration — durable long-term storage, 
 instances — is entirely up to whatever service you build to receive this webhook. EZThrottle Local
 only detects idle and hands off what it has.
 
+**[canalis-rs](https://github.com/rjpruitt16/canalis-rs) is a real example of that orchestrator, and of
+why draining to a genuinely stateless handoff is worth building.** A freed node carries no memory of
+who it served last, so canalis-rs can hand it to any tenant currently waiting — durably queuing that
+tenant's work in Valkey if none is free yet — without needing this node recreated or reconfigured
+first. Scaling the fleet becomes adding or removing interchangeable nodes, not reprovisioning
+per-tenant ones.
+
 **State machine**, visible via `GET /health` (`"drain": {"state": "..."}`, only present when enabled):
 
 | State | Meaning |
