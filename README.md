@@ -6,6 +6,8 @@ Kubernetes and modern orchestrators are great at scaling compute — but they we
 
 EZThrottle Local is what I built to actually fix it: a self-hosted load balancer that absorbs bursts into a durable queue, dispatches at a controlled rate, and spreads traffic across a pool of backend instances — your API sheds load by talking back, not by getting hammered until it falls over.
 
+What's usually behind that API can't scale instantly either — a GPU, a database, a CI runner. EZThrottle Local buys time for more of it to come online; it's overkill if that ceiling is fixed for good.
+
 Real numbers — durability, throughput ceiling, admission shedding, multi-tenant fairness, a real GPU under load — are in [benchmark.md](benchmark.md), including a head-to-head against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
 ---
