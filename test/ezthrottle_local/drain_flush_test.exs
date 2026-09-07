@@ -140,6 +140,7 @@ defmodule EzthrottleLocal.DrainFlushTest do
     assert payload["batch_id"] == "#{payload["sequence_start"]}-#{payload["sequence_end"]}"
     assert [%{"job_id" => delivered_job_id, "status" => "completed"}] = payload["ledger"]
     assert delivered_job_id == job1.id
+    assert is_integer(payload["ledger"] |> List.first() |> Map.fetch!("recorded_at"))
   end
 
   @tag timeout: 60_000

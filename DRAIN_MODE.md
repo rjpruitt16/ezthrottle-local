@@ -81,7 +81,7 @@ sequence metadata:
       "idempotent_key_hash": "3fa9c1...",
       "job_id": "a3f9...",
       "status": "completed",
-      "recorded_at": "2026-08-23T14:00:42Z"
+      "recorded_at": 1798053642000
     }
   ]
 }

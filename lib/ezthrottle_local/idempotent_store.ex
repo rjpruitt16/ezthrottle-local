@@ -429,7 +429,7 @@ defmodule EzthrottleLocal.IdempotentStore do
        when status in [:completed, :failed] do
     unless Job.webhook_delivery_job?(job) do
       job_id = job.id
-      recorded_at = DateTime.utc_now() |> DateTime.to_iso8601()
+      recorded_at = System.system_time(:millisecond)
 
       :mnesia.sync_transaction(fn ->
         case :mnesia.read(@drain_events_table, job_id) do
