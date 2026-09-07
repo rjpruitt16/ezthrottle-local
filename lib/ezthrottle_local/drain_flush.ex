@@ -18,6 +18,12 @@ defmodule EzthrottleLocal.DrainFlush do
                                        this configured is treated as
                                        disabled (logged), never a flush
                                        attempt with nowhere to send it
+    EZTHROTTLE_DRAIN_BATCH_ENABLED  - periodically stream terminal ledger
+                                       events before idle handoff (default: false)
+    EZTHROTTLE_DRAIN_BATCH_INTERVAL_SECONDS
+                                     - batch stream interval (default: 60)
+    EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS
+                                     - max events per webhook batch (default: 1000)
 
   Disabled by default means exactly that: EzthrottleLocal.AccountQueueRegistry
   only schedules the periodic idle-check message when enabled?/0 is true at
@@ -29,6 +35,8 @@ defmodule EzthrottleLocal.DrainFlush do
   alias EzthrottleLocal.{IdempotentStore, Metrics, Webhook}
 
   @default_timer_seconds 45
+  @default_batch_interval_seconds 60
+  @default_batch_max_events 1_000
 
   @doc """
   Whether drain mode is actually active -- checks both the enable flag and
@@ -56,6 +64,13 @@ defmodule EzthrottleLocal.DrainFlush do
 
   def timer_seconds, do: env_int("EZTHROTTLE_DRAIN_TIMER_SECONDS", @default_timer_seconds)
   def webhook_url, do: System.get_env("EZTHROTTLE_DRAIN_WEBHOOK_URL")
+  def batch_enabled?, do: env_bool("EZTHROTTLE_DRAIN_BATCH_ENABLED", false)
+
+  def batch_interval_seconds,
+    do: env_int("EZTHROTTLE_DRAIN_BATCH_INTERVAL_SECONDS", @default_batch_interval_seconds)
+
+  def batch_max_events,
+    do: env_int("EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS", @default_batch_max_events)
 
   @doc """
   Enumerates the ledger, delivers it, and only clears local state on
@@ -65,6 +80,80 @@ defmodule EzthrottleLocal.DrainFlush do
   cleared on failure.
   """
   def attempt do
+    case flush_all_batches("instance_idle") do
+      {:ok, 0} ->
+        flush_legacy_idle_ledger()
+
+      {:ok, _sent} ->
+        IdempotentStore.clear_ledger()
+        true
+
+      :error ->
+        false
+    end
+  end
+
+  @doc """
+  Sends one bounded batch of unacknowledged terminal drain events. Returns
+  true when the batch was delivered or there was nothing to send, and false
+  when delivery failed and the events were intentionally left in Mnesia for
+  the next attempt.
+  """
+  def flush_batch(event \\ "ledger_batch") do
+    entries = IdempotentStore.list_drain_events(batch_max_events())
+
+    case entries do
+      [] ->
+        true
+
+      entries ->
+        sequence_start = entries |> List.first() |> Map.fetch!(:sequence)
+        sequence_end = entries |> List.last() |> Map.fetch!(:sequence)
+        payload = batch_payload(event, entries, sequence_start, sequence_end)
+
+        case Webhook.deliver(webhook_url(), payload) do
+          :ok ->
+            IdempotentStore.acknowledge_drain_events_through(sequence_end)
+            Metrics.drain_flush_succeeded(webhook_url(), length(entries))
+
+            Logger.info(
+              "[Drain] flushed ledger batch #{sequence_start}-#{sequence_end} (#{length(entries)} entries)"
+            )
+
+            true
+
+          :error ->
+            Metrics.drain_flush_failed(webhook_url(), length(entries))
+
+            Logger.error(
+              "[Drain] failed to deliver ledger batch #{sequence_start}-#{sequence_end} (#{length(entries)} entries) after retries — not clearing, will retry"
+            )
+
+            false
+        end
+    end
+  end
+
+  # ---- Private ----
+
+  defp flush_all_batches(event) do
+    case IdempotentStore.list_drain_events(batch_max_events()) do
+      [] ->
+        {:ok, 0}
+
+      entries ->
+        if flush_batch(event) do
+          case flush_all_batches(event) do
+            {:ok, sent} -> {:ok, sent + length(entries)}
+            :error -> :error
+          end
+        else
+          :error
+        end
+    end
+  end
+
+  defp flush_legacy_idle_ledger do
     case IdempotentStore.list_ledger() do
       [] ->
         true
@@ -95,7 +184,16 @@ defmodule EzthrottleLocal.DrainFlush do
     end
   end
 
-  # ---- Private ----
+  defp batch_payload(event, entries, sequence_start, sequence_end) do
+    %{
+      event: event,
+      batch_id: "#{sequence_start}-#{sequence_end}",
+      sequence_start: sequence_start,
+      sequence_end: sequence_end,
+      flushed_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+      ledger: entries
+    }
+  end
 
   defp env_bool(key, default) do
     case System.get_env(key) do
@@ -115,8 +213,9 @@ defmodule EzthrottleLocal.DrainFlush do
 
       val ->
         case Integer.parse(val) do
-          {n, _} -> n
+          {n, _} when n > 0 -> n
           :error -> default
+          _ -> default
         end
     end
   end

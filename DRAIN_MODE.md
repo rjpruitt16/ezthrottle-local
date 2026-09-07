@@ -12,6 +12,11 @@ just one tenant's queue) for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, it flushes everyt
 since the last flush to a webhook, and only on confirmed delivery, clears its local ledger — making
 the node safe to hand to someone else.
 
+For longer-running assignments, drain mode can also stream acknowledged ledger batches before the
+node is idle. Batch streaming records each completed or failed user job in a small Mnesia journal,
+posts bounded chunks to the same webhook, and deletes only the acknowledged journal events. The hot
+idempotency/job tables stay in place until the normal idle handoff succeeds.
+
 **EZThrottle Local does not decide who gets a freed instance next**, and does not retain the ledger
 itself beyond the next flush. That orchestration — durable long-term storage, and assigning tenants to
 instances — is entirely up to whatever service you build to receive this webhook. EZThrottle Local
@@ -43,6 +48,9 @@ guarantee that never happens, enforce it on your own end before routing traffic 
 | `EZTHROTTLE_DRAIN_ENABLED` | `false` | The real gate — the other two vars are only read when this is `true`. |
 | `EZTHROTTLE_DRAIN_TIMER_SECONDS` | `45` | How long the whole node must be idle before flushing. Deliberately separate from the per-tenant-queue self-teardown timer below (`@idle_timeout_ms`) — but drain mode's own countdown only starts once every AccountQueue and UrlActor has already self-torn-down via that timer, so a real drain flush is gated by both. |
 | `EZTHROTTLE_DRAIN_WEBHOOK_URL` | *(none)* | Required if enabled — if unset, drain mode logs a warning and stays off rather than flushing with nowhere to send it. |
+| `EZTHROTTLE_DRAIN_BATCH_ENABLED` | `false` | Periodically stream terminal ledger events while the node is still assigned. Requires drain mode and the same webhook URL. |
+| `EZTHROTTLE_DRAIN_BATCH_INTERVAL_SECONDS` | `60` | How often to attempt one batch flush when batch streaming is enabled. |
+| `EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS` | `1000` | Maximum unacknowledged terminal events to include in one batch webhook. |
 | `EZTHROTTLE_IDLE_TIMEOUT_MS` | `300000` (5min) | The per-tenant-queue self-teardown timer itself (`@idle_timeout_ms`) — AccountQueue uses it directly; UrlActor tears itself down immediately once its last AccountQueue is gone, so this is the one real wait that gates a drain flush. Exists mainly so contract tests don't have to burn real minutes to prove one — leave this at the default in production. |
 
 **Webhook payload:**
@@ -56,6 +64,33 @@ guarantee that never happens, enforce it on your own end before routing traffic 
   ]
 }
 ```
+
+When batch streaming is enabled, periodic batches use the same `ledger` entry shape plus local
+sequence metadata:
+
+```json
+{
+  "event": "ledger_batch",
+  "batch_id": "101-250",
+  "sequence_start": 101,
+  "sequence_end": 250,
+  "flushed_at": "2026-08-23T14:01:00Z",
+  "ledger": [
+    {
+      "sequence": 101,
+      "idempotent_key_hash": "3fa9c1...",
+      "job_id": "a3f9...",
+      "status": "completed",
+      "recorded_at": "2026-08-23T14:00:42Z"
+    }
+  ]
+}
+```
+
+The webhook response is the acknowledgement: a successful delivery deletes events through
+`sequence_end`; a failed delivery leaves them in Mnesia for retry. Sequence numbers are local to one
+node and are for acknowledgement only, not global identity. Downstream dedupe should still key on
+`idempotent_key_hash`.
 
 `idempotent_key_hash` is `sha256(user_id + ":" + idempotent_key)`, hex-encoded lowercase — the exact
 hash this store already computes internally, never the plaintext key. A downstream consumer

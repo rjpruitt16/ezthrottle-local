@@ -130,6 +130,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     # not a check that runs and no-ops. See EzthrottleLocal.DrainFlush.
     if DrainFlush.enabled?() do
       schedule_idle_check()
+      if DrainFlush.batch_enabled?(), do: schedule_batch_flush()
     end
 
     {:ok, %{table: table, became_idle_at: nil, drain_state: :active}}
@@ -177,6 +178,13 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     {:noreply, new_state}
   end
 
+  @impl true
+  def handle_info(:drain_batch_flush, state) do
+    DrainFlush.flush_batch()
+    schedule_batch_flush()
+    {:noreply, state}
+  end
+
   # ---- Private ----
 
   # Mirrors Aquifer's drainWatchdogLoop, made explicit as a small state
@@ -211,6 +219,10 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   defp schedule_idle_check do
     Process.send_after(self(), :idle_check, @idle_check_interval_ms)
+  end
+
+  defp schedule_batch_flush do
+    Process.send_after(self(), :drain_batch_flush, DrainFlush.batch_interval_seconds() * 1_000)
   end
 
   # Resolves (spawning if necessary) the UrlActor pid for a job's routing

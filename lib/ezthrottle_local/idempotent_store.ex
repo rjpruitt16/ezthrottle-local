@@ -2,9 +2,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   @moduledoc """
   Mnesia-backed store for idempotent keys and full job structs with TTL.
 
-  Two tables, both disc_copies for crash durability:
+  Tables are disc_copies for crash durability:
   - :idempotent_keys  — keyed by hashed idempotent_key, prevents duplicate execution
   - :jobs             — keyed by job_id, stores the full Job struct for status lookup
+  - :drain_events     — keyed by job_id, stores terminal ledger events until acknowledged
 
   Raw client keys are never stored — they are hashed before insertion.
   TTL defaults to 24 hours and is configurable via :idempotent_ttl.
@@ -26,6 +27,8 @@ defmodule EzthrottleLocal.IdempotentStore do
   @keys_table :idempotent_keys
   @jobs_table :jobs
   @delivery_table :job_delivery_modes
+  @drain_events_table :drain_events
+  @drain_sequence_table :drain_sequence
   @cleanup_interval_ms 60_000
 
   # EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS controls the durability/throughput
@@ -68,7 +71,18 @@ defmodule EzthrottleLocal.IdempotentStore do
     ensure_table(@jobs_table, [:job_id, :job, :expires_at, :status], node_list)
     ensure_table(@delivery_table, [:job_id, :mode], node_list)
 
-    :mnesia.wait_for_tables([@keys_table, @jobs_table, @delivery_table], 30_000)
+    ensure_table(
+      @drain_events_table,
+      [:job_id, :sequence, :idempotent_key_hash, :status, :recorded_at],
+      node_list
+    )
+
+    ensure_table(@drain_sequence_table, [:key, :value], node_list)
+
+    :mnesia.wait_for_tables(
+      [@keys_table, @jobs_table, @delivery_table, @drain_events_table, @drain_sequence_table],
+      30_000
+    )
   end
 
   defp ensure_table(name, attrs, node_list) do
@@ -162,6 +176,8 @@ defmodule EzthrottleLocal.IdempotentStore do
           _ ->
             :ok
         end
+
+        maybe_record_drain_event(job, hashed, status)
 
         :ok
 
@@ -258,6 +274,55 @@ defmodule EzthrottleLocal.IdempotentStore do
     end)
   end
 
+  @doc """
+  Lists terminal drain events that have not yet been acknowledged by the
+  drain webhook receiver. The sequence is local to this node and exists
+  only to make batch acknowledgement precise; idempotency across nodes is
+  still keyed by idempotent_key_hash.
+  """
+  def list_drain_events(limit \\ :all) do
+    {:atomic, entries} =
+      :mnesia.transaction(fn ->
+        :mnesia.select(@drain_events_table, [
+          {{@drain_events_table, :"$1", :"$2", :"$3", :"$4", :"$5"}, [],
+           [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+        ])
+      end)
+
+    entries
+    |> Enum.map(fn {job_id, sequence, hash, status, recorded_at} ->
+      %{
+        sequence: sequence,
+        idempotent_key_hash: hash,
+        job_id: job_id,
+        status: status,
+        recorded_at: recorded_at
+      }
+    end)
+    |> Enum.sort_by(& &1.sequence)
+    |> take_limit(limit)
+  end
+
+  @doc """
+  Deletes acknowledged drain events through the given sequence, leaving
+  normal idempotency/job rows in place for hot-path duplicate checks.
+  """
+  def acknowledge_drain_events_through(sequence) when is_integer(sequence) do
+    {:atomic, rows} =
+      :mnesia.transaction(fn ->
+        :mnesia.select(@drain_events_table, [
+          {{@drain_events_table, :_, :"$1", :_, :_, :_}, [{:"=<", :"$1", sequence}], [:"$_"]}
+        ])
+      end)
+
+    :mnesia.transaction(fn ->
+      Enum.each(rows, fn row -> :mnesia.delete_object(row) end)
+    end)
+
+    if flush_interval_ms() == 0, do: :mnesia.dump_log()
+    :ok
+  end
+
   defp webhook_delivery_job_id?(job_id) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
       [{@jobs_table, ^job_id, job, _expires_at, _status}] -> Job.webhook_delivery_job?(job)
@@ -266,7 +331,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   @doc """
-  Wipes all three tables -- only ever called by drain mode's watchdog after
+  Wipes all local ledger tables -- only ever called by drain mode's watchdog after
   a successful ledger-flush webhook delivery, never on a normal
   (non-drain-mode) deployment. Clears job_delivery_modes too, alongside the
   ledger and job tables, so a handoff doesn't leave orphaned rows behind.
@@ -275,6 +340,8 @@ defmodule EzthrottleLocal.IdempotentStore do
     :mnesia.clear_table(@keys_table)
     :mnesia.clear_table(@jobs_table)
     :mnesia.clear_table(@delivery_table)
+    :mnesia.clear_table(@drain_events_table)
+    :mnesia.clear_table(@drain_sequence_table)
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
     :ok
   end
@@ -357,6 +424,49 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   # ---- Private ----
+
+  defp maybe_record_drain_event(%Job{} = job, hashed, status)
+       when status in [:completed, :failed] do
+    unless Job.webhook_delivery_job?(job) do
+      job_id = job.id
+      recorded_at = DateTime.utc_now() |> DateTime.to_iso8601()
+
+      :mnesia.sync_transaction(fn ->
+        case :mnesia.read(@drain_events_table, job_id) do
+          [{@drain_events_table, ^job_id, _sequence, _hash, _status, _recorded_at}] ->
+            :ok
+
+          [] ->
+            sequence = next_drain_sequence()
+            :mnesia.write({@drain_events_table, job_id, sequence, hashed, status, recorded_at})
+            :ok
+        end
+      end)
+
+      if flush_interval_ms() == 0, do: :mnesia.dump_log()
+    end
+  end
+
+  defp maybe_record_drain_event(_job, _hashed, _status), do: :ok
+
+  defp next_drain_sequence do
+    next =
+      case :mnesia.read(@drain_sequence_table, :sequence) do
+        [{@drain_sequence_table, :sequence, current}] when is_integer(current) -> current + 1
+        [] -> 1
+      end
+
+    :mnesia.write({@drain_sequence_table, :sequence, next})
+    next
+  end
+
+  defp take_limit(entries, :all), do: entries
+
+  defp take_limit(entries, limit) when is_integer(limit) and limit > 0 do
+    Enum.take(entries, limit)
+  end
+
+  defp take_limit(entries, _limit), do: entries
 
   # Scoped per user_id, matching Aquifer's hashKey(job.UserID + ":" + job.IdempotentKey) exactly --
   # without this, two different users submitting the same idempotent_key would collide with each

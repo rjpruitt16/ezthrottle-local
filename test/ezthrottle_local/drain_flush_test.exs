@@ -37,15 +37,22 @@ defmodule EzthrottleLocal.DrainFlushTest do
   setup do
     {:ok, counter} = Agent.start_link(fn -> 0 end, name: :drain_flush_test_counter)
     {:ok, bodies} = Agent.start_link(fn -> [] end, name: :drain_flush_test_bodies)
+
     on_exit(fn ->
       if Process.alive?(counter), do: Agent.stop(counter)
       if Process.alive?(bodies), do: Agent.stop(bodies)
+      System.delete_env("EZTHROTTLE_DRAIN_BATCH_ENABLED")
+      System.delete_env("EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS")
+      System.delete_env("EZTHROTTLE_DRAIN_BATCH_INTERVAL_SECONDS")
     end)
+
     :ok
   end
 
   defp start_webhook(responses) do
-    {:ok, responses_pid} = Agent.start_link(fn -> responses end, name: :drain_flush_test_responses)
+    {:ok, responses_pid} =
+      Agent.start_link(fn -> responses end, name: :drain_flush_test_responses)
+
     # A unique port per call, not a fixed one -- a hard-killed listener's
     # socket can take a moment to actually release, and reusing the same
     # port across tests raced that release window (eaddrinuse).
@@ -85,6 +92,12 @@ defmodule EzthrottleLocal.DrainFlushTest do
     job
   end
 
+  defp seed_terminal_ledger_entry(status) do
+    job = seed_ledger_entry()
+    :ok = IdempotentStore.update_status(job.id, status)
+    job
+  end
+
   test "attempt/0 succeeds on first delivery and clears the ledger" do
     url = start_webhook([200])
     System.put_env("EZTHROTTLE_DRAIN_WEBHOOK_URL", url)
@@ -102,6 +115,65 @@ defmodule EzthrottleLocal.DrainFlushTest do
     assert payload["event"] == "instance_idle"
     assert is_list(payload["ledger"])
     assert length(payload["ledger"]) == 1
+  end
+
+  test "flush_batch/1 delivers terminal drain events and acknowledges only the delivered batch" do
+    url = start_webhook([200])
+    System.put_env("EZTHROTTLE_DRAIN_WEBHOOK_URL", url)
+    System.put_env("EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS", "1")
+    on_exit(fn -> System.delete_env("EZTHROTTLE_DRAIN_WEBHOOK_URL") end)
+
+    IdempotentStore.clear_ledger()
+    job1 = seed_terminal_ledger_entry(:completed)
+    job2 = seed_terminal_ledger_entry(:failed)
+
+    assert DrainFlush.flush_batch() == true
+    assert Agent.get(:drain_flush_test_counter, & &1) == 1
+
+    remaining = IdempotentStore.list_drain_events()
+    assert Enum.map(remaining, & &1.job_id) == [job2.id]
+
+    [body] = Agent.get(:drain_flush_test_bodies, & &1)
+    payload = Jason.decode!(body)
+    assert payload["event"] == "ledger_batch"
+    assert payload["sequence_start"] == payload["sequence_end"]
+    assert payload["batch_id"] == "#{payload["sequence_start"]}-#{payload["sequence_end"]}"
+    assert [%{"job_id" => delivered_job_id, "status" => "completed"}] = payload["ledger"]
+    assert delivered_job_id == job1.id
+  end
+
+  @tag timeout: 60_000
+  test "flush_batch/1 leaves drain events queued when delivery fails" do
+    url = start_webhook([500])
+    System.put_env("EZTHROTTLE_DRAIN_WEBHOOK_URL", url)
+    on_exit(fn -> System.delete_env("EZTHROTTLE_DRAIN_WEBHOOK_URL") end)
+
+    IdempotentStore.clear_ledger()
+    job = seed_terminal_ledger_entry(:completed)
+
+    assert DrainFlush.flush_batch() == false
+    assert [%{job_id: job_id}] = IdempotentStore.list_drain_events()
+    assert job_id == job.id
+  end
+
+  test "attempt/0 streams terminal batches, then clears local ledger after idle handoff" do
+    url = start_webhook([200, 200])
+    System.put_env("EZTHROTTLE_DRAIN_WEBHOOK_URL", url)
+    System.put_env("EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS", "1")
+    on_exit(fn -> System.delete_env("EZTHROTTLE_DRAIN_WEBHOOK_URL") end)
+
+    IdempotentStore.clear_ledger()
+    seed_terminal_ledger_entry(:completed)
+    seed_terminal_ledger_entry(:failed)
+
+    assert DrainFlush.attempt() == true
+    assert Agent.get(:drain_flush_test_counter, & &1) == 2
+    assert IdempotentStore.list_drain_events() == []
+    assert IdempotentStore.list_ledger() == []
+
+    bodies = Agent.get(:drain_flush_test_bodies, &Enum.reverse/1)
+    payloads = Enum.map(bodies, &Jason.decode!/1)
+    assert Enum.map(payloads, & &1["event"]) == ["instance_idle", "instance_idle"]
   end
 
   test "attempt/0 with an empty ledger skips delivery entirely" do
