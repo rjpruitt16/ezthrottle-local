@@ -88,6 +88,31 @@ defmodule EzthrottleLocal.IdempotentStoreTest do
     assert :ok = IdempotentStore.check_or_insert(job)
   end
 
+  test "put_result and get_result retain terminal payloads until clear" do
+    IdempotentStore.clear_ledger()
+    stamp = System.unique_integer([:positive])
+    job_id = "result-#{stamp}"
+
+    result = %{
+      job_id: job_id,
+      status: "completed",
+      response_status: 200,
+      body: ~s({"ok":true})
+    }
+
+    assert :ok = IdempotentStore.put_result(job_id, result, :completed)
+
+    assert IdempotentStore.get_result(job_id) == %{
+             "job_id" => job_id,
+             "status" => "completed",
+             "response_status" => 200,
+             "body" => ~s({"ok":true})
+           }
+
+    IdempotentStore.clear_ledger()
+    assert IdempotentStore.get_result(job_id) == nil
+  end
+
   # Drain mode's store-level primitives (EzthrottleLocal.DrainFlush):
   # enumerate returns exactly what was inserted, hash-only, and clear wipes
   # the whole table so a previously-duplicate key is fresh afterward. Runs

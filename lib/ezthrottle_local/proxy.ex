@@ -105,7 +105,14 @@ defmodule EzthrottleLocal.Proxy do
     cond do
       AccountQueueRegistry.breaker_open?(job) ->
         try_redirect = AccountQueueRegistry.breaker_kind(job) == :reroute
-        maybe_redirect_or_fallback(job, account_queue_header, "domain_degraded", nil, try_redirect)
+
+        maybe_redirect_or_fallback(
+          job,
+          account_queue_header,
+          "domain_degraded",
+          nil,
+          try_redirect
+        )
 
       AccountQueueRegistry.queue_active?(job) ->
         maybe_redirect_or_fallback(job, account_queue_header, "domain_degraded", nil, false)
@@ -116,7 +123,13 @@ defmodule EzthrottleLocal.Proxy do
             handle_direct_response(job, account_queue_header, response)
 
           {:error, _reason} ->
-            maybe_redirect_or_fallback(job, account_queue_header, "upstream_unreachable", nil, true)
+            maybe_redirect_or_fallback(
+              job,
+              account_queue_header,
+              "upstream_unreachable",
+              nil,
+              true
+            )
         end
     end
   end
@@ -175,7 +188,14 @@ defmodule EzthrottleLocal.Proxy do
     case classify_overload(response.headers, response.status) do
       kind when kind in [:queue, :reroute] ->
         AccountQueueRegistry.trip_breaker(job, breaker_cooldown(response.headers), kind)
-        maybe_redirect_or_fallback(job, account_queue_header, "upstream_overloaded", response.status, kind == :reroute)
+
+        maybe_redirect_or_fallback(
+          job,
+          account_queue_header,
+          "upstream_overloaded",
+          response.status,
+          kind == :reroute
+        )
 
       nil ->
         # The upstream can proactively ask to be routed through the durable
@@ -190,21 +210,34 @@ defmodule EzthrottleLocal.Proxy do
           AccountQueueRegistry.trip_breaker(job, breaker_cooldown(response.headers), :queue)
         end
 
+        completed_payload = %{
+          job_id: job.id,
+          status: "completed",
+          response_status: response.status,
+          body: response.body
+        }
+
+        IdempotentStore.put_result(job.id, completed_payload, :completed)
         IdempotentStore.update_status(job.id, :completed)
 
         Phoenix.PubSub.broadcast(
           EzthrottleLocal.PubSub,
           "job:#{job.id}",
           {:job_event,
-           %{event: "completed", job_id: job.id, response_status: response.status, body: response.body}}
+           %{
+             event: "completed",
+             job_id: job.id,
+             response_status: response.status,
+             body: response.body
+           }}
         )
 
-        AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, %{
-          job_id: job.id,
-          status: "completed",
-          response_status: response.status,
-          body: response.body
-        })
+        AccountQueueRegistry.enqueue_webhook(
+          job.id,
+          job.user_id,
+          job.webhook_url,
+          completed_payload
+        )
 
         {:direct, job, response}
     end
@@ -244,10 +277,16 @@ defmodule EzthrottleLocal.Proxy do
       Orca.rps(headers) != nil ->
         :reroute
 
-      code_list_matches?(parse_code_list(header_or_default(headers, "reroute-codes", @default_reroute_codes)), status) ->
+      code_list_matches?(
+        parse_code_list(header_or_default(headers, "reroute-codes", @default_reroute_codes)),
+        status
+      ) ->
         :reroute
 
-      code_list_matches?(parse_code_list(header_or_default(headers, "queue-codes", @default_queue_codes)), status) ->
+      code_list_matches?(
+        parse_code_list(header_or_default(headers, "queue-codes", @default_queue_codes)),
+        status
+      ) ->
         :queue
 
       true ->

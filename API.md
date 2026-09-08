@@ -89,6 +89,27 @@ Opens a server-sent event stream. Events: `queued`, `position`, `dispatching`, `
 GET /jobs/:id
 ```
 
+Queued or in-flight jobs return status and request metadata. Completed or failed jobs also include a
+durable `result` object with the same terminal payload delivered over SSE/webhook:
+
+```json
+{
+  "job_id": "abc123",
+  "status": "completed",
+  "url": "https://api.yourservice.com/process",
+  "method": "POST",
+  "created_at": 1798053642000,
+  "result": {
+    "job_id": "abc123",
+    "status": "completed",
+    "response_status": 200,
+    "body": "{\"ok\":true}"
+  }
+}
+```
+
+Terminal duplicate submissions return the same stored result inline with `duplicate: true`.
+
 ## Health check
 
 ```bash

@@ -25,7 +25,7 @@ defmodule EzthrottleLocalWeb.JobController do
             # admission limit.
             conn
             |> put_status(:ok)
-            |> json(%{job_id: existing_id, status: "queued", duplicate: true})
+            |> json(duplicate_response(existing_id))
 
           :ok ->
             # check_or_insert already wrote this job's rows since it
@@ -114,7 +114,8 @@ defmodule EzthrottleLocalWeb.JobController do
         |> put_resp_header("retry-after", to_string(retry_after))
         |> put_status(429)
         |> json(%{
-          error: "job #{job_id}: cross-region redirect exhausted, no known-live region could help",
+          error:
+            "job #{job_id}: cross-region redirect exhausted, no known-live region could help",
           limit_reason: "redirect_exhausted"
         })
     end
@@ -131,7 +132,7 @@ defmodule EzthrottleLocalWeb.JobController do
   defp stream_or_status_for_duplicate(conn, job) do
     case IdempotentStore.get_status(job.id) do
       status when status in ["completed", "failed"] ->
-        json(conn, %{job_id: job.id, status: status, duplicate: true})
+        json(conn, duplicate_response(job.id, status))
 
       _ ->
         JobStreamController.stream_events(conn, job)
@@ -147,17 +148,33 @@ defmodule EzthrottleLocalWeb.JobController do
 
       job ->
         status = IdempotentStore.get_status(job_id)
+        result = IdempotentStore.get_result(job_id)
 
-        json(conn, %{
-          job_id: job_id,
-          status: status,
-          url: job.url,
-          pool_id: job.pool_id,
-          method: job.method,
-          created_at: job.created_at
-        })
+        response =
+          %{
+            job_id: job_id,
+            status: status,
+            url: job.url,
+            pool_id: job.pool_id,
+            method: job.method,
+            created_at: job.created_at
+          }
+          |> maybe_put_result(result)
+
+        json(conn, response)
     end
   end
+
+  defp duplicate_response(job_id, status \\ nil) do
+    status = status || IdempotentStore.get_status(job_id) || "queued"
+    result = IdempotentStore.get_result(job_id)
+
+    %{job_id: job_id, status: status, duplicate: true}
+    |> maybe_put_result(result)
+  end
+
+  defp maybe_put_result(payload, nil), do: payload
+  defp maybe_put_result(payload, result), do: Map.put(payload, :result, result)
 
   # Reads X-Aqueduct-Account-Queue first, falling back to
   # X-EZThrottle-Account-Queue — this is the client-facing request-header

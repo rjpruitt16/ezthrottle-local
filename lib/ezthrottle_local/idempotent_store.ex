@@ -5,6 +5,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   Tables are disc_copies for crash durability:
   - :idempotent_keys  — keyed by hashed idempotent_key, prevents duplicate execution
   - :jobs             — keyed by job_id, stores the full Job struct for status lookup
+  - :job_results      — keyed by job_id, stores terminal response payloads for polling
   - :drain_events     — keyed by job_id, stores terminal ledger events until acknowledged
 
   Raw client keys are never stored — they are hashed before insertion.
@@ -26,6 +27,7 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   @keys_table :idempotent_keys
   @jobs_table :jobs
+  @results_table :job_results
   @delivery_table :job_delivery_modes
   @drain_events_table :drain_events
   @drain_sequence_table :drain_sequence
@@ -69,6 +71,7 @@ defmodule EzthrottleLocal.IdempotentStore do
 
     ensure_table(@keys_table, [:hashed_key, :job_id, :expires_at, :status], node_list)
     ensure_table(@jobs_table, [:job_id, :job, :expires_at, :status], node_list)
+    ensure_table(@results_table, [:job_id, :result, :expires_at], node_list)
     ensure_table(@delivery_table, [:job_id, :mode], node_list)
 
     ensure_table(
@@ -80,7 +83,14 @@ defmodule EzthrottleLocal.IdempotentStore do
     ensure_table(@drain_sequence_table, [:key, :value], node_list)
 
     :mnesia.wait_for_tables(
-      [@keys_table, @jobs_table, @delivery_table, @drain_events_table, @drain_sequence_table],
+      [
+        @keys_table,
+        @jobs_table,
+        @results_table,
+        @delivery_table,
+        @drain_events_table,
+        @drain_sequence_table
+      ],
       30_000
     )
   end
@@ -150,6 +160,7 @@ defmodule EzthrottleLocal.IdempotentStore do
 
     :mnesia.sync_transaction(fn ->
       :mnesia.delete({@jobs_table, job.id})
+      :mnesia.delete({@results_table, job.id})
       :mnesia.delete({@keys_table, hashed})
     end)
 
@@ -192,6 +203,31 @@ defmodule EzthrottleLocal.IdempotentStore do
   def get_status(job_id) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
       [{@jobs_table, ^job_id, _job, _expires_at, status}] -> to_string(status)
+      [] -> nil
+    end
+  end
+
+  @doc """
+  Stores the terminal job result payload for later polling. The payload is
+  the same shape delivered over SSE/webhook, minus the SSE-only event name.
+  """
+  def put_result(job_id, result, status) when status in [:completed, :failed] do
+    expires_at = System.system_time(:millisecond) + ttl_ms(status)
+    :mnesia.dirty_write({@results_table, job_id, normalize_result(result), expires_at})
+    if flush_interval_ms() == 0, do: :mnesia.dump_log()
+    :ok
+  end
+
+  @doc """
+  Returns a stored terminal result payload by job_id, or nil if the job has
+  not completed/failed yet or the result has expired.
+  """
+  def get_result(job_id) do
+    now = System.system_time(:millisecond)
+
+    case :mnesia.dirty_read(@results_table, job_id) do
+      [{@results_table, ^job_id, result, expires_at}] when expires_at > now -> result
+      [{@results_table, ^job_id, _result, _expires_at}] -> nil
       [] -> nil
     end
   end
@@ -339,6 +375,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   def clear_ledger do
     :mnesia.clear_table(@keys_table)
     :mnesia.clear_table(@jobs_table)
+    :mnesia.clear_table(@results_table)
     :mnesia.clear_table(@delivery_table)
     :mnesia.clear_table(@drain_events_table)
     :mnesia.clear_table(@drain_sequence_table)
@@ -376,10 +413,12 @@ defmodule EzthrottleLocal.IdempotentStore do
   @impl true
   def handle_info(:cleanup, state) do
     now = System.system_time(:millisecond)
-    spec = [{{:_, :_, :"$1", :_}, [{:<, :"$1", now}], [:"$_"]}]
+    key_and_job_spec = [{{:_, :_, :_, :"$1", :_}, [{:<, :"$1", now}], [:"$_"]}]
+    result_spec = [{{:_, :_, :_, :"$1"}, [{:<, :"$1", now}], [:"$_"]}]
 
-    delete_matching(@keys_table, spec)
-    delete_matching(@jobs_table, spec)
+    delete_matching(@keys_table, key_and_job_spec)
+    delete_matching(@jobs_table, key_and_job_spec)
+    delete_matching(@results_table, result_spec)
 
     schedule_cleanup()
     {:noreply, state}
@@ -467,6 +506,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   defp take_limit(entries, _limit), do: entries
+
+  defp normalize_result(result) when is_map(result) do
+    Map.new(result, fn {key, value} -> {to_string(key), value} end)
+  end
 
   # Scoped per user_id, matching Aquifer's hashKey(job.UserID + ":" + job.IdempotentKey) exactly --
   # without this, two different users submitting the same idempotent_key would collide with each

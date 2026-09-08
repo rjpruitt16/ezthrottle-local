@@ -173,7 +173,7 @@ event: completed
 data: {"job_id":"abc123","response_status":200,"body":"..."}
 ```
 
-**If the stream drops before completion, the result is delivered to your `webhook_url` automatically.** You never lose the response — stream for the happy path, webhook as the guaranteed fallback.
+**If the stream drops before completion, the result is delivered to your `webhook_url` automatically.** Terminal results are also retained for `GET /jobs/:id`, so polling later returns the same completed/failed payload.
 
 ### Queue position for agent fleets
 

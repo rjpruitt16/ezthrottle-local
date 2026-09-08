@@ -228,7 +228,13 @@ defmodule EzthrottleLocal.AccountQueue do
         state
       ) do
     new_state =
-      apply_job_done(state, rps_header, max_concurrent_header, account_queue_header, slow_start_header)
+      apply_job_done(
+        state,
+        rps_header,
+        max_concurrent_header,
+        account_queue_header,
+        slow_start_header
+      )
 
     send(self(), :process_next)
     {:noreply, new_state, idle_timeout_ms()}
@@ -280,7 +286,13 @@ defmodule EzthrottleLocal.AccountQueue do
         state
       ) do
     new_state =
-      apply_job_done(state, rps_header, max_concurrent_header, account_queue_header, slow_start_header)
+      apply_job_done(
+        state,
+        rps_header,
+        max_concurrent_header,
+        account_queue_header,
+        slow_start_header
+      )
 
     send(self(), :process_next)
     {:reply, :ok, new_state, idle_timeout_ms()}
@@ -365,6 +377,14 @@ defmodule EzthrottleLocal.AccountQueue do
         slow_start = parse_slow_start_header(resp_headers)
         GenServer.call(parent, {:job_done, rps, max_concurrent, account_queue, slow_start})
 
+        completed_payload = %{
+          job_id: job.id,
+          status: "completed",
+          response_status: status,
+          body: body
+        }
+
+        IdempotentStore.put_result(job.id, completed_payload, :completed)
         IdempotentStore.update_status(job.id, :completed)
 
         Metrics.job_completed(
@@ -395,23 +415,6 @@ defmodule EzthrottleLocal.AccountQueue do
       {:error, reason, response} ->
         GenServer.call(parent, {:job_done, nil, nil, nil, nil})
 
-        IdempotentStore.update_status(job.id, :failed)
-        Metrics.job_failed(job.user_id, upstream, to_string(reason))
-
-        failed_event =
-          %{
-            event: "failed",
-            job_id: job.id,
-            reason: to_string(reason)
-          }
-          |> maybe_put_response(response)
-
-        Phoenix.PubSub.broadcast(
-          EzthrottleLocal.PubSub,
-          "job:#{job.id}",
-          {:job_event, failed_event}
-        )
-
         failed_payload =
           %{
             job_id: job.id,
@@ -419,6 +422,18 @@ defmodule EzthrottleLocal.AccountQueue do
             reason: to_string(reason)
           }
           |> maybe_put_response(response)
+
+        IdempotentStore.put_result(job.id, failed_payload, :failed)
+        IdempotentStore.update_status(job.id, :failed)
+        Metrics.job_failed(job.user_id, upstream, to_string(reason))
+
+        failed_event = Map.put(failed_payload, :event, "failed")
+
+        Phoenix.PubSub.broadcast(
+          EzthrottleLocal.PubSub,
+          "job:#{job.id}",
+          {:job_event, failed_event}
+        )
 
         maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, failed_payload)
     end
@@ -553,12 +568,17 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp env_int(key, default) do
     case System.get_env(key) do
-      nil -> default
-      "" -> default
-      val -> case Integer.parse(val) do
-        {n, _} -> n
-        :error -> default
-      end
+      nil ->
+        default
+
+      "" ->
+        default
+
+      val ->
+        case Integer.parse(val) do
+          {n, _} -> n
+          :error -> default
+        end
     end
   end
 
@@ -571,7 +591,14 @@ defmodule EzthrottleLocal.AccountQueue do
   (not defp) so Proxy can call it directly without duplicating the
   header-building/L8/ORCA logic below.
   """
-  def make_request(%Job{} = job, dispatch_url, flow_rate, max_concurrent, queue_key, timeout \\ :infinity) do
+  def make_request(
+        %Job{} = job,
+        dispatch_url,
+        flow_rate,
+        max_concurrent,
+        queue_key,
+        timeout \\ :infinity
+      ) do
     %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()
     url = String.to_charlist(dispatch_url)
     account_queue_enabled = queue_key != :shared
@@ -767,7 +794,13 @@ defmodule EzthrottleLocal.AccountQueue do
   defp maybe_update_max_concurrent(state, nil), do: state
   defp maybe_update_max_concurrent(state, max), do: %{state | max_concurrent: max}
 
-  defp apply_job_done(state, rps_header, max_concurrent_header, account_queue_header, slow_start_header) do
+  defp apply_job_done(
+         state,
+         rps_header,
+         max_concurrent_header,
+         account_queue_header,
+         slow_start_header
+       ) do
     maybe_update_account_queue_mode(state, account_queue_header)
     maybe_propagate_slow_start(state, slow_start_header)
 
