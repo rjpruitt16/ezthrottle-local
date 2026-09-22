@@ -2,6 +2,8 @@
 
 **Increase your rate limit without DDoSing your backend.**
 
+![How engineers respond to congestion: pacing and backpressure everywhere else in infrastructure, versus retrying everything immediately at the API layer](docs/images/how-engineers-respond-to-congestion.jpg)
+
 Kubernetes and modern orchestrators are great at scaling compute — but they weren't designed for spiky traffic or tenant fairness. When a burst of requests arrives, your pods get hammered, queues back up unevenly, and one noisy tenant crowds out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready, so the burden falls on clients retrying uncoordinated — [wasted utilization and higher cost](https://rahmipruitt.me/content/gpu-retry-tax/) on one end, [outages reactive autoscaling alone can't prevent](https://rahmipruitt.me/content/github-outage-reactive-scaling/) on the other.
 
 EZThrottle Local is what I built to actually fix it: a self-hosted load balancer that absorbs bursts into a durable queue, dispatches at a controlled rate, and spreads traffic across a pool of backend instances — your API sheds load by talking back, not by getting hammered until it falls over.
