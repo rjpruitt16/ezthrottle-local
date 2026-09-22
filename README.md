@@ -1,8 +1,8 @@
 # EZThrottle Local — Load balancer for agentic workloads
 
-**Increase your rate limit without DDoSing your backend.**
-
 ![How engineers respond to congestion: pacing and backpressure everywhere else in infrastructure, versus retrying everything immediately at the API layer](docs/images/how-engineers-respond-to-congestion.jpg)
+
+**Increase your rate limit without DDoSing your backend.**
 
 Kubernetes and modern orchestrators are great at scaling compute — but they weren't designed for spiky traffic or tenant fairness. When a burst of requests arrives, your pods get hammered, queues back up unevenly, and one noisy tenant crowds out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready, so the burden falls on clients retrying uncoordinated — [wasted utilization and higher cost](https://rahmipruitt.me/content/gpu-retry-tax/) on one end, [outages reactive autoscaling alone can't prevent](https://rahmipruitt.me/content/github-outage-reactive-scaling/) on the other.
 
