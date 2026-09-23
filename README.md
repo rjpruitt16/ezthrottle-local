@@ -2,6 +2,16 @@
 
 ![How engineers respond to congestion: pacing and backpressure everywhere else in infrastructure, versus retrying everything immediately at the API layer](docs/images/how-engineers-respond-to-congestion.jpg)
 
+**TL;DR — why not Envoy?**
+
+Envoy circuit breaking protects an overloaded service by rejecting excess work outright. That keeps the backend alive, but a rejected request is just gone — nothing durable — and it leaves the client to retry independently, creating uncoordinated competition for whatever capacity opens up next and wasting cycles on repeated attempts.
+
+EZThrottle Local takes a different approach: persist the excess work, then pace its release.
+
+The backend is also closer to the truth about its own capacity than a static proxy limit ever is. If the fleet loses half its usable capacity, the admission rate should fall; if capacity expands, the release rate should rise. Instead of leaning on static limits like max connections or concurrent requests, EZThrottle Local can ask the backend directly, continuously: *how fast should we send work right now?* (See [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) for how that ceiling, backoff, and recovery actually work.)
+
+Circuit breaking protects the service by saying "stop." EZThrottle Local coordinates demand by saying "wait here, and I'll tell you when to go."
+
 **Increase your rate limit without DDoSing your backend.**
 
 Kubernetes and modern orchestrators are great at scaling compute — but they weren't designed for spiky traffic or tenant fairness. When a burst of requests arrives, your pods get hammered, queues back up unevenly, and one noisy tenant crowds out everyone else. Horizontal scaling helps eventually, but the spike hits before a new pod is ready, so the burden falls on clients retrying uncoordinated — [wasted utilization and higher cost](https://rahmipruitt.me/content/gpu-retry-tax/) on one end, [outages reactive autoscaling alone can't prevent](https://rahmipruitt.me/content/github-outage-reactive-scaling/) on the other.
