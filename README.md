@@ -256,6 +256,8 @@ The two combine: a fleet can partition statically by upstream domain, while indi
 
 **External registration** — off by default, and orthogonal to the above: `EZTHROTTLE_REGISTRY_URL` makes a node periodically report its own listening port to an external control plane (deciding tenant assignment, scaling, etc. is entirely that service's job, not this node's). See **[REGISTRATION.md](REGISTRATION.md)** for the env vars and ping payload shape.
 
+None of this needs nodes sharing state centrally, and that's the normal shape for a load balancer, not a gap unique to this project — nginx and HAProxy make local decisions the same way. Pure central rate limiting is a gateway-layer concern that composes in front of this if you want it, not something this project needs to reinvent. What a node does need is to be safe to hand off without knowing anything about the rest of the fleet, which is what slow start (mirrors Aquifer's `URLWorker.slowStart`, see [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode)) is for: a freshly-assigned node starts below its configured ceiling and creeps up, rather than assuming the ramp some other node already earned.
+
 ---
 
 ## Admission control
