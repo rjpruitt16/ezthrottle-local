@@ -8,13 +8,15 @@ Kubernetes and modern orchestrators are great at scaling compute — but they we
 
 The usual fix for that is more hardware — double the fleet, triple the GPU budget, eat the bill. It works, but it's expensive, it leaves capacity idle most of the time, and it doesn't actually fix the burst, just buys enough headroom to survive the next one:
 
-![Traditional load balancing collapsing under a spike, round-robin flickering faster as instances die, versus Aqueduct pacing that keeps the fleet stable while an autoscaler brings real capacity online](docs/images/fleet-degradation.gif)
+![How teams handle traffic spikes: overprovisioning the fleet versus queueing the burst and pacing the flow while capacity catches up](docs/images/how-teams-handle-traffic-spikes.png)
 
 EZThrottle Local is what I built to actually fix it: a self-hosted load balancer that absorbs bursts into a durable queue, dispatches at a controlled rate, and spreads traffic across a pool of backend instances — your API sheds load by talking back, not by getting hammered until it falls over.
 
 What's usually behind that API can't scale instantly either — a GPU, a database, a CI runner. EZThrottle Local buys time for more of it to come online; it's overkill if that ceiling is fixed for good.
 
 Real numbers — durability, throughput ceiling, admission shedding, multi-tenant fairness, a real GPU under load — are in [benchmark.md](benchmark.md), including a head-to-head against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
+
+![Traditional load balancing collapsing under a spike, round-robin flickering faster as instances die, versus Aqueduct pacing that keeps the fleet stable while an autoscaler brings real capacity online](docs/images/fleet-degradation.gif)
 
 ---
 
