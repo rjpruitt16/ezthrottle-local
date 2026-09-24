@@ -77,6 +77,8 @@ Client → POST /jobs → EZThrottle Local → paced outbound requests → Your 
 
 By default all traffic for a destination flows through one shared queue. Turn on per-tenant isolation via a response header (or set it on submission if you already know a tenant needs it) and each `user_id` + API key gets its own independently paced queue — a heavy user no longer blocks everyone else, and each tenant can run at a genuinely different pace.
 
+![Traditional circuit breaking rejecting requests outright, forcing clients to retry independently into a thundering herd on reopen, versus Aqueduct's per-client queues pacing release via X-Aqueduct-Rps until the backend catches up](docs/images/circuit-breaking-vs-queue.gif)
+
 <details>
 <summary>Full pacing reference — headers, isolation mechanics, ORCA fallback, webhook pacing</summary>
 
