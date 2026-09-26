@@ -17,7 +17,7 @@ defmodule EzthrottleLocal.UrlActor do
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.Pool
 
-  @default_idle_timeout_ms 300_000
+  @default_idle_timeout_seconds 300
   @shared_queue_key :shared
   @min_rps 0.5
 
@@ -316,6 +316,7 @@ defmodule EzthrottleLocal.UrlActor do
     if map_size(state.queues) > 0 do
       schedule_budget_check()
     end
+
     {:noreply, state, idle_timeout_ms()}
   end
 
@@ -351,18 +352,36 @@ defmodule EzthrottleLocal.UrlActor do
   # How long this actor can sit genuinely idle before self-terminating --
   # same env var and default as AccountQueue.idle_timeout_ms/0 (one shared
   # knob for both levels of the same concept), overridable via
-  # EZTHROTTLE_IDLE_TIMEOUT_MS so contract tests don't have to burn 5+ real
-  # minutes per level per drain-mode run.
-  defp idle_timeout_ms, do: env_int("EZTHROTTLE_IDLE_TIMEOUT_MS", @default_idle_timeout_ms)
+  # EZTHROTTLE_IDLE_TIMEOUT_SECONDS. EZTHROTTLE_IDLE_TIMEOUT_MS is accepted
+  # as a compatibility fallback for older configs.
+  defp idle_timeout_ms,
+    do:
+      env_seconds_as_ms(
+        "EZTHROTTLE_IDLE_TIMEOUT_SECONDS",
+        @default_idle_timeout_seconds,
+        "EZTHROTTLE_IDLE_TIMEOUT_MS"
+      )
+
+  defp env_seconds_as_ms(seconds_key, default_seconds, legacy_ms_key) do
+    case System.get_env(seconds_key) do
+      nil -> env_int(legacy_ms_key, default_seconds * 1_000)
+      "" -> env_int(legacy_ms_key, default_seconds * 1_000)
+      val -> parsed_or_default(val, default_seconds) * 1_000
+    end
+  end
 
   defp env_int(key, default) do
     case System.get_env(key) do
       nil -> default
       "" -> default
-      val -> case Integer.parse(val) do
-        {n, _} -> n
-        :error -> default
-      end
+      val -> parsed_or_default(val, default)
+    end
+  end
+
+  defp parsed_or_default(val, default) do
+    case Integer.parse(val) do
+      {n, _} -> n
+      :error -> default
     end
   end
 

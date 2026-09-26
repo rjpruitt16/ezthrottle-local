@@ -39,8 +39,8 @@ defmodule EzthrottleLocal.DrainFlushTest do
     {:ok, bodies} = Agent.start_link(fn -> [] end, name: :drain_flush_test_bodies)
 
     on_exit(fn ->
-      if Process.alive?(counter), do: Agent.stop(counter)
-      if Process.alive?(bodies), do: Agent.stop(bodies)
+      safe_agent_stop(counter)
+      safe_agent_stop(bodies)
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_ENABLED")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_INTERVAL_SECONDS")
@@ -60,7 +60,7 @@ defmodule EzthrottleLocal.DrainFlushTest do
     {:ok, server} = Bandit.start_link(plug: TestWebhookPlug, port: port, startup_log: false)
 
     on_exit(fn ->
-      if Process.alive?(responses_pid), do: Agent.stop(responses_pid)
+      safe_agent_stop(responses_pid)
       # A hard kill, not Supervisor.stop/1 -- Bandit's supervision tree
       # exits with :shutdown internally regardless of the reason passed to
       # stop/1, which GenServer.stop/3 (what Supervisor.stop/1 calls under
@@ -70,6 +70,14 @@ defmodule EzthrottleLocal.DrainFlushTest do
     end)
 
     "http://localhost:#{port}"
+  end
+
+  defp safe_agent_stop(pid) do
+    if Process.alive?(pid) do
+      Agent.stop(pid)
+    end
+  catch
+    :exit, _ -> :ok
   end
 
   defp seed_ledger_entry do

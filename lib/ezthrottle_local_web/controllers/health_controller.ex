@@ -7,7 +7,8 @@ defmodule EzthrottleLocalWeb.HealthController do
       l8_protocol: "0.1",
       l8_public_key: EzthrottleLocal.L8.pub_b64(),
       admission: EzthrottleLocal.Admission.snapshot(),
-      pools: EzthrottleLocal.PoolRegistry.snapshot()
+      pools: EzthrottleLocal.PoolRegistry.snapshot(),
+      websocket: EzthrottleLocal.WebSocketQueue.snapshot()
     }
 
     # Only present when drain mode is enabled -- an instance that never

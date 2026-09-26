@@ -14,6 +14,8 @@ defmodule EzthrottleLocal.Webhook do
 
   require Logger
 
+  alias EzthrottleLocal.Jitter
+
   @max_retries 4
 
   def deliver(url, payload, attempt \\ 0)
@@ -29,7 +31,7 @@ defmodule EzthrottleLocal.Webhook do
         :ok
 
       {:ok, status} ->
-        backoff = backoff_ms(attempt)
+        backoff = backoff_ms(attempt) |> Jitter.add_ms()
 
         Logger.warning(
           "[Webhook] #{status} from #{url}, retry #{attempt + 1}/#{@max_retries} in #{backoff}ms"
@@ -39,7 +41,7 @@ defmodule EzthrottleLocal.Webhook do
         deliver(url, payload, attempt + 1)
 
       {:error, reason} ->
-        backoff = backoff_ms(attempt)
+        backoff = backoff_ms(attempt) |> Jitter.add_ms()
 
         Logger.warning(
           "[Webhook] Error delivering to #{url}, retry #{attempt + 1}/#{@max_retries} in #{backoff}ms: #{inspect(reason)}"

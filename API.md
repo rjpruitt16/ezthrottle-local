@@ -75,6 +75,83 @@ If literally no known-live region can help either — none live at all, or every
 
 **Honest limitation, not silently glossed over:** this instance's idempotency check remains per-instance (Mnesia), unchanged by this feature. If the exact same `idempotent_key` is independently submitted to two different regions at nearly the same moment (a real scenario — a caller's own client retrying after a timeout can land on a different region via Fly's anycast), each region may independently begin its own redirect tour, and in rare cases the job could end up durably queued in two places. The deterministic region selection above narrows this window but does not close it. During cross-region redirect specifically, treat delivery as at-least-once, not exactly-once.
 
+## GET /websocket
+
+WebSocket proxying with an ordered Mnesia transcript, cursor replay, paced upstream connection admission, and automatic reconnect. This is the same `aqueduct.v1` wire contract Aquifer exposes. EZThrottle Local does **not** authenticate callers or choose their destination; put it behind a trusted gateway that authenticates the request and injects the upstream URL.
+
+WebSockets are enabled by default because Mnesia is already part of EZThrottle Local. `EZTHROTTLE_WS_ENABLED=false` is an operational kill switch.
+
+### Handshake
+
+```http
+GET /websocket?session_id=session-123&after=0-0 HTTP/1.1
+Connection: Upgrade
+Upgrade: websocket
+Sec-WebSocket-Protocol: aqueduct.v1
+Authorization: Bearer gateway-authenticated-identity
+X-Aqueduct-Upstream-URL: wss://backend.internal/socket
+```
+
+`session_id` identifies the durable transcript. `after` is the last stream ID the client processed and defaults to `0-0`. EZThrottle replays backend messages after that cursor before following live events. A cursor older than retained history returns **409** instead of silently skipping data.
+
+The trusted upstream URL must be absolute `ws://` or `wss://`. When `EZTHROTTLE_ALLOWED_URL_DOMAINS` is set, its comma-separated hosts are enforced as an allowlist. Gateway headers such as `Authorization` are forwarded; hop-by-hop and internal Aqueduct/Aquifer headers are stripped, and `X-Aqueduct-Session-ID` is injected upstream.
+
+### Messages
+
+Every application message is a JSON `aqueduct.v1` envelope. Raw frames are not supported.
+
+```json
+{"type":"command","message_id":"command-42","payload":{"action":"start"}}
+```
+
+The client must keep `message_id` stable across retries. EZThrottle persists the command before forwarding it and confirms that write:
+
+```json
+{"type":"command_recorded","message_id":"command-42","stream_id":"1798053731000-1"}
+```
+
+Backend acknowledgements and events use the same shapes as Aquifer:
+
+```json
+{"type":"ack","message_id":"ack-42","caused_by":"command-42"}
+{"type":"event","message_id":"event-43","caused_by":"command-42","payload":{"state":"running"}}
+```
+
+Every backend `ack` or `event` is persisted before client delivery. `caused_by` permits one command to produce zero, one, or many events. Delivery after cursor reconnect is at least once. After an ambiguous upstream disconnect, persisted commands are not automatically replayed because EZThrottle cannot know whether the backend acted before the socket disappeared; backend actions must be idempotent by `message_id`.
+
+Live, non-durable status envelopes report `replaying`, `replay_complete`, `waiting`, `connecting`, `connected`, and `reconnecting`. Waiting messages include the current FIFO `position`; reconnecting messages include `retry_after_ms`.
+
+### Capacity and retention
+
+Connection ceilings and slow start are local to one EZThrottle process. A backend can lower this process's ceiling or opening rate through successful-handshake headers:
+
+```http
+X-Aqueduct-WS-Max-Connections: 250
+X-Aqueduct-WS-Connect-Rps: 20
+```
+
+It may update either limit on an established connection using `{"type":"aqueduct.capacity","max_connections":250,"connect_rps":20}`. Dynamic signals can only lower operator ceilings. Successful handshakes double the slow-start ramp toward its configured maximum; a failed handshake resets it. Opening and reconnect delays include jitter.
+
+Transcripts retain the newest configured events and expire after an idle TTL. Mnesia uses the same `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
+
+| Environment variable | Default |
+|---|---:|
+| `EZTHROTTLE_WS_ENABLED` | `true` |
+| `EZTHROTTLE_WS_STREAM_MAX_EVENTS` | `10000` |
+| `EZTHROTTLE_WS_STREAM_TTL_SECONDS` | `86400` |
+| `EZTHROTTLE_WS_READ_BATCH` | `100` |
+| `EZTHROTTLE_WS_MAX_MESSAGE_BYTES` | `1048576` |
+| `EZTHROTTLE_WS_HANDSHAKE_TIMEOUT_SECONDS` | `10` |
+| `EZTHROTTLE_WS_RECONNECT_MAX_SECONDS` | `30` |
+| `EZTHROTTLE_WS_IDLE_TIMEOUT_SECONDS` | `30` |
+| `EZTHROTTLE_WS_MAX_CLIENT_CONNECTIONS` | `1000` |
+| `EZTHROTTLE_WS_MAX_UPSTREAM_CONNECTIONS` | `1000` |
+| `EZTHROTTLE_WS_MAX_WAITING_CONNECTIONS` | `1000` |
+| `EZTHROTTLE_WS_CONNECT_RPS` | `20` |
+| `EZTHROTTLE_WS_SLOW_START_RPS` | `1` |
+
+Handshake errors match Aquifer: **400** for invalid protocol/session/upstream input, **409** for a replay gap, and **429** for the local client ceiling. `GET /health` exposes the local client, waiting, active-upstream, configured, ramp, and effective limits under `websocket`.
+
 ## Stream job events (SSE)
 
 ```bash

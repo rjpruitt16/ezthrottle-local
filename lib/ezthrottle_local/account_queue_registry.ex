@@ -12,6 +12,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   alias EzthrottleLocal.PoolRegistry
   alias EzthrottleLocal.DrainFlush
   alias EzthrottleLocal.IdempotentStore
+  alias EzthrottleLocal.Jitter
 
   @default_table :url_actors
   @idle_check_interval_ms 5_000
@@ -222,7 +223,11 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   end
 
   defp schedule_batch_flush do
-    Process.send_after(self(), :drain_batch_flush, DrainFlush.batch_interval_seconds() * 1_000)
+    Process.send_after(
+      self(),
+      :drain_batch_flush,
+      (DrainFlush.batch_interval_seconds() * 1_000) |> Jitter.add_ms()
+    )
   end
 
   # Resolves (spawning if necessary) the UrlActor pid for a job's routing

@@ -15,8 +15,9 @@ defmodule EzthrottleLocal.AccountQueue do
   alias EzthrottleLocal.Metrics
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.Pool
+  alias EzthrottleLocal.Jitter
 
-  @default_idle_timeout_ms 300_000
+  @default_idle_timeout_seconds 300
   @min_rps 0.5
   @position_broadcast_ms 2_000
   @max_retries 4
@@ -173,11 +174,10 @@ defmodule EzthrottleLocal.AccountQueue do
             # Enforce RPS with jitter to prevent synchronized bursts across queues
             now = System.system_time(:millisecond)
             interval_ms = trunc(1_000 / state.rps)
-            jitter_ms = :rand.uniform(trunc(interval_ms * 0.1) + 1)
             elapsed = now - state.last_request_at
 
             if elapsed < interval_ms do
-              Process.sleep(interval_ms - elapsed + jitter_ms)
+              Process.sleep(Jitter.add_ms(interval_ms - elapsed))
             end
 
             new_state = %{
@@ -548,6 +548,7 @@ defmodule EzthrottleLocal.AccountQueue do
   defp sleep_before_retry(attempt) do
     Process.sleep(
       Application.get_env(:ezthrottle_local, :dispatch_retry_ms, retry_backoff_ms(attempt))
+      |> Jitter.add_ms()
     )
   end
 
@@ -557,14 +558,30 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @doc """
   How long this queue can sit genuinely idle before self-terminating --
-  300_000ms (5min) by default, overridable via EZTHROTTLE_IDLE_TIMEOUT_MS.
+  300 seconds (5min) by default, overridable via
+  EZTHROTTLE_IDLE_TIMEOUT_SECONDS. EZTHROTTLE_IDLE_TIMEOUT_MS is still
+  accepted as a compatibility fallback for older configs.
   Exists mainly so contract tests (aqueduct-runner) don't have to burn 5+
   real minutes per drain-mode run; production should leave this at the
   default. Read live via System.get_env rather than Application config so
   a container-level env var (set the same way EZTHROTTLE_DRAIN_TIMER_SECONDS
   already is) takes effect with no code/config-file change.
   """
-  def idle_timeout_ms, do: env_int("EZTHROTTLE_IDLE_TIMEOUT_MS", @default_idle_timeout_ms)
+  def idle_timeout_ms,
+    do:
+      env_seconds_as_ms(
+        "EZTHROTTLE_IDLE_TIMEOUT_SECONDS",
+        @default_idle_timeout_seconds,
+        "EZTHROTTLE_IDLE_TIMEOUT_MS"
+      )
+
+  defp env_seconds_as_ms(seconds_key, default_seconds, legacy_ms_key) do
+    case System.get_env(seconds_key) do
+      nil -> env_int(legacy_ms_key, default_seconds * 1_000)
+      "" -> env_int(legacy_ms_key, default_seconds * 1_000)
+      val -> parsed_or_default(val, default_seconds) * 1_000
+    end
+  end
 
   defp env_int(key, default) do
     case System.get_env(key) do
@@ -575,10 +592,14 @@ defmodule EzthrottleLocal.AccountQueue do
         default
 
       val ->
-        case Integer.parse(val) do
-          {n, _} -> n
-          :error -> default
-        end
+        parsed_or_default(val, default)
+    end
+  end
+
+  defp parsed_or_default(val, default) do
+    case Integer.parse(val) do
+      {n, _} -> n
+      :error -> default
     end
   end
 
