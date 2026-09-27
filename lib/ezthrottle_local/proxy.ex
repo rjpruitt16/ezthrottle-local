@@ -11,8 +11,6 @@ defmodule EzthrottleLocal.Proxy do
 
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.IdempotentStore
-  alias EzthrottleLocal.Admission
-  alias EzthrottleLocal.Metrics
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.AccountQueue
   alias EzthrottleLocal.Orca
@@ -61,20 +59,15 @@ defmodule EzthrottleLocal.Proxy do
         {:error, reason}
 
       {:ok, job} ->
-        case IdempotentStore.check_or_insert(job) do
+        case AccountQueueRegistry.prepare(job, account_queue_header) do
           {:duplicate, existing_id} ->
             {:duplicate, IdempotentStore.get_job(existing_id)}
 
-          :ok ->
-            case Admission.check() do
-              {:rejected, reason, limit, current} ->
-                IdempotentStore.delete_job(job)
-                {:admission_rejected, reason, limit, current}
+          {:rejected, reason, limit, current} ->
+            {:admission_rejected, reason, limit, current}
 
-              :ok ->
-                Metrics.job_queued(job.user_id, Metrics.upstream(job.url))
-                attempt_dispatch_or_fallback(job, account_queue_header)
-            end
+          {:prepared, prepared_job} ->
+            attempt_dispatch_or_fallback(prepared_job, account_queue_header)
         end
     end
   end

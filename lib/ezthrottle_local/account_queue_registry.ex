@@ -11,7 +11,6 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.PoolRegistry
   alias EzthrottleLocal.DrainFlush
-  alias EzthrottleLocal.IdempotentStore
   alias EzthrottleLocal.Jitter
 
   @default_table :url_actors
@@ -47,7 +46,34 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   flip it off for every other concurrent tenant relying on it being on.
   """
   def enqueue(%Job{} = job, account_queue_header \\ nil) do
-    GenServer.call(__MODULE__, {:enqueue, job, account_queue_header})
+    job
+    |> actor_for()
+    |> route_to_actor(:enqueue, job, account_queue_header)
+  end
+
+  @doc "Claims the job's cluster-wide queue, then persists and admits it on that owner node."
+  def submit(%Job{} = job, account_queue_header \\ nil) do
+    job
+    |> actor_for()
+    |> route_to_actor(:submit, job, account_queue_header)
+  end
+
+  def submit_internal(%Job{} = job, account_queue_header \\ nil) do
+    job
+    |> actor_for()
+    |> route_to_actor(:submit_internal, job, account_queue_header)
+  end
+
+  def prepare(%Job{} = job, account_queue_header \\ nil) do
+    job
+    |> actor_for()
+    |> route_to_actor(:prepare, job, account_queue_header)
+  end
+
+  def enqueue_prepared(%Job{} = job, account_queue_header \\ nil) do
+    job
+    |> actor_for()
+    |> route_to_actor(:enqueue_prepared, job, account_queue_header)
   end
 
   @doc """
@@ -58,7 +84,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   rate-limited webhook receiver can now shed load exactly the way an
   upstream API already can, and delivery is durable across a restart the
   same way a real job is (the underlying webhook-delivery Job is
-  persisted via IdempotentStore.check_or_insert/1, not just an in-memory
+  persisted by the cluster-wide queue owner, not just held in an in-memory
   retry loop).
 
   original_job_id scopes the idempotent key (see Job.new_webhook_delivery/4)
@@ -72,9 +98,10 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   def enqueue_webhook(original_job_id, user_id, webhook_url, payload) do
     job = Job.new_webhook_delivery(original_job_id, user_id, webhook_url, payload)
 
-    case IdempotentStore.check_or_insert(job) do
-      :ok -> enqueue(job)
+    case submit_internal(job) do
+      {:accepted, _job} -> :ok
       {:duplicate, _existing_job_id} -> :ok
+      {:rejected, _reason, _limit, _current} -> :ok
     end
   end
 
@@ -144,8 +171,54 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
 
   @impl true
   def handle_call({:enqueue, job, account_queue_header}, _from, state) do
-    pid = resolve_actor(state, job)
+    route_job(:enqueue, job, account_queue_header, state)
+  end
 
+  @impl true
+  def handle_call({:submit, job, account_queue_header}, _from, state) do
+    route_job(:submit, job, account_queue_header, state)
+  end
+
+  @impl true
+  def handle_call({:submit_internal, job, account_queue_header}, _from, state) do
+    route_job(:submit_internal, job, account_queue_header, state)
+  end
+
+  @impl true
+  def handle_call({:prepare, job, account_queue_header}, _from, state) do
+    route_job(:prepare, job, account_queue_header, state)
+  end
+
+  @impl true
+  def handle_call({:enqueue_prepared, job, account_queue_header}, _from, state) do
+    route_job(:enqueue_prepared, job, account_queue_header, state)
+  end
+
+  @impl true
+  def handle_call({:actor_for, job}, _from, state) do
+    {:reply, resolve_actor(state, job), state}
+  end
+
+  defp route_job(action, job, account_queue_header, state) do
+    pid = resolve_actor(state, job)
+    result = route_to_actor(pid, action, job, account_queue_header)
+
+    {:reply, result, state}
+  end
+
+  defp route_to_actor(pid, action, job, account_queue_header) do
+    apply_account_queue_header(pid, account_queue_header)
+
+    case action do
+      :submit -> UrlActor.submit(pid, job)
+      :submit_internal -> UrlActor.submit_internal(pid, job)
+      :prepare -> UrlActor.prepare(pid, job)
+      :enqueue_prepared -> UrlActor.enqueue_prepared(pid, job)
+      :enqueue -> UrlActor.enqueue(pid, job)
+    end
+  end
+
+  defp apply_account_queue_header(pid, account_queue_header) do
     if account_queue_header do
       mode = account_queue_header |> to_string() |> String.trim() |> String.downcase()
 
@@ -155,14 +228,6 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
         _ -> :ok
       end
     end
-
-    UrlActor.enqueue(pid, job)
-    {:reply, :ok, state}
-  end
-
-  @impl true
-  def handle_call({:actor_for, job}, _from, state) do
-    {:reply, resolve_actor(state, job), state}
   end
 
   @impl true
@@ -245,6 +310,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
         {:ok, new_pid} =
           UrlActor.start_link(url_key: route_key, domain: route_key, pool_pid: pool_pid)
 
+        Process.unlink(new_pid)
         Process.monitor(new_pid)
         :ets.insert(state.table, {route_key, new_pid})
         new_pid

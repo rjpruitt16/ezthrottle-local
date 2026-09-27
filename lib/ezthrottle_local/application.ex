@@ -18,8 +18,8 @@ defmodule EzthrottleLocal.Application do
     children =
       [
         EzthrottleLocalWeb.Telemetry,
-        {DNSCluster,
-         query: Application.get_env(:ezthrottle_local, :dns_cluster_query) || :ignore},
+        {Cluster.Supervisor,
+         [EzthrottleLocal.Cluster.topologies(), [name: EzthrottleLocal.ClusterSupervisor]]},
         {Phoenix.PubSub, name: EzthrottleLocal.PubSub},
         {EzthrottleLocal.WebSocketStore, websocket_config},
         {EzthrottleLocal.WebSocketQueue, websocket_config},

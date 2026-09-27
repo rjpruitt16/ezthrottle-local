@@ -3,6 +3,7 @@ defmodule EzthrottleLocal.IdleLifecycleTest do
 
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.AccountQueueRegistry
+  alias EzthrottleLocal.Cluster
 
   defmodule OkPlug do
     import Plug.Conn
@@ -79,7 +80,10 @@ defmodule EzthrottleLocal.IdleLifecycleTest do
     queue_ref = Process.monitor(queue)
     actor_ref = Process.monitor(actor)
 
+    assert Cluster.lookup_account_queue(route_key, Job.queue_key(job)) == queue
+
     assert_receive {:DOWN, ^queue_ref, :process, ^queue, :normal}, 3_000
+    assert Cluster.lookup_account_queue(route_key, Job.queue_key(job)) == nil
     assert_receive {:DOWN, ^actor_ref, :process, ^actor, :normal}, 2_000
 
     assert wait_until(fn -> :ets.lookup(table, route_key) == [] end),

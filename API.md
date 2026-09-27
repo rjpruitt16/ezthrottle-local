@@ -28,6 +28,21 @@ Content-Type: application/json
 
 With `X-EZTHROTTLE-SLOW-START: true` (or `X-Aqueduct-Slow-Start`), a new queue starts at a low floor rate and climbs toward its configured ceiling using the same gradual-recovery pacing that already brings a throttled queue back up, rather than firing at full speed on its very first dispatch. Applies per domain: a queue's first-ever dispatch has no prior response to read the signal from, so this takes effect on the *next* new queue created for that domain once any response has carried it — not the request that carried the header, and not retroactively for queues already running.
 
+### Region-local queue ownership
+
+EZThrottle Local uses libcluster for optional BEAM discovery and Syn for queue ownership. When `DNS_CLUSTER_QUERY` is set, connected nodes agree on one `AccountQueue` owner for each upstream and queue key; a request received by any node is routed to that owner before idempotency admission, persistence, and enqueueing. Pacing state and circuit-breaker changes are propagated between the upstream's URL actors. Without `DNS_CLUSTER_QUERY`, the same code path runs as a standalone one-node cluster.
+
+This coordinates live processes; it does not turn each node's Mnesia directory into a replicated database. While the owning node is connected, job status and result calls route back to its local store. If that node is unavailable, its persisted jobs become available when it returns and performs normal recovery. Configure Mnesia replication separately if the deployment requires another node to serve that data during the owner's outage. Mnesia also binds its on-disk schema to the Erlang node name, so every clustered machine must retain the same node name when reusing its volume.
+
+| Environment variable | Default | Effect |
+|---|---:|---|
+| `DNS_CLUSTER_QUERY` | unset | Enables libcluster DNS polling; all nodes must share their distribution cookie and node-name basename. Fly deployments remain stable singletons unless this is explicitly set |
+| `EZTHROTTLE_CLUSTER_NODE_BASENAME` | release node basename | Overrides the basename libcluster uses for discovered node names |
+| `EZTHROTTLE_CLUSTER_POLL_INTERVAL_MS` | `5000` | DNS discovery interval |
+| `EZTHROTTLE_MAX_PENDING_PER_USER` | `10000` | Maximum queued plus in-flight jobs for one user in an account queue; `0` disables the ceiling |
+
+The per-user ceiling rejects only new client work with `429` and `limit_reason: "user_queue"`; duplicates are still returned normally. Internal webhook deliveries and startup recovery bypass it so admission pressure cannot discard already-accepted work.
+
 ## POST /proxy
 
 Edge-gateway mode — see [Use cases](README.md#use-cases) for the deployment shape this is for. Same request body as `POST /jobs`, same idempotency/admission rules, but tries the upstream directly and synchronously first:
