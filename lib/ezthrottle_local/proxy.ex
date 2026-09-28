@@ -67,7 +67,11 @@ defmodule EzthrottleLocal.Proxy do
             {:admission_rejected, reason, limit, current}
 
           {:prepared, prepared_job} ->
-            attempt_dispatch_or_fallback(prepared_job, account_queue_header)
+            if Job.execution_expired?(prepared_job) do
+              {:fallback, prepared_job, %{reason: "execution_deadline_exceeded", status: nil}}
+            else
+              attempt_dispatch_or_fallback(prepared_job, account_queue_header)
+            end
         end
     end
   end
@@ -178,6 +182,8 @@ defmodule EzthrottleLocal.Proxy do
   end
 
   defp handle_direct_response(job, account_queue_header, response) do
+    maybe_update_max_backlog(job, response.headers)
+
     case classify_overload(response.headers, response.status) do
       kind when kind in [:queue, :reroute] ->
         AccountQueueRegistry.trip_breaker(job, breaker_cooldown(response.headers), kind)
@@ -233,6 +239,22 @@ defmodule EzthrottleLocal.Proxy do
         )
 
         {:direct, job, response}
+    end
+  end
+
+  defp maybe_update_max_backlog(job, headers) do
+    case AccountQueue.pacing_header(headers, "max-backlog") do
+      nil ->
+        :ok
+
+      value ->
+        case Integer.parse(value) do
+          {max_backlog, ""} when max_backlog >= 0 ->
+            AccountQueueRegistry.update_max_backlog(job, max_backlog)
+
+          _ ->
+            :ok
+        end
     end
   end
 

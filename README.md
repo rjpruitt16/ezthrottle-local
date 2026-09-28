@@ -104,6 +104,8 @@ X-Aqueduct-Account-Queue: enabled
 
 Either way, EZThrottle switches to per-user isolation: each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else.
 
+Above 70% of the shared upstream backlog budget, queues holding more than their current fair share receive progressively more `429` responses while smaller queues continue entering. One active queue can still use the entire budget. See [API.md](API.md#fair-queue-admission) for the formula and observability headers.
+
 Critically, each user can run at a **different pace**. If your service processes requests from user A faster than user B, because of their tier, their data size, or just load at that moment, each user's queue drains independently at the rate their own responses signal back. A premium user responding with `X-Aqueduct-Rps: 50` runs at 50 RPS while a free-tier user on `X-Aqueduct-Rps: 2` runs at 2, in parallel, without either affecting the other. Note that literal pace (RPS/max-concurrent) can only ever be set by the upstream's own response headers, never by the client submitting the job, so a client can ask for isolation but never for a faster rate than what's configured.
 
 Disable it any time by responding with `X-Aqueduct-Account-Queue: disabled`.
@@ -291,6 +293,7 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 | `EZTHROTTLE_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
 | `EZTHROTTLE_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |
 | `EZTHROTTLE_MAX_PENDING_PER_USER` | `10000` | Reject new client work for one user once its queued plus in-flight jobs reach this ceiling; `0` disables it |
+| `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
 | `EZTHROTTLE_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429`: doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |
 
 Body-size and DB-size admission are **on by default**, sized off the infrastructure this project is

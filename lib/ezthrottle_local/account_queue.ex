@@ -99,6 +99,8 @@ defmodule EzthrottleLocal.AccountQueue do
   """
   def active?(pid), do: GenServer.call(pid, :active?)
 
+  def snapshot(pid), do: GenServer.call(pid, :snapshot)
+
   def update_max_concurrent(pid, max) do
     GenServer.cast(pid, {:update_max_concurrent, max})
   end
@@ -183,7 +185,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_call(
         {:job_done, user_id, rps_header, max_concurrent_header, account_queue_header,
-         slow_start_header},
+         slow_start_header, max_backlog_header},
         _from,
         state
       ) do
@@ -193,7 +195,8 @@ defmodule EzthrottleLocal.AccountQueue do
         rps_header,
         max_concurrent_header,
         account_queue_header,
-        slow_start_header
+        slow_start_header,
+        max_backlog_header
       )
 
     send(self(), :process_next)
@@ -210,6 +213,12 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   @impl true
+  def handle_call(:snapshot, _from, state) do
+    backlog = :queue.len(state.queue) + state.in_flight
+    {:reply, %{backlog: backlog, active: backlog > 0}, state}
+  end
+
+  @impl true
   def handle_cast({:update_rps, rps}, state) do
     safe_rps = max(rps, @min_rps)
     Metrics.flow_rate(state.upstream, safe_rps)
@@ -223,6 +232,8 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info(:process_next, state) do
+    state = expire_queued_jobs(state)
+
     cond do
       state.in_flight >= state.max_concurrent ->
         {:noreply, state, idle_timeout_ms()}
@@ -285,13 +296,25 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info({:job_done, rps_header, max_concurrent_header}, state) do
-    handle_info({:job_done, nil, rps_header, max_concurrent_header, nil, nil}, state)
+    handle_info({:job_done, nil, rps_header, max_concurrent_header, nil, nil, nil}, state)
   end
 
   @impl true
   def handle_info({:job_done, rps_header, max_concurrent_header, account_queue_header}, state) do
     handle_info(
-      {:job_done, nil, rps_header, max_concurrent_header, account_queue_header, nil},
+      {:job_done, nil, rps_header, max_concurrent_header, account_queue_header, nil, nil},
+      state
+    )
+  end
+
+  def handle_info(
+        {:job_done, user_id, rps_header, max_concurrent_header, account_queue_header,
+         slow_start_header},
+        state
+      ) do
+    handle_info(
+      {:job_done, user_id, rps_header, max_concurrent_header, account_queue_header,
+       slow_start_header, nil},
       state
     )
   end
@@ -299,7 +322,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_info(
         {:job_done, user_id, rps_header, max_concurrent_header, account_queue_header,
-         slow_start_header},
+         slow_start_header, max_backlog_header},
         state
       ) do
     new_state =
@@ -308,7 +331,8 @@ defmodule EzthrottleLocal.AccountQueue do
         rps_header,
         max_concurrent_header,
         account_queue_header,
-        slow_start_header
+        slow_start_header,
+        max_backlog_header
       )
 
     send(self(), :process_next)
@@ -416,6 +440,47 @@ defmodule EzthrottleLocal.AccountQueue do
     new_state
   end
 
+  defp expire_queued_jobs(state) do
+    {kept, expired} =
+      state.queue
+      |> :queue.to_list()
+      |> Enum.split_with(&(not Job.execution_expired?(&1)))
+
+    if expired == [] do
+      state
+    else
+      state = %{state | queue: :queue.from_list(kept)}
+
+      state =
+        Enum.reduce(expired, state, fn job, current_state ->
+          fail_expired_job(job, current_state.upstream)
+          complete_user_job(current_state, job.user_id)
+        end)
+
+      Metrics.queue_depth(state.upstream, length(kept))
+      state
+    end
+  end
+
+  defp fail_expired_job(job, upstream) do
+    reason = "execution_deadline_exceeded"
+    payload = %{job_id: job.id, status: "failed", reason: reason}
+
+    IdempotentStore.put_result(job.id, payload, :failed)
+    IdempotentStore.update_status(job.id, :failed)
+    Metrics.job_failed(job.user_id, upstream, reason)
+
+    Phoenix.PubSub.broadcast(
+      EzthrottleLocal.PubSub,
+      "job:#{job.id}",
+      {:job_event, Map.put(payload, :event, "failed")}
+    )
+
+    Task.start(fn ->
+      maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, payload)
+    end)
+  end
+
   # Pool-backed queue: resolve via weighted selection. nil url/pool_pid on
   # a plain queue means dispatch straight to the job's own fixed url, same
   # as before pools existed.
@@ -482,10 +547,11 @@ defmodule EzthrottleLocal.AccountQueue do
         max_concurrent = parse_max_concurrent_header(resp_headers)
         account_queue = parse_account_queue_header(resp_headers)
         slow_start = parse_slow_start_header(resp_headers)
+        max_backlog = parse_max_backlog_header(resp_headers)
 
         GenServer.call(
           parent,
-          {:job_done, job.user_id, rps, max_concurrent, account_queue, slow_start}
+          {:job_done, job.user_id, rps, max_concurrent, account_queue, slow_start, max_backlog}
         )
 
         completed_payload = %{
@@ -524,7 +590,7 @@ defmodule EzthrottleLocal.AccountQueue do
         })
 
       {:error, reason, response} ->
-        GenServer.call(parent, {:job_done, job.user_id, nil, nil, nil, nil})
+        GenServer.call(parent, {:job_done, job.user_id, nil, nil, nil, nil, nil})
 
         failed_payload =
           %{
@@ -551,6 +617,32 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   defp dispatch_with_retries(
+         %Job{} = job,
+         dispatch_url,
+         flow_rate,
+         max_concurrent,
+         queue_key,
+         pool_pid,
+         member_id,
+         attempt
+       ) do
+    if Job.execution_expired?(job) do
+      {:error, "execution_deadline_exceeded", nil}
+    else
+      dispatch_with_retries_active(
+        job,
+        dispatch_url,
+        flow_rate,
+        max_concurrent,
+        queue_key,
+        pool_pid,
+        member_id,
+        attempt
+      )
+    end
+  end
+
+  defp dispatch_with_retries_active(
          job,
          dispatch_url,
          flow_rate,
@@ -757,6 +849,7 @@ defmodule EzthrottleLocal.AccountQueue do
         timeout \\ :infinity
       ) do
     %{total_jobs: total, queue_depth: depth} = EzthrottleLocal.IdempotentStore.counts()
+    queue_snapshot = queue_load_snapshot(job)
     url = String.to_charlist(dispatch_url)
     account_queue_enabled = queue_key != :shared
     queue_key_header = if account_queue_enabled, do: to_string(queue_key), else: "shared"
@@ -765,6 +858,8 @@ defmodule EzthrottleLocal.AccountQueue do
       {"x-aqueduct-total-jobs", to_string(total)},
       {"x-aqueduct-queue-depth", to_string(depth)},
       {"x-aqueduct-flow-rate", :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])},
+      {"x-aqueduct-active-queues", to_string(queue_snapshot.active_queues)},
+      {"x-aqueduct-upstream-backlog", to_string(queue_snapshot.upstream_backlog)},
       {"x-aquifer-total-jobs", to_string(total)},
       {"x-aquifer-queue-depth", to_string(depth)},
       {"x-aquifer-flow-rate", :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])},
@@ -772,6 +867,8 @@ defmodule EzthrottleLocal.AccountQueue do
       {"x-ezthrottle-current-queue-depth", to_string(depth)},
       {"x-ezthrottle-current-flow-rate",
        :erlang.float_to_binary(flow_rate * 1.0, [{:decimals, 2}])},
+      {"x-ezthrottle-active-queues", to_string(queue_snapshot.active_queues)},
+      {"x-ezthrottle-upstream-backlog", to_string(queue_snapshot.upstream_backlog)},
       {"x-ezthrottle-current-max-concurrent", to_string(max_concurrent)},
       {"x-ezthrottle-current-account-queue-enabled", to_string(account_queue_enabled)},
       {"x-ezthrottle-current-queue-key", queue_key_header},
@@ -816,6 +913,12 @@ defmodule EzthrottleLocal.AccountQueue do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp queue_load_snapshot(job) do
+    AccountQueueRegistry.queue_snapshot(job)
+  catch
+    :exit, _reason -> %{active_queues: 0, upstream_backlog: 0}
   end
 
   # L8 signing proves EZThrottle's identity to the *receiver* of a
@@ -935,6 +1038,19 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
+  defp parse_max_backlog_header(headers) do
+    case pacing_header(headers, "max-backlog") do
+      nil ->
+        nil
+
+      val ->
+        case Integer.parse(val) do
+          {max_backlog, ""} when max_backlog >= 0 -> max_backlog
+          _ -> nil
+        end
+    end
+  end
+
   # No explicit rate signal on this response -- creep back up toward the
   # configured ceiling instead of staying wherever a previous throttle (or
   # slow start) left it. Mirrors Aquifer's account_queue.go run() (the
@@ -956,10 +1072,12 @@ defmodule EzthrottleLocal.AccountQueue do
          rps_header,
          max_concurrent_header,
          account_queue_header,
-         slow_start_header
+         slow_start_header,
+         max_backlog_header
        ) do
     maybe_update_account_queue_mode(state, account_queue_header)
     maybe_propagate_slow_start(state, slow_start_header)
+    maybe_propagate_max_backlog(state, max_backlog_header)
 
     new_state =
       state
@@ -990,6 +1108,14 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp maybe_propagate_slow_start(%{url_actor: url_actor}, enabled) do
     GenServer.call(url_actor, {:slow_start_header, enabled})
+    :ok
+  end
+
+  defp maybe_propagate_max_backlog(%{url_actor: nil}, _max_backlog), do: :ok
+  defp maybe_propagate_max_backlog(_state, nil), do: :ok
+
+  defp maybe_propagate_max_backlog(%{url_actor: url_actor}, max_backlog) do
+    GenServer.call(url_actor, {:max_backlog_header, max_backlog})
     :ok
   end
 end

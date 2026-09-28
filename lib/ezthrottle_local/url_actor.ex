@@ -17,6 +17,8 @@ defmodule EzthrottleLocal.UrlActor do
   alias EzthrottleLocal.Cluster
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.Pool
+  alias EzthrottleLocal.FairAdmission
+  alias EzthrottleLocal.IdempotentStore
 
   @default_idle_timeout_seconds 300
   @shared_queue_key :shared
@@ -42,7 +44,8 @@ defmodule EzthrottleLocal.UrlActor do
     queues: %{},
     breaker_until_ms: nil,
     breaker_kind: nil,
-    slow_start_enabled: false
+    slow_start_enabled: false,
+    max_backlog: 10_000
   ]
 
   # ---- Public API ----
@@ -142,6 +145,8 @@ defmodule EzthrottleLocal.UrlActor do
     GenServer.call(pid, :queue_active?)
   end
 
+  def queue_snapshot(pid, %Job{} = job), do: GenServer.call(pid, {:queue_snapshot, job})
+
   # ---- GenServer Callbacks ----
 
   @impl true
@@ -154,7 +159,8 @@ defmodule EzthrottleLocal.UrlActor do
       domain: domain,
       pool_pid: pool_pid,
       rps: default_rps,
-      account_queue_enabled: account_queue_enabled
+      account_queue_enabled: account_queue_enabled,
+      max_backlog: FairAdmission.max_pending_per_upstream()
     }
 
     Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, cluster_topic(domain))
@@ -196,7 +202,8 @@ defmodule EzthrottleLocal.UrlActor do
        :account_queue_enabled,
        :breaker_until_ms,
        :breaker_kind,
-       :slow_start_enabled
+       :slow_start_enabled,
+       :max_backlog
      ]), state, idle_timeout_ms()}
   end
 
@@ -255,6 +262,17 @@ defmodule EzthrottleLocal.UrlActor do
   def handle_call(:queue_active?, _from, state) do
     active? = state |> all_queue_pids() |> Enum.any?(&AccountQueue.active?/1)
     {:reply, active?, state, idle_timeout_ms()}
+  end
+
+  @impl true
+  def handle_call({:queue_snapshot, job}, _from, state) do
+    {:reply, queue_snapshot_for_job(state, job), state, idle_timeout_ms()}
+  end
+
+  @impl true
+  def handle_call({:max_backlog_header, max_backlog}, _from, state) do
+    broadcast_cluster_state(state, :max_backlog, max_backlog)
+    {:reply, :ok, %{state | max_backlog: max_backlog}, idle_timeout_ms()}
   end
 
   @impl true
@@ -324,6 +342,10 @@ defmodule EzthrottleLocal.UrlActor do
     {:noreply, %{state | slow_start_enabled: enabled}, idle_timeout_ms()}
   end
 
+  def handle_info({:cluster_url_state, :max_backlog, max_backlog}, state) do
+    {:noreply, %{state | max_backlog: max_backlog}, idle_timeout_ms()}
+  end
+
   def handle_info({:cluster_url_state, :breaker, {until_ms, kind}}, state) do
     {:noreply, %{state | breaker_until_ms: until_ms, breaker_kind: kind}, idle_timeout_ms()}
   end
@@ -355,7 +377,7 @@ defmodule EzthrottleLocal.UrlActor do
 
   @impl true
   def handle_info(:check_aggregate_budget, state) do
-    queue_pids = all_queue_pids(state)
+    queue_pids = Enum.filter(all_queue_pids(state), &safe_queue_active?/1)
 
     # A single active queue (or none) can't exceed an aggregate budget by
     # definition -- nothing to throttle.
@@ -405,10 +427,10 @@ defmodule EzthrottleLocal.UrlActor do
 
     result =
       case action do
-        :submit -> AccountQueue.submit(queue_pid, job)
+        :submit -> prepare_and_admit(queue_pid, job, new_state)
         :submit_internal -> AccountQueue.submit_internal(queue_pid, job)
         :prepare -> AccountQueue.prepare(queue_pid, job)
-        :enqueue_prepared -> AccountQueue.enqueue_prepared(queue_pid, job)
+        :enqueue_prepared -> admit_prepared(queue_pid, job, new_state, :prepared)
         :enqueue -> AccountQueue.enqueue(queue_pid, job)
       end
 
@@ -417,6 +439,101 @@ defmodule EzthrottleLocal.UrlActor do
     if was_empty, do: schedule_budget_check()
 
     {:reply, result, new_state, idle_timeout_ms()}
+  end
+
+  defp prepare_and_admit(queue_pid, job, state) do
+    case AccountQueue.prepare(queue_pid, job) do
+      {:prepared, prepared_job} -> admit_prepared(queue_pid, prepared_job, state, :new)
+      other -> other
+    end
+  end
+
+  defp admit_prepared(queue_pid, job, state, mode) do
+    case fair_admission(state, queue_pid) do
+      {:allowed, _snapshot} ->
+        case AccountQueue.enqueue_prepared(queue_pid, job) do
+          :ok when mode == :new ->
+            {:accepted, job}
+
+          {:rejected, _reason, _limit, _current} = rejected ->
+            IdempotentStore.delete_job(job)
+            rejected
+
+          other ->
+            other
+        end
+
+      {:rejected, reason, snapshot} ->
+        IdempotentStore.delete_job(job)
+        {:rejected, reason, snapshot.max_backlog, snapshot.upstream_backlog - 1}
+    end
+  end
+
+  defp fair_admission(state, queue_pid) do
+    {active_queues, total_pending, queue_pending} = queue_counts(state, queue_pid)
+
+    case FairAdmission.decide(
+           queue_pending,
+           total_pending,
+           active_queues,
+           state.max_backlog
+         ) do
+      {:allowed, snapshot} -> {:allowed, snapshot}
+      {:rejected, reason, snapshot} -> {:rejected, reason, snapshot}
+    end
+  end
+
+  defp queue_snapshot_for_job(state, job) do
+    queue_key = if state.account_queue_enabled, do: Job.queue_key(job), else: @shared_queue_key
+    queue_pid = Cluster.lookup_account_queue(state.domain, queue_key)
+    {active_queues, total_pending, queue_pending} = queue_counts(state, queue_pid, false)
+
+    %{
+      active_queues: active_queues,
+      upstream_backlog: total_pending,
+      queue_backlog: queue_pending,
+      max_backlog: state.max_backlog,
+      admission_pressure: FairAdmission.pressure(total_pending, state.max_backlog)
+    }
+  end
+
+  defp queue_counts(state, queue_pid, include_incoming \\ true) do
+    snapshots =
+      state
+      |> all_queue_pids()
+      |> Enum.uniq()
+      |> Enum.map(fn pid -> {pid, safe_queue_snapshot(pid)} end)
+
+    total_pending = Enum.sum(Enum.map(snapshots, fn {_pid, snapshot} -> snapshot.backlog end))
+    active_queues = Enum.count(snapshots, fn {_pid, snapshot} -> snapshot.active end)
+
+    queue_pending =
+      case Enum.find(snapshots, fn {pid, _snapshot} -> pid == queue_pid end) do
+        nil -> 0
+        {_pid, snapshot} -> snapshot.backlog
+      end
+
+    active_queues =
+      if include_incoming and queue_pending == 0, do: active_queues + 1, else: active_queues
+
+    if state.account_queue_enabled do
+      {max(active_queues, if(include_incoming, do: 1, else: 0)), total_pending, queue_pending}
+    else
+      active = if total_pending > 0 or include_incoming, do: 1, else: 0
+      {active, total_pending, total_pending}
+    end
+  end
+
+  defp safe_queue_snapshot(pid) do
+    AccountQueue.snapshot(pid)
+  catch
+    :exit, _reason -> %{backlog: 0, active: false}
+  end
+
+  defp safe_queue_active?(pid) do
+    AccountQueue.active?(pid)
+  catch
+    :exit, _reason -> false
   end
 
   defp find_or_spawn_queue(queue_key, state) do

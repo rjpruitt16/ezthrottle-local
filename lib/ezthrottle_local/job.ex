@@ -19,6 +19,7 @@ defmodule EzthrottleLocal.Job do
           webhook_url: String.t(),
           status: status(),
           created_at: integer(),
+          execute_before: integer() | nil,
           origin_machine_id: String.t() | nil,
           origin_region: String.t() | nil,
           visited_regions: [String.t()],
@@ -38,6 +39,7 @@ defmodule EzthrottleLocal.Job do
     :webhook_url,
     status: :queued,
     created_at: nil,
+    execute_before: nil,
     origin_machine_id: nil,
     origin_region: nil,
     visited_regions: [],
@@ -58,7 +60,8 @@ defmodule EzthrottleLocal.Job do
          :ok <- require_exactly_one_of_url_or_pool_id(url, pool_id),
          {:ok, method} <- require_field(params, "method"),
          {:ok, webhook_url} <- require_field(params, "webhook_url"),
-         {:ok, idempotent_key} <- require_field(params, "idempotent_key") do
+         {:ok, idempotent_key} <- require_field(params, "idempotent_key"),
+         {:ok, execute_before} <- parse_execute_before(Map.get(params, "execute_before")) do
       {:ok,
        %__MODULE__{
          id: generate_id(),
@@ -72,6 +75,7 @@ defmodule EzthrottleLocal.Job do
          webhook_url: webhook_url,
          status: :queued,
          created_at: System.system_time(:millisecond),
+         execute_before: execute_before,
          origin_machine_id: blank_to_nil(Map.get(params, "origin_machine_id")),
          origin_region: blank_to_nil(Map.get(params, "origin_region")),
          visited_regions: Map.get(params, "visited_regions", []),
@@ -152,6 +156,20 @@ defmodule EzthrottleLocal.Job do
   decide whether to L8-sign the outbound request.
   """
   def webhook_delivery_job?(%__MODULE__{webhook_url: url}), do: url in [nil, ""]
+
+  def execution_expired?(%__MODULE__{execute_before: nil}), do: false
+  def execution_expired?(%__MODULE__{execute_before: 0}), do: false
+
+  def execution_expired?(%__MODULE__{execute_before: execute_before})
+      when is_integer(execute_before),
+      do: System.system_time(:millisecond) >= execute_before
+
+  defp parse_execute_before(nil), do: {:ok, nil}
+  defp parse_execute_before(0), do: {:ok, nil}
+  defp parse_execute_before(value) when is_integer(value) and value > 0, do: {:ok, value}
+
+  defp parse_execute_before(_value),
+    do: {:error, "execute_before must be a positive Unix timestamp in milliseconds"}
 
   defp require_field(params, key) do
     case Map.get(params, key) do

@@ -25,11 +25,14 @@ defmodule EzthrottleLocalWeb.JobController do
 
           {:accepted, accepted_job} ->
             conn
+            |> put_queue_headers(accepted_job)
             |> put_status(:created)
             |> json(%{job_id: accepted_job.id, status: "queued"})
 
           {:rejected, reason, limit, current} ->
-            admission_rejected(conn, reason, limit, current)
+            conn
+            |> put_queue_headers(job)
+            |> admission_rejected(reason, limit, current)
         end
     end
   end
@@ -61,11 +64,16 @@ defmodule EzthrottleLocalWeb.JobController do
       {:fallback, job, reason} ->
         case AccountQueueRegistry.enqueue_prepared(job, account_queue_header(conn)) do
           :ok ->
-            JobStreamController.stream_events(conn, job, reason)
+            conn
+            |> put_queue_headers(job)
+            |> JobStreamController.stream_events(job, reason)
 
           {:rejected, limit_reason, limit, current} ->
             IdempotentStore.delete_job(job)
-            admission_rejected(conn, limit_reason, limit, current)
+
+            conn
+            |> put_queue_headers(job)
+            |> admission_rejected(limit_reason, limit, current)
         end
 
       {:redirected, {:direct, status, headers, body, region}} ->
@@ -128,7 +136,8 @@ defmodule EzthrottleLocalWeb.JobController do
             url: job.url,
             pool_id: job.pool_id,
             method: job.method,
-            created_at: job.created_at
+            created_at: job.created_at,
+            execute_before: job.execute_before
           }
           |> maybe_put_result(result)
 
@@ -154,11 +163,26 @@ defmodule EzthrottleLocalWeb.JobController do
     |> put_resp_header("retry-after", to_string(retry_after))
     |> put_status(429)
     |> json(%{
-      error: "admission rejected: #{reason} at #{current} exceeds limit #{limit}",
+      error: "admission rejected: #{reason} (current #{current}, limit #{limit})",
       limit_reason: reason,
       limit: limit,
       current: current
     })
+  end
+
+  defp put_queue_headers(conn, job) do
+    snapshot = AccountQueueRegistry.queue_snapshot(job)
+    pressure = :erlang.float_to_binary(snapshot.admission_pressure * 1.0, decimals: 3)
+
+    conn
+    |> put_resp_header("x-aqueduct-active-queues", to_string(snapshot.active_queues))
+    |> put_resp_header("x-aqueduct-upstream-backlog", to_string(snapshot.upstream_backlog))
+    |> put_resp_header("x-aqueduct-queue-backlog", to_string(snapshot.queue_backlog))
+    |> put_resp_header("x-aqueduct-admission-pressure", pressure)
+    |> put_resp_header("x-ezthrottle-active-queues", to_string(snapshot.active_queues))
+    |> put_resp_header("x-ezthrottle-upstream-backlog", to_string(snapshot.upstream_backlog))
+    |> put_resp_header("x-ezthrottle-queue-backlog", to_string(snapshot.queue_backlog))
+    |> put_resp_header("x-ezthrottle-admission-pressure", pressure)
   end
 
   # Reads X-Aqueduct-Account-Queue first, falling back to

@@ -12,6 +12,8 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   alias EzthrottleLocal.PoolRegistry
   alias EzthrottleLocal.DrainFlush
   alias EzthrottleLocal.Jitter
+  alias EzthrottleLocal.AccountQueue
+  alias EzthrottleLocal.Cluster
 
   @default_table :url_actors
   @idle_check_interval_ms 5_000
@@ -142,9 +144,36 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     UrlActor.queue_active?(actor_for(job))
   end
 
+  def queue_snapshot(%Job{} = job) do
+    UrlActor.queue_snapshot(actor_for(job), job)
+  end
+
+  def node_queue_snapshot do
+    snapshots =
+      Cluster.all_account_queues()
+      |> Enum.uniq()
+      |> Enum.filter(&(node(&1) == node()))
+      |> Enum.map(fn pid ->
+        try do
+          AccountQueue.snapshot(pid)
+        catch
+          :exit, _reason -> %{backlog: 0, active: false}
+        end
+      end)
+
+    %{
+      active: Enum.count(snapshots, & &1.active),
+      backlog: Enum.sum(Enum.map(snapshots, & &1.backlog))
+    }
+  end
+
   @doc "See UrlActor.trip_breaker/3 -- resolves the actor for this job first."
   def trip_breaker(%Job{} = job, cooldown_ms, kind) do
     UrlActor.trip_breaker(actor_for(job), cooldown_ms, kind)
+  end
+
+  def update_max_backlog(%Job{} = job, max_backlog) do
+    GenServer.call(actor_for(job), {:max_backlog_header, max_backlog})
   end
 
   # ---- GenServer Callbacks ----

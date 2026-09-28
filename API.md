@@ -13,9 +13,12 @@ Content-Type: application/json
   "method": "POST",
   "headers": { "Authorization": "Bearer sk-..." },
   "body": "{\"input\": \"data\"}",
-  "webhook_url": "https://yourapp.com/webhooks/results"
+  "webhook_url": "https://yourapp.com/webhooks/results",
+  "execute_before": 1798761600000
 }
 ```
+
+`execute_before` is optional Unix time in milliseconds. EZThrottle checks it immediately before dispatch and before every retry. Work that has not started its next attempt by that time is never sent upstream; it becomes `failed` with reason `execution_deadline_exceeded`, remains pollable through the normal failed-result retention window, and emits the normal failed SSE/webhook event.
 
 **Response headers your API can return to control pacing:**
 
@@ -25,8 +28,24 @@ Content-Type: application/json
 | `X-EZTHROTTLE-MAX-CONCURRENT: 5` | Change max in-flight requests |
 | `X-EZTHROTTLE-ACCOUNT-QUEUE: enabled` | Switch to per-tenant queue isolation |
 | `X-EZTHROTTLE-SLOW-START: true` | New queues ramp up instead of firing at full rate immediately |
+| `X-EZTHROTTLE-MAX-BACKLOG: 10000` | Set the shared backlog budget used by fair admission |
 
 With `X-EZTHROTTLE-SLOW-START: true` (or `X-Aqueduct-Slow-Start`), a new queue starts at a low floor rate and climbs toward its configured ceiling using the same gradual-recovery pacing that already brings a throttled queue back up, rather than firing at full speed on its very first dispatch. Applies per domain: a queue's first-ever dispatch has no prior response to read the signal from, so this takes effect on the *next* new queue created for that domain once any response has carried it — not the request that carried the header, and not retroactively for queues already running.
+
+### Fair queue admission
+
+Each upstream has a shared backlog budget `B`, defaulting to `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM=10000`. The upstream may update it with `X-Aqueduct-Max-Backlog` (or `X-EZThrottle-Max-Backlog`); `0` disables this count-based limit. For a prospective request in AccountQueue mode, let `q` be its queue's projected backlog, `Q` the projected upstream backlog, and `N` the projected number of active account queues:
+
+```text
+F        = B / N
+pressure = clamp((Q - 0.70B) / 0.30B, 0, 1)
+excess   = clamp((q - F) / (B - F), 0, 1)
+P(429)   = pressure * excess
+```
+
+A lone queue may use the whole budget. Below 70% pressure, idle capacity remains freely borrowable. Under congestion, above-share queues receive progressively more `429` responses while queues at or below `F` continue entering. If admission would put `Q` above `B`, it is rejected deterministically. Shared-queue mode uses `N=1`, so only the shared ceiling applies. Duplicate requests, recovered jobs, and internal webhook deliveries bypass fair admission; already-accepted work is never removed.
+
+Accepted and fairness-rejected responses expose `X-Aqueduct-Active-Queues`, `X-Aqueduct-Upstream-Backlog`, `X-Aqueduct-Queue-Backlog`, and `X-Aqueduct-Admission-Pressure`, with `X-EZThrottle-*` aliases. Outbound dispatches include the active-queue and upstream-backlog values alongside the existing load headers. `GET /health` reports node-local totals under `queues`; Syn-connected siblings are used for an upstream's admission decision but are not mislabeled as local health state.
 
 ### Region-local queue ownership
 
@@ -40,6 +59,7 @@ This coordinates live processes; it does not turn each node's Mnesia directory i
 | `EZTHROTTLE_CLUSTER_NODE_BASENAME` | release node basename | Overrides the basename libcluster uses for discovered node names |
 | `EZTHROTTLE_CLUSTER_POLL_INTERVAL_MS` | `5000` | DNS discovery interval |
 | `EZTHROTTLE_MAX_PENDING_PER_USER` | `10000` | Maximum queued plus in-flight jobs for one user in an account queue; `0` disables the ceiling |
+| `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
 
 The per-user ceiling rejects only new client work with `429` and `limit_reason: "user_queue"`; duplicates are still returned normally. Internal webhook deliveries and startup recovery bypass it so admission pressure cannot discard already-accepted work.
 

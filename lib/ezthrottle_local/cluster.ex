@@ -45,12 +45,19 @@ defmodule EzthrottleLocal.Cluster do
   end
 
   def join_upstream(upstream, pid) do
-    :syn.join(@account_queue_scope, {:upstream, upstream}, pid)
+    :ok = :syn.join(@account_queue_scope, {:upstream, upstream}, pid)
+    :syn.join(@account_queue_scope, :all_account_queues, pid)
   end
 
   def account_queues_for_upstream(upstream) do
     @account_queue_scope
     |> :syn.members({:upstream, upstream})
+    |> Enum.map(fn {pid, _metadata} -> pid end)
+  end
+
+  def all_account_queues do
+    @account_queue_scope
+    |> :syn.members(:all_account_queues)
     |> Enum.map(fn {pid, _metadata} -> pid end)
   end
 
