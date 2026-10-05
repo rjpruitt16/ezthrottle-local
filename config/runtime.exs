@@ -31,6 +31,10 @@ if rps = System.get_env("EZTHROTTLE_DEFAULT_RPS") do
   end
 end
 
+if query = System.get_env("DNS_CLUSTER_QUERY") do
+  config :ezthrottle_local, :dns_cluster_query, query
+end
+
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
@@ -47,7 +51,6 @@ if config_env() == :prod do
   host = System.get_env("PHX_HOST") || "example.com"
   port = String.to_integer(System.get_env("PORT") || "4000")
 
-  config :ezthrottle_local, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
   config :ezthrottle_local, :mnesia_dir, System.get_env("MNESIA_DIR", "/data/mnesia")
 
   config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,

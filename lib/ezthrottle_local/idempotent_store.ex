@@ -24,6 +24,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   require Logger
 
   alias EzthrottleLocal.Job
+  alias EzthrottleLocal.Cluster
 
   @keys_table :idempotent_keys
   @jobs_table :jobs
@@ -143,6 +144,11 @@ defmodule EzthrottleLocal.IdempotentStore do
     # loss to that interval without paying the cost per request.
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
 
+    case result do
+      :ok -> register_job_owner(job.id)
+      {:duplicate, existing_id} -> register_job_owner(existing_id)
+    end
+
     result
   end
 
@@ -156,6 +162,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   that doesn't really exist.
   """
   def delete_job(%Job{} = job) do
+    route_job(job.id, {:delete_job, job}, fn -> delete_job_local(job) end)
+  end
+
+  defp delete_job_local(%Job{} = job) do
     hashed = hash_key(job)
 
     :mnesia.sync_transaction(fn ->
@@ -165,6 +175,7 @@ defmodule EzthrottleLocal.IdempotentStore do
     end)
 
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
+    unregister_job_owner(job.id)
 
     :ok
   end
@@ -173,6 +184,12 @@ defmodule EzthrottleLocal.IdempotentStore do
   Update the status of a job by job_id in both tables.
   """
   def update_status(job_id, status) do
+    route_job(job_id, {:update_status, job_id, status}, fn ->
+      update_status_local(job_id, status)
+    end)
+  end
+
+  defp update_status_local(job_id, status) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
       [{@jobs_table, ^job_id, job, _expires_at, _old_status}] ->
         new_expires = System.system_time(:millisecond) + ttl_ms(status)
@@ -201,6 +218,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   Get the status of a job by job_id. Returns status string or nil.
   """
   def get_status(job_id) do
+    route_job(job_id, {:get_status, job_id}, fn -> get_status_local(job_id) end)
+  end
+
+  defp get_status_local(job_id) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
       [{@jobs_table, ^job_id, _job, _expires_at, status}] -> to_string(status)
       [] -> nil
@@ -212,6 +233,12 @@ defmodule EzthrottleLocal.IdempotentStore do
   the same shape delivered over SSE/webhook, minus the SSE-only event name.
   """
   def put_result(job_id, result, status) when status in [:completed, :failed] do
+    route_job(job_id, {:put_result, job_id, result, status}, fn ->
+      put_result_local(job_id, result, status)
+    end)
+  end
+
+  defp put_result_local(job_id, result, status) do
     expires_at = System.system_time(:millisecond) + ttl_ms(status)
     :mnesia.dirty_write({@results_table, job_id, normalize_result(result), expires_at})
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
@@ -223,6 +250,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   not completed/failed yet or the result has expired.
   """
   def get_result(job_id) do
+    route_job(job_id, {:get_result, job_id}, fn -> get_result_local(job_id) end)
+  end
+
+  defp get_result_local(job_id) do
     now = System.system_time(:millisecond)
 
     case :mnesia.dirty_read(@results_table, job_id) do
@@ -257,6 +288,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   Get the full Job struct by job_id. Returns the Job or nil.
   """
   def get_job(job_id) do
+    route_job(job_id, {:get_job, job_id}, fn -> get_job_local(job_id) end)
+  end
+
+  defp get_job_local(job_id) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
       [{@jobs_table, ^job_id, job, _expires_at, _status}] -> job
       [] -> nil
@@ -373,12 +408,14 @@ defmodule EzthrottleLocal.IdempotentStore do
   ledger and job tables, so a handoff doesn't leave orphaned rows behind.
   """
   def clear_ledger do
+    job_ids = local_job_ids()
     :mnesia.clear_table(@keys_table)
     :mnesia.clear_table(@jobs_table)
     :mnesia.clear_table(@results_table)
     :mnesia.clear_table(@delivery_table)
     :mnesia.clear_table(@drain_events_table)
     :mnesia.clear_table(@drain_sequence_table)
+    Enum.each(job_ids, &unregister_job_owner/1)
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
     :ok
   end
@@ -387,6 +424,12 @@ defmodule EzthrottleLocal.IdempotentStore do
   Set delivery mode for a job. :webhook (default), :stream, :stream_fallback.
   """
   def set_delivery_mode(job_id, mode) do
+    route_job(job_id, {:set_delivery_mode, job_id, mode}, fn ->
+      set_delivery_mode_local(job_id, mode)
+    end)
+  end
+
+  defp set_delivery_mode_local(job_id, mode) do
     :mnesia.dirty_write({@delivery_table, job_id, mode})
     :ok
   end
@@ -395,6 +438,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   Get delivery mode for a job. Returns :webhook if not set.
   """
   def get_delivery_mode(job_id) do
+    route_job(job_id, {:get_delivery_mode, job_id}, fn -> get_delivery_mode_local(job_id) end)
+  end
+
+  defp get_delivery_mode_local(job_id) do
     case :mnesia.dirty_read(@delivery_table, job_id) do
       [{@delivery_table, ^job_id, mode}] -> mode
       [] -> :webhook
@@ -405,10 +452,44 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   @impl true
   def init(_) do
+    register_existing_job_owners()
     schedule_cleanup()
     schedule_flush()
     {:ok, %{}}
   end
+
+  @impl true
+  def handle_call({:register_job_owner, job_id}, _from, state) do
+    {:reply, register_job_owner_local(job_id), state}
+  end
+
+  def handle_call({:unregister_job_owner, job_id}, _from, state) do
+    {:reply, unregister_job_owner_local(job_id), state}
+  end
+
+  def handle_call({:job_store, {:delete_job, job}}, _from, state),
+    do: {:reply, delete_job_local(job), state}
+
+  def handle_call({:job_store, {:update_status, job_id, status}}, _from, state),
+    do: {:reply, update_status_local(job_id, status), state}
+
+  def handle_call({:job_store, {:get_status, job_id}}, _from, state),
+    do: {:reply, get_status_local(job_id), state}
+
+  def handle_call({:job_store, {:put_result, job_id, result, status}}, _from, state),
+    do: {:reply, put_result_local(job_id, result, status), state}
+
+  def handle_call({:job_store, {:get_result, job_id}}, _from, state),
+    do: {:reply, get_result_local(job_id), state}
+
+  def handle_call({:job_store, {:get_job, job_id}}, _from, state),
+    do: {:reply, get_job_local(job_id), state}
+
+  def handle_call({:job_store, {:set_delivery_mode, job_id, mode}}, _from, state),
+    do: {:reply, set_delivery_mode_local(job_id, mode), state}
+
+  def handle_call({:job_store, {:get_delivery_mode, job_id}}, _from, state),
+    do: {:reply, get_delivery_mode_local(job_id), state}
 
   @impl true
   def handle_info(:cleanup, state) do
@@ -417,7 +498,13 @@ defmodule EzthrottleLocal.IdempotentStore do
     result_spec = [{{:_, :_, :_, :"$1"}, [{:<, :"$1", now}], [:"$_"]}]
 
     delete_matching(@keys_table, key_and_job_spec)
-    delete_matching(@jobs_table, key_and_job_spec)
+
+    @jobs_table
+    |> delete_matching(key_and_job_spec)
+    |> Enum.each(fn {@jobs_table, job_id, _job, _expires_at, _status} ->
+      unregister_job_owner_local(job_id)
+    end)
+
     delete_matching(@results_table, result_spec)
 
     schedule_cleanup()
@@ -460,6 +547,64 @@ defmodule EzthrottleLocal.IdempotentStore do
     :mnesia.transaction(fn ->
       Enum.each(rows, fn row -> :mnesia.delete_object(row) end)
     end)
+
+    rows
+  end
+
+  defp route_job(job_id, message, local_fun) do
+    local_store = Process.whereis(__MODULE__)
+
+    case Cluster.lookup_job_store(job_id) do
+      nil ->
+        local_fun.()
+
+      ^local_store ->
+        local_fun.()
+
+      owner ->
+        GenServer.call(owner, {:job_store, message}, 15_000)
+    end
+  catch
+    :exit, _reason -> local_fun.()
+  end
+
+  defp register_job_owner(job_id) do
+    case Process.whereis(__MODULE__) do
+      pid when pid == self() -> register_job_owner_local(job_id)
+      _pid -> GenServer.call(__MODULE__, {:register_job_owner, job_id})
+    end
+  end
+
+  defp unregister_job_owner(job_id) do
+    case Process.whereis(__MODULE__) do
+      pid when pid == self() -> unregister_job_owner_local(job_id)
+      _pid -> GenServer.call(__MODULE__, {:unregister_job_owner, job_id})
+    end
+  end
+
+  defp register_job_owner_local(job_id) do
+    case :syn.register(Cluster.job_store_scope(), job_id, self()) do
+      :ok -> :ok
+      {:error, :taken} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp unregister_job_owner_local(job_id) do
+    case Cluster.lookup_job_store(job_id) do
+      pid when pid == self() -> :syn.unregister(Cluster.job_store_scope(), job_id)
+      _ -> :ok
+    end
+  end
+
+  defp register_existing_job_owners do
+    Enum.each(local_job_ids(), &register_job_owner_local/1)
+  end
+
+  defp local_job_ids do
+    :mnesia.dirty_select(@jobs_table, [
+      {{@jobs_table, :"$1", :_, :_, :_}, [], [:"$1"]}
+    ])
   end
 
   # ---- Private ----

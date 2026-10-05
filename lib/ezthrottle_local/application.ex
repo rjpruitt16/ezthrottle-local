@@ -12,12 +12,19 @@ defmodule EzthrottleLocal.Application do
     configure_httpc_ipfamily()
     configure_mnesia_dir()
     EzthrottleLocal.IdempotentStore.ensure_schema!()
+    EzthrottleLocal.WebSocketStore.ensure_tables!()
+    websocket_config = EzthrottleLocal.WebSocketConfig.load()
 
     children =
       [
         EzthrottleLocalWeb.Telemetry,
-        {DNSCluster, query: Application.get_env(:ezthrottle_local, :dns_cluster_query) || :ignore},
+        {Cluster.Supervisor,
+         [EzthrottleLocal.Cluster.topologies(), [name: EzthrottleLocal.ClusterSupervisor]]},
         {Phoenix.PubSub, name: EzthrottleLocal.PubSub},
+        {EzthrottleLocal.WebSocketStore, websocket_config},
+        {EzthrottleLocal.WebSocketQueue, websocket_config},
+        {Registry, keys: :unique, name: EzthrottleLocal.WebSocketSessionRegistry},
+        EzthrottleLocal.WebSocketSessionSupervisor,
         EzthrottleLocal.L8,
         EzthrottleLocal.Admission,
         EzthrottleLocal.IdempotentStore,

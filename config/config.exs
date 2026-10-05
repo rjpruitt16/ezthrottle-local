@@ -11,6 +11,9 @@ config :ezthrottle_local,
   generators: [timestamp_type: :utc_datetime],
   metrics_adapter: EzthrottleLocal.Metrics.Noop
 
+config :syn,
+  scopes: [:ezthrottle_account_queues, :ezthrottle_job_stores]
+
 # Configures the endpoint
 config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
   url: [host: "localhost"],

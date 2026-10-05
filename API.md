@@ -13,9 +13,12 @@ Content-Type: application/json
   "method": "POST",
   "headers": { "Authorization": "Bearer sk-..." },
   "body": "{\"input\": \"data\"}",
-  "webhook_url": "https://yourapp.com/webhooks/results"
+  "webhook_url": "https://yourapp.com/webhooks/results",
+  "execute_before": 1798761600000
 }
 ```
+
+`execute_before` is optional Unix time in milliseconds. EZThrottle checks it immediately before dispatch and before every retry. Work that has not started its next attempt by that time is never sent upstream; it becomes `failed` with reason `execution_deadline_exceeded`, remains pollable through the normal failed-result retention window, and emits the normal failed SSE/webhook event.
 
 **Response headers your API can return to control pacing:**
 
@@ -25,8 +28,40 @@ Content-Type: application/json
 | `X-EZTHROTTLE-MAX-CONCURRENT: 5` | Change max in-flight requests |
 | `X-EZTHROTTLE-ACCOUNT-QUEUE: enabled` | Switch to per-tenant queue isolation |
 | `X-EZTHROTTLE-SLOW-START: true` | New queues ramp up instead of firing at full rate immediately |
+| `X-EZTHROTTLE-MAX-BACKLOG: 10000` | Set the shared backlog budget used by fair admission |
 
 With `X-EZTHROTTLE-SLOW-START: true` (or `X-Aqueduct-Slow-Start`), a new queue starts at a low floor rate and climbs toward its configured ceiling using the same gradual-recovery pacing that already brings a throttled queue back up, rather than firing at full speed on its very first dispatch. Applies per domain: a queue's first-ever dispatch has no prior response to read the signal from, so this takes effect on the *next* new queue created for that domain once any response has carried it — not the request that carried the header, and not retroactively for queues already running.
+
+### Fair queue admission
+
+Each upstream has a shared backlog budget `B`, defaulting to `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM=10000`. The upstream may update it with `X-Aqueduct-Max-Backlog` (or `X-EZThrottle-Max-Backlog`); `0` disables this count-based limit. For a prospective request in AccountQueue mode, let `q` be its queue's projected backlog, `Q` the projected upstream backlog, and `N` the projected number of active account queues:
+
+```text
+F        = B / N
+pressure = clamp((Q - 0.70B) / 0.30B, 0, 1)
+excess   = clamp((q - F) / (B - F), 0, 1)
+P(429)   = pressure * excess
+```
+
+A lone queue may use the whole budget. Below 70% pressure, idle capacity remains freely borrowable. Under congestion, above-share queues receive progressively more `429` responses while queues at or below `F` continue entering. If admission would put `Q` above `B`, it is rejected deterministically. Shared-queue mode uses `N=1`, so only the shared ceiling applies. Duplicate requests, recovered jobs, and internal webhook deliveries bypass fair admission; already-accepted work is never removed.
+
+Accepted and fairness-rejected responses expose `X-Aqueduct-Active-Queues`, `X-Aqueduct-Upstream-Backlog`, `X-Aqueduct-Queue-Backlog`, and `X-Aqueduct-Admission-Pressure`, with `X-EZThrottle-*` aliases. Outbound dispatches include the active-queue and upstream-backlog values alongside the existing load headers. `GET /health` reports node-local totals under `queues`; Syn-connected siblings are used for an upstream's admission decision but are not mislabeled as local health state.
+
+### Region-local queue ownership
+
+EZThrottle Local uses libcluster for optional BEAM discovery and Syn for queue ownership. When `DNS_CLUSTER_QUERY` is set, connected nodes agree on one `AccountQueue` owner for each upstream and queue key; a request received by any node is routed to that owner before idempotency admission, persistence, and enqueueing. Pacing state and circuit-breaker changes are propagated between the upstream's URL actors. Without `DNS_CLUSTER_QUERY`, the same code path runs as a standalone one-node cluster.
+
+This coordinates live processes; it does not turn each node's Mnesia directory into a replicated database. While the owning node is connected, job status and result calls route back to its local store. If that node is unavailable, its persisted jobs become available when it returns and performs normal recovery. Configure Mnesia replication separately if the deployment requires another node to serve that data during the owner's outage. Mnesia also binds its on-disk schema to the Erlang node name, so every clustered machine must retain the same node name when reusing its volume.
+
+| Environment variable | Default | Effect |
+|---|---:|---|
+| `DNS_CLUSTER_QUERY` | unset | Enables libcluster DNS polling; all nodes must share their distribution cookie and node-name basename. Fly deployments remain stable singletons unless this is explicitly set |
+| `EZTHROTTLE_CLUSTER_NODE_BASENAME` | release node basename | Overrides the basename libcluster uses for discovered node names |
+| `EZTHROTTLE_CLUSTER_POLL_INTERVAL_MS` | `5000` | DNS discovery interval |
+| `EZTHROTTLE_MAX_PENDING_PER_USER` | `10000` | Maximum queued plus in-flight jobs for one user in an account queue; `0` disables the ceiling |
+| `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
+
+The per-user ceiling rejects only new client work with `429` and `limit_reason: "user_queue"`; duplicates are still returned normally. Internal webhook deliveries and startup recovery bypass it so admission pressure cannot discard already-accepted work.
 
 ## POST /proxy
 
@@ -74,6 +109,83 @@ A reroute is never silent to the caller — same principle as `proxy_fallback` a
 If literally no known-live region can help either — none live at all, or every one tried and failed — the request is **rejected**, not queued locally: **429**, `Retry-After` set to `EZTHROTTLE_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` (default 900 — a real regional outage, not a transient blip), `limit_reason: "redirect_exhausted"`, same response shape as an admission-control rejection. Queueing locally instead was never actually decided, so the default is to fail loudly rather than have the request land unnoticed on one struggling instance's queue. Separate from `EZTHROTTLE_REDIRECT_GATE_COOLDOWN_SECONDS` (default 500) — that one is purely internal probe-retry throttling, not what's told to the caller.
 
 **Honest limitation, not silently glossed over:** this instance's idempotency check remains per-instance (Mnesia), unchanged by this feature. If the exact same `idempotent_key` is independently submitted to two different regions at nearly the same moment (a real scenario — a caller's own client retrying after a timeout can land on a different region via Fly's anycast), each region may independently begin its own redirect tour, and in rare cases the job could end up durably queued in two places. The deterministic region selection above narrows this window but does not close it. During cross-region redirect specifically, treat delivery as at-least-once, not exactly-once.
+
+## GET /websocket
+
+WebSocket proxying with an ordered Mnesia transcript, cursor replay, paced upstream connection admission, and automatic reconnect. This is the same `aqueduct.v1` wire contract Aquifer exposes. EZThrottle Local does **not** authenticate callers or choose their destination; put it behind a trusted gateway that authenticates the request and injects the upstream URL.
+
+WebSockets are enabled by default because Mnesia is already part of EZThrottle Local. `EZTHROTTLE_WS_ENABLED=false` is an operational kill switch.
+
+### Handshake
+
+```http
+GET /websocket?session_id=session-123&after=0-0 HTTP/1.1
+Connection: Upgrade
+Upgrade: websocket
+Sec-WebSocket-Protocol: aqueduct.v1
+Authorization: Bearer gateway-authenticated-identity
+X-Aqueduct-Upstream-URL: wss://backend.internal/socket
+```
+
+`session_id` identifies the durable transcript. `after` is the last stream ID the client processed and defaults to `0-0`. EZThrottle replays backend messages after that cursor before following live events. A cursor older than retained history returns **409** instead of silently skipping data.
+
+The trusted upstream URL must be absolute `ws://` or `wss://`. When `EZTHROTTLE_ALLOWED_URL_DOMAINS` is set, its comma-separated hosts are enforced as an allowlist. Gateway headers such as `Authorization` are forwarded; hop-by-hop and internal Aqueduct/Aquifer headers are stripped, and `X-Aqueduct-Session-ID` is injected upstream.
+
+### Messages
+
+Every application message is a JSON `aqueduct.v1` envelope. Raw frames are not supported.
+
+```json
+{"type":"command","message_id":"command-42","payload":{"action":"start"}}
+```
+
+The client must keep `message_id` stable across retries. EZThrottle persists the command before forwarding it and confirms that write:
+
+```json
+{"type":"command_recorded","message_id":"command-42","stream_id":"1798053731000-1"}
+```
+
+Backend acknowledgements and events use the same shapes as Aquifer:
+
+```json
+{"type":"ack","message_id":"ack-42","caused_by":"command-42"}
+{"type":"event","message_id":"event-43","caused_by":"command-42","payload":{"state":"running"}}
+```
+
+Every backend `ack` or `event` is persisted before client delivery. `caused_by` permits one command to produce zero, one, or many events. Delivery after cursor reconnect is at least once. After an ambiguous upstream disconnect, persisted commands are not automatically replayed because EZThrottle cannot know whether the backend acted before the socket disappeared; backend actions must be idempotent by `message_id`.
+
+Live, non-durable status envelopes report `replaying`, `replay_complete`, `waiting`, `connecting`, `connected`, and `reconnecting`. Waiting messages include the current FIFO `position`; reconnecting messages include `retry_after_ms`.
+
+### Capacity and retention
+
+Connection ceilings and slow start are local to one EZThrottle process. A backend can lower this process's ceiling or opening rate through successful-handshake headers:
+
+```http
+X-Aqueduct-WS-Max-Connections: 250
+X-Aqueduct-WS-Connect-Rps: 20
+```
+
+It may update either limit on an established connection using `{"type":"aqueduct.capacity","max_connections":250,"connect_rps":20}`. Dynamic signals can only lower operator ceilings. Successful handshakes double the slow-start ramp toward its configured maximum; a failed handshake resets it. Opening and reconnect delays include jitter.
+
+Transcripts retain the newest configured events and expire after an idle TTL. Mnesia uses the same `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
+
+| Environment variable | Default |
+|---|---:|
+| `EZTHROTTLE_WS_ENABLED` | `true` |
+| `EZTHROTTLE_WS_STREAM_MAX_EVENTS` | `10000` |
+| `EZTHROTTLE_WS_STREAM_TTL_SECONDS` | `86400` |
+| `EZTHROTTLE_WS_READ_BATCH` | `100` |
+| `EZTHROTTLE_WS_MAX_MESSAGE_BYTES` | `1048576` |
+| `EZTHROTTLE_WS_HANDSHAKE_TIMEOUT_SECONDS` | `10` |
+| `EZTHROTTLE_WS_RECONNECT_MAX_SECONDS` | `30` |
+| `EZTHROTTLE_WS_IDLE_TIMEOUT_SECONDS` | `30` |
+| `EZTHROTTLE_WS_MAX_CLIENT_CONNECTIONS` | `1000` |
+| `EZTHROTTLE_WS_MAX_UPSTREAM_CONNECTIONS` | `1000` |
+| `EZTHROTTLE_WS_MAX_WAITING_CONNECTIONS` | `1000` |
+| `EZTHROTTLE_WS_CONNECT_RPS` | `20` |
+| `EZTHROTTLE_WS_SLOW_START_RPS` | `1` |
+
+Handshake errors match Aquifer: **400** for invalid protocol/session/upstream input, **409** for a replay gap, and **429** for the local client ceiling. `GET /health` exposes the local client, waiting, active-upstream, configured, ramp, and effective limits under `websocket`.
 
 ## Stream job events (SSE)
 

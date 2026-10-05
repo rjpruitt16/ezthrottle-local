@@ -293,6 +293,7 @@ defmodule EzthrottleLocal.Redirect do
         headers: hop_job.headers,
         body: hop_job.body,
         webhook_url: hop_job.webhook_url,
+        execute_before: hop_job.execute_before,
         origin_machine_id: hop_job.origin_machine_id,
         origin_region: hop_job.origin_region,
         visited_regions: hop_job.visited_regions,

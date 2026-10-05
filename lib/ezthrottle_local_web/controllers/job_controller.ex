@@ -3,7 +3,6 @@ defmodule EzthrottleLocalWeb.JobController do
 
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.IdempotentStore
-  alias EzthrottleLocal.Metrics
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.Admission
   alias EzthrottleLocal.Proxy
@@ -18,43 +17,22 @@ defmodule EzthrottleLocalWeb.JobController do
         |> json(%{error: reason})
 
       {:ok, job} ->
-        case IdempotentStore.check_or_insert(job) do
+        case AccountQueueRegistry.submit(job, account_queue_header(conn)) do
           {:duplicate, existing_id} ->
-            # Idempotency check comes first: a retried job that already
-            # exists must still succeed even while the system is over an
-            # admission limit.
             conn
             |> put_status(:ok)
             |> json(duplicate_response(existing_id))
 
-          :ok ->
-            # check_or_insert already wrote this job's rows since it
-            # wasn't a duplicate. If admission rejects it now, those rows
-            # must be deleted or they become a ghost "queued" entry that
-            # never dispatches.
-            case Admission.check() do
-              :ok ->
-                Metrics.job_queued(job.user_id, Metrics.upstream(job.url))
-                AccountQueueRegistry.enqueue(job, account_queue_header(conn))
+          {:accepted, accepted_job} ->
+            conn
+            |> put_queue_headers(accepted_job)
+            |> put_status(:created)
+            |> json(%{job_id: accepted_job.id, status: "queued"})
 
-                conn
-                |> put_status(:created)
-                |> json(%{job_id: job.id, status: "queued"})
-
-              {:rejected, reason, limit, current} ->
-                IdempotentStore.delete_job(job)
-                retry_after = Admission.retry_after_seconds()
-
-                conn
-                |> put_resp_header("retry-after", to_string(retry_after))
-                |> put_status(429)
-                |> json(%{
-                  error: "admission rejected: #{reason} at #{current} exceeds limit #{limit}",
-                  limit_reason: reason,
-                  limit: limit,
-                  current: current
-                })
-            end
+          {:rejected, reason, limit, current} ->
+            conn
+            |> put_queue_headers(job)
+            |> admission_rejected(reason, limit, current)
         end
     end
   end
@@ -74,17 +52,7 @@ defmodule EzthrottleLocalWeb.JobController do
         |> json(%{error: reason})
 
       {:admission_rejected, reason, limit, current} ->
-        retry_after = Admission.retry_after_seconds()
-
-        conn
-        |> put_resp_header("retry-after", to_string(retry_after))
-        |> put_status(429)
-        |> json(%{
-          error: "admission rejected: #{reason} at #{current} exceeds limit #{limit}",
-          limit_reason: reason,
-          limit: limit,
-          current: current
-        })
+        admission_rejected(conn, reason, limit, current)
 
       {:duplicate, existing_job} ->
         stream_or_status_for_duplicate(conn, existing_job)
@@ -94,8 +62,19 @@ defmodule EzthrottleLocalWeb.JobController do
         send_resp(conn, response.status, response.body)
 
       {:fallback, job, reason} ->
-        AccountQueueRegistry.enqueue(job, account_queue_header(conn))
-        JobStreamController.stream_events(conn, job, reason)
+        case AccountQueueRegistry.enqueue_prepared(job, account_queue_header(conn)) do
+          :ok ->
+            conn
+            |> put_queue_headers(job)
+            |> JobStreamController.stream_events(job, reason)
+
+          {:rejected, limit_reason, limit, current} ->
+            IdempotentStore.delete_job(job)
+
+            conn
+            |> put_queue_headers(job)
+            |> admission_rejected(limit_reason, limit, current)
+        end
 
       {:redirected, {:direct, status, headers, body, region}} ->
         conn =
@@ -157,7 +136,8 @@ defmodule EzthrottleLocalWeb.JobController do
             url: job.url,
             pool_id: job.pool_id,
             method: job.method,
-            created_at: job.created_at
+            created_at: job.created_at,
+            execute_before: job.execute_before
           }
           |> maybe_put_result(result)
 
@@ -175,6 +155,35 @@ defmodule EzthrottleLocalWeb.JobController do
 
   defp maybe_put_result(payload, nil), do: payload
   defp maybe_put_result(payload, result), do: Map.put(payload, :result, result)
+
+  defp admission_rejected(conn, reason, limit, current) do
+    retry_after = Admission.retry_after_seconds()
+
+    conn
+    |> put_resp_header("retry-after", to_string(retry_after))
+    |> put_status(429)
+    |> json(%{
+      error: "admission rejected: #{reason} (current #{current}, limit #{limit})",
+      limit_reason: reason,
+      limit: limit,
+      current: current
+    })
+  end
+
+  defp put_queue_headers(conn, job) do
+    snapshot = AccountQueueRegistry.queue_snapshot(job)
+    pressure = :erlang.float_to_binary(snapshot.admission_pressure * 1.0, decimals: 3)
+
+    conn
+    |> put_resp_header("x-aqueduct-active-queues", to_string(snapshot.active_queues))
+    |> put_resp_header("x-aqueduct-upstream-backlog", to_string(snapshot.upstream_backlog))
+    |> put_resp_header("x-aqueduct-queue-backlog", to_string(snapshot.queue_backlog))
+    |> put_resp_header("x-aqueduct-admission-pressure", pressure)
+    |> put_resp_header("x-ezthrottle-active-queues", to_string(snapshot.active_queues))
+    |> put_resp_header("x-ezthrottle-upstream-backlog", to_string(snapshot.upstream_backlog))
+    |> put_resp_header("x-ezthrottle-queue-backlog", to_string(snapshot.queue_backlog))
+    |> put_resp_header("x-ezthrottle-admission-pressure", pressure)
+  end
 
   # Reads X-Aqueduct-Account-Queue first, falling back to
   # X-EZThrottle-Account-Queue — this is the client-facing request-header

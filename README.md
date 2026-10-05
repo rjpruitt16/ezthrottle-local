@@ -104,6 +104,8 @@ X-Aqueduct-Account-Queue: enabled
 
 Either way, EZThrottle switches to per-user isolation: each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else.
 
+Above 70% of the shared upstream backlog budget, queues holding more than their current fair share receive progressively more `429` responses while smaller queues continue entering. One active queue can still use the entire budget. See [API.md](API.md#fair-queue-admission) for the formula and observability headers.
+
 Critically, each user can run at a **different pace**. If your service processes requests from user A faster than user B, because of their tier, their data size, or just load at that moment, each user's queue drains independently at the rate their own responses signal back. A premium user responding with `X-Aqueduct-Rps: 50` runs at 50 RPS while a free-tier user on `X-Aqueduct-Rps: 2` runs at 2, in parallel, without either affecting the other. Note that literal pace (RPS/max-concurrent) can only ever be set by the upstream's own response headers, never by the client submitting the job, so a client can ask for isolation but never for a faster rate than what's configured.
 
 Disable it any time by responding with `X-Aqueduct-Account-Queue: disabled`.
@@ -158,7 +160,7 @@ The same call is both initial registration and heartbeat: call it again periodic
 
 **Set `capacity_rps` conservatively, not at your true theoretical max.** EZThrottle only learns a member died via a failed dispatch or a missed heartbeat, both of which lag the actual failure, so leaving headroom in what you declare gives real slack for that detection delay. Reputation decay is a second line of defense on top of this.
 
-**A given `pool_id` should belong to exactly one EZThrottle instance**: same partitioning rule as everywhere else in this README. Pool state isn't shared or coordinated across instances; if the same member registers the same `pool_id` with two different instances, each one independently believes it owns that member's full declared capacity. If a member genuinely needs to register with more than one instance, divide its declared `capacity_rps` across however many it's registered with.
+**A given `pool_id` should belong to exactly one EZThrottle instance**: pool membership is not distributed by Syn. If the same member registers the same `pool_id` with two different instances, each one independently believes it owns that member's full declared capacity. If a member genuinely needs to register with more than one instance, divide its declared `capacity_rps` across however many it's registered with.
 
 `GET /health` reports every pool's current members, their declared capacity, and current reputation.
 
@@ -266,7 +268,7 @@ Two things matter for what "durable" actually means here:
 
 Running one node for everything works fine until you have multiple tenants or multiple upstreams sharing it, and then one tenant's burst, or one upstream's own rate limit, ends up affecting everyone else on that same node. Two ways to split traffic apart so that doesn't happen, not mutually exclusive:
 
-**Static partitioning**: decided once, at deploy time. Dedicate one node to a single protected resource (a CI runner, a database, a GPU, or a rate-limited external API you want to be nice to) so that resource only ever sees traffic paced the way you configured, up to whatever it can actually bear. Multiple tenants can safely share that same node: turn on [AccountQueue mode](#per-tenant-fairness-accountqueue-mode) and each tenant gets their own independently-paced queue, so one tenant's burst doesn't starve another's, and the resource itself never sees more aggregate load than it's rated for. The mistake to avoid: pointing multiple *nodes* at the *same* resource instead of routing everyone through this one pacing checkpoint, which just multiplies your total request rate against it. Same rule for pools: a given `pool_id` should belong to exactly one node, since pool state isn't shared across nodes.
+**Static partitioning**: decided once, at deploy time. Dedicate one standalone node, or one connected cluster, to a protected resource (a CI runner, a database, a GPU, or a rate-limited external API) so that resource only sees traffic paced through one coordinated queue owner. Multiple tenants can safely share it: turn on [AccountQueue mode](#per-tenant-fairness-accountqueue-mode) and each tenant gets an independently paced queue. Unconnected nodes still multiply the configured rate, and pools remain local to one instance because pool membership is not distributed by Syn.
 
 **Dynamic partitioning (drain mode)**: off by default, for a more specific shape. Instead of deciding every assignment up front, a node gets handed to one tenant at a time, absorbs and drains whatever burst that tenant sends, then frees itself up to be handed to a *different* tenant next, useful when you want dedicated capacity per user without hand-assigning it at deploy time. A normal single-node or statically-partitioned deployment is completely unaffected unless you turn this on. When idle for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, the node flushes its deduped idempotency ledger to a webhook and clears local state, moving through an `active` → `draining` → `unassigned` state machine visible via `GET /health`; optional batch streaming can send acknowledged terminal-job chunks before that final idle handoff. See **[DRAIN_MODE.md](DRAIN_MODE.md)** for the full state machine, env vars, and webhook payload shape.
 
@@ -274,7 +276,7 @@ The two combine: a fleet can partition statically by upstream domain, while indi
 
 **External registration**: off by default, and orthogonal to the above. `EZTHROTTLE_REGISTRY_URL` makes a node periodically report its own listening port to an external control plane (deciding tenant assignment, scaling, etc. is entirely that service's job, not this node's). See **[REGISTRATION.md](REGISTRATION.md)** for the env vars and ping payload shape.
 
-None of this needs nodes sharing state centrally, and that's the normal shape for a load balancer, not a gap unique to this project: nginx and HAProxy make local decisions the same way. Pure central rate limiting is a gateway-layer concern that composes in front of this if you want it, not something this project needs to reinvent. What a node does need is to be safe to hand off without knowing anything about the rest of the fleet, which is what slow start (mirrors Aquifer's `URLWorker.slowStart`, see [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode)) is for: a freshly-assigned node starts below its configured ceiling and creeps up, rather than assuming the ramp some other node already earned.
+**Region-local clustering is optional.** With `DNS_CLUSTER_QUERY` set, libcluster discovers sibling BEAM nodes and Syn gives each upstream/account queue one live owner across the connected cluster, so any node can accept a user's request without creating a second queue. Unset, EZThrottle remains standalone. Mnesia durability is still node-local unless you configure replication separately; see [API.md](API.md#region-local-queue-ownership) for the exact boundary and settings.
 
 ---
 
@@ -290,6 +292,8 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 | `EZTHROTTLE_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once BEAM's total memory exceeds this many MB |
 | `EZTHROTTLE_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
 | `EZTHROTTLE_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |
+| `EZTHROTTLE_MAX_PENDING_PER_USER` | `10000` | Reject new client work for one user once its queued plus in-flight jobs reach this ceiling; `0` disables it |
+| `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
 | `EZTHROTTLE_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429`: doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |
 
 Body-size and DB-size admission are **on by default**, sized off the infrastructure this project is
@@ -405,7 +409,7 @@ docker run -p 4000:4000 ezthrottle-local
 
 ## Deployment
 
-Run one node per upstream domain or tenant. Each node persists to its own Mnesia directory, no external database or coordination service required, and total throughput scales with node count.
+Run standalone, partition nodes by upstream, or connect a region-local cluster with `DNS_CLUSTER_QUERY`. Each node persists to its own Mnesia directory; Syn coordinates live queue ownership but does not replicate that disk state.
 
 <details>
 <summary>Full deployment reference — Fly.io, Kubernetes, partitioning, zero-downtime updates</summary>

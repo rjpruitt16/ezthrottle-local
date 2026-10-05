@@ -58,6 +58,16 @@ jobs:
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder
 
+      - name: Contract test -- shared WebSocket behavior
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-ezthrottle-websocket
+            --source=./ezthrottle-local
+            --websocket-dir=./aqueduct-runner/websocket
+
   # Separate job so a slow drain-mode regression doesn't hold up the fast
   # checks above -- both start immediately, no `needs:` dependency.
   contract-test-drain:
