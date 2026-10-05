@@ -147,14 +147,14 @@ defmodule EzthrottleLocal.AccountQueue do
     # handle_info(:broadcast_positions, ...) below for the other half of
     # the fix). Confirmed via aqueduct-runner: this is why drain mode could
     # never flush.
-    {:ok, state, idle_timeout_ms()}
+    {:ok, state, arm_idle_timeout()}
   end
 
   @impl true
   def handle_call({:submit, job}, _from, state) do
     case prepare_submission(job, true) do
       {:prepared, prepared_job} -> submit_inserted_job(state, prepared_job, true)
-      other -> {:reply, other, state, idle_timeout_ms()}
+      other -> {:reply, other, state, arm_idle_timeout()}
     end
   end
 
@@ -162,23 +162,23 @@ defmodule EzthrottleLocal.AccountQueue do
   def handle_call({:submit_internal, job}, _from, state) do
     case prepare_submission(job, false) do
       {:prepared, prepared_job} -> submit_inserted_job(state, prepared_job, false)
-      other -> {:reply, other, state, idle_timeout_ms()}
+      other -> {:reply, other, state, arm_idle_timeout()}
     end
   end
 
   @impl true
   def handle_call({:prepare, job}, _from, state) do
-    {:reply, prepare_submission(job, true), state, idle_timeout_ms()}
+    {:reply, prepare_submission(job, true), state, arm_idle_timeout()}
   end
 
   @impl true
   def handle_call({:enqueue, job, enforce_limit}, _from, state) do
     case enqueue_job(state, job, enforce_limit) do
       {:ok, new_state} ->
-        {:reply, :ok, new_state, idle_timeout_ms()}
+        {:reply, :ok, new_state, arm_idle_timeout()}
 
       {:rejected, limit, current} ->
-        {:reply, {:rejected, "user_queue", limit, current}, state, idle_timeout_ms()}
+        {:reply, {:rejected, "user_queue", limit, current}, state, arm_idle_timeout()}
     end
   end
 
@@ -200,34 +200,35 @@ defmodule EzthrottleLocal.AccountQueue do
       )
 
     send(self(), :process_next)
-    {:reply, :ok, complete_user_job(new_state, user_id), idle_timeout_ms()}
+    {:reply, :ok, complete_user_job(new_state, user_id), arm_idle_timeout()}
   end
 
   @impl true
-  def handle_call(:get_rps, _from, state), do: {:reply, state.rps, state}
+  def handle_call(:get_rps, _from, state),
+    do: {:reply, state.rps, state, remaining_idle_timeout()}
 
   @impl true
   def handle_call(:active?, _from, state) do
     active? = not (:queue.is_empty(state.queue) and state.in_flight == 0)
-    {:reply, active?, state}
+    {:reply, active?, state, remaining_idle_timeout()}
   end
 
   @impl true
   def handle_call(:snapshot, _from, state) do
     backlog = :queue.len(state.queue) + state.in_flight
-    {:reply, %{backlog: backlog, active: backlog > 0}, state}
+    {:reply, %{backlog: backlog, active: backlog > 0}, state, remaining_idle_timeout()}
   end
 
   @impl true
   def handle_cast({:update_rps, rps}, state) do
     safe_rps = max(rps, @min_rps)
     Metrics.flow_rate(state.upstream, safe_rps)
-    {:noreply, %{state | rps: safe_rps}, idle_timeout_ms()}
+    {:noreply, %{state | rps: safe_rps}, arm_idle_timeout()}
   end
 
   @impl true
   def handle_cast({:update_max_concurrent, max}, state) do
-    {:noreply, %{state | max_concurrent: max}, idle_timeout_ms()}
+    {:noreply, %{state | max_concurrent: max}, arm_idle_timeout()}
   end
 
   @impl true
@@ -236,10 +237,10 @@ defmodule EzthrottleLocal.AccountQueue do
 
     cond do
       state.in_flight >= state.max_concurrent ->
-        {:noreply, state, idle_timeout_ms()}
+        {:noreply, state, arm_idle_timeout()}
 
       :queue.is_empty(state.queue) ->
-        {:noreply, state, idle_timeout_ms()}
+        {:noreply, state, arm_idle_timeout()}
 
       true ->
         case resolve_target(state) do
@@ -250,7 +251,7 @@ defmodule EzthrottleLocal.AccountQueue do
             # later instead of turning temporary absence into terminal
             # failure.
             Process.send_after(self(), :process_next, no_pool_members_retry_ms())
-            {:noreply, state, idle_timeout_ms()}
+            {:noreply, state, arm_idle_timeout()}
 
           {:ok, job, dispatch_url, member, remaining_queue} ->
             # Enforce RPS with jitter to prevent synchronized bursts across queues
@@ -289,7 +290,7 @@ defmodule EzthrottleLocal.AccountQueue do
               )
             end)
 
-            {:noreply, new_state, idle_timeout_ms()}
+            {:noreply, new_state, arm_idle_timeout()}
         end
     end
   end
@@ -336,7 +337,7 @@ defmodule EzthrottleLocal.AccountQueue do
       )
 
     send(self(), :process_next)
-    {:noreply, complete_user_job(new_state, user_id), idle_timeout_ms()}
+    {:noreply, complete_user_job(new_state, user_id), arm_idle_timeout()}
   end
 
   @impl true
@@ -366,7 +367,7 @@ defmodule EzthrottleLocal.AccountQueue do
       schedule_position_broadcast()
     end
 
-    {:noreply, state, idle_timeout_ms()}
+    {:noreply, state, arm_idle_timeout()}
   end
 
   @impl true
@@ -374,7 +375,7 @@ defmodule EzthrottleLocal.AccountQueue do
     if :queue.is_empty(state.queue) and state.in_flight == 0 do
       {:stop, :normal, state}
     else
-      {:noreply, state, idle_timeout_ms()}
+      {:noreply, state, arm_idle_timeout()}
     end
   end
 
@@ -383,12 +384,12 @@ defmodule EzthrottleLocal.AccountQueue do
   defp submit_inserted_job(state, job, enforce_limit) do
     case enqueue_job(state, job, enforce_limit) do
       {:ok, new_state} ->
-        {:reply, {:accepted, job}, new_state, idle_timeout_ms()}
+        {:reply, {:accepted, job}, new_state, arm_idle_timeout()}
 
       {:rejected, limit, current} ->
         IdempotentStore.delete_job(job)
 
-        {:reply, {:rejected, "user_queue", limit, current}, state, idle_timeout_ms()}
+        {:reply, {:rejected, "user_queue", limit, current}, state, arm_idle_timeout()}
     end
   end
 
@@ -802,6 +803,24 @@ defmodule EzthrottleLocal.AccountQueue do
         @default_idle_timeout_seconds,
         "EZTHROTTLE_IDLE_TIMEOUT_MS"
       )
+
+  # Read-only probes (active?/get_rps/snapshot) must not count as activity.
+  # A GenServer reply with no timeout disables the idle timer, and one with a
+  # fresh timeout restarts it, so UrlActor's 3s budget poll (and /health) kept
+  # idle queues alive forever. Real work re-arms the deadline; probes reply
+  # with whatever time is left.
+  defp arm_idle_timeout do
+    timeout = idle_timeout_ms()
+    Process.put(:idle_deadline_ms, System.monotonic_time(:millisecond) + timeout)
+    timeout
+  end
+
+  defp remaining_idle_timeout do
+    case Process.get(:idle_deadline_ms) do
+      nil -> arm_idle_timeout()
+      deadline -> max(deadline - System.monotonic_time(:millisecond), 0)
+    end
+  end
 
   defp env_seconds_as_ms(seconds_key, default_seconds, legacy_ms_key) do
     case System.get_env(seconds_key) do
