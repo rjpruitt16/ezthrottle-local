@@ -90,6 +90,76 @@ defmodule EzthrottleLocal.IdleLifecycleTest do
            "expected registry ETS entry to be removed after UrlActor shutdown"
   end
 
+  # The test above uses a 1s idle timeout, shorter than UrlActor's 3s budget
+  # poll, so the queue always exited before the first poll. In production the
+  # poll always lands first, and every probe used to disable or reset the idle
+  # timer, so queues never exited and drain mode never flushed.
+  test "read-only probes do not keep an idle account queue alive" do
+    {queue, _actor, _table} = start_idle_queue()
+    queue_ref = Process.monitor(queue)
+
+    prober =
+      spawn(fn ->
+        Stream.repeatedly(fn ->
+          EzthrottleLocal.AccountQueue.active?(queue)
+          EzthrottleLocal.AccountQueue.get_rps(queue)
+          EzthrottleLocal.AccountQueue.snapshot(queue)
+          Process.sleep(200)
+        end)
+        |> Stream.run()
+      end)
+
+    on_exit(fn -> Process.exit(prober, :kill) end)
+    assert_receive {:DOWN, ^queue_ref, :process, ^queue, :normal}, 3_000
+  end
+
+  test "idle account queue exits even when its idle timeout outlasts the budget poll" do
+    System.put_env("EZTHROTTLE_IDLE_TIMEOUT_SECONDS", "4")
+    {queue, actor, table} = start_idle_queue()
+    queue_ref = Process.monitor(queue)
+    actor_ref = Process.monitor(actor)
+
+    assert_receive {:DOWN, ^queue_ref, :process, ^queue, :normal}, 8_000
+    assert_receive {:DOWN, ^actor_ref, :process, ^actor, :normal}, 2_000
+    assert wait_until(fn -> :ets.info(table, :size) == 0 end)
+  end
+
+  defp start_idle_queue do
+    base_url = start_plug_server()
+    table = :"idle_probe_url_actors_#{System.unique_integer([:positive])}"
+
+    {:ok, registry} =
+      AccountQueueRegistry.start_link(
+        name: :"idle_probe_registry_#{System.unique_integer([:positive])}",
+        table: table
+      )
+
+    on_exit(fn -> if Process.alive?(registry), do: Process.exit(registry, :kill) end)
+
+    job = %Job{
+      id: "idle-probe-#{System.unique_integer([:positive])}",
+      user_id: "tenant-probe",
+      idempotent_key: "idle-probe-key-#{System.unique_integer([:positive])}",
+      url: "#{base_url}/work",
+      method: "POST",
+      headers: %{},
+      body: nil,
+      webhook_url: "",
+      status: :queued,
+      created_at: System.system_time(:millisecond)
+    }
+
+    :ok = GenServer.call(registry, {:enqueue, job, "enabled"})
+    [{_, actor}] = :ets.lookup(table, base_url)
+
+    queue =
+      wait_until_value(fn ->
+        actor |> :sys.get_state() |> Map.get(:queues) |> Map.values() |> List.first()
+      end)
+
+    {queue, actor, table}
+  end
+
   defp start_plug_server do
     port = Enum.random(20_000..60_000)
     child_id = :"idle_lifecycle_test_#{port}"
