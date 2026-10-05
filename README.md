@@ -242,7 +242,9 @@ Content-Type: application/json
 
 ## Idempotency
 
-Every job requires an `idempotent_key`. Submitting the same key twice **for the same `user_id`** returns the original job ID without re-executing the request; different users can safely use the same `idempotent_key` without colliding with each other. Keys expire after 24 hours (configurable). Backed by Mnesia (`disc_copies`), not ETS: durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
+Every job requires an `idempotent_key`. Submitting the same key twice **for the same `user_id`** returns the original job ID without re-executing the request; different users can safely use the same `idempotent_key` without colliding with each other. Keys expire after 24 hours (configurable).
+
+**Shared scope.** With `EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED=true`, a job can set `"idempotency_scope": "shared"` to dedup on `idempotent_key` alone, across every `user_id`. Many agents asking for the same resource then coalesce onto one upstream call: later callers get `200 + "duplicate": true` with the first job's ID and can poll or stream it; they don't get their own webhook. Anyone who knows a shared key can read its result, so use keys that name a public resource (`weather:sf:2026-10-05`), never a user's private data. Backed by Mnesia (`disc_copies`), not ETS: durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
 
 **Delivery semantics:** EZThrottle provides at-least-once dispatch and webhook delivery, not exactly-once execution. If the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches to the upstream again on restart, so it's not just the webhook that can repeat, the upstream call itself can. Make both your upstream endpoint and your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
 
@@ -365,9 +367,11 @@ Custom implementations plug in via `:region_adapter`, implementing the `Ezthrott
 
 ## L8 Protocol — trustless webhook delivery
 
-Traditional webhook security shares an HMAC secret between sender and receiver, stored in a database on both sides: something that can be stolen, logged accidentally, or forgotten during rotation, letting anyone forge deliveries forever once it leaks. EZThrottle Local implements **L8 v0.1**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography: the receiver publishes a public key, a one-time handshake proves both sides own their private keys, and every delivery afterward carries a signature verified locally in microseconds, with no database lookup and no round-trip to any authority.
+Traditional webhook security shares an HMAC secret between sender and receiver, stored in a database on both sides: something that can be stolen, logged accidentally, or forgotten during rotation, letting anyone forge deliveries forever once it leaks. EZThrottle Local implements **L8 v0.2**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography: the receiver publishes a public key, a one-time handshake proves both sides own their private keys, and every delivery afterward carries a signature verified locally in microseconds, with no database lookup and no round-trip to any authority.
 
 The full protocol rationale, wire format, and a reference receiver implementation live at the **[L8 spec](https://rjpruitt16.github.io/l8-protocol/)** (the same canonical spec [Aquifer](https://github.com/rjpruitt16/aquifer) follows), also served locally at `GET /l8-spec` for an agent/script with only network access to this instance. Set `L8_PRIVATE_KEY` for a stable identity across restarts, or let EZThrottle auto-generate one on first start.
+
+Two additions in 0.2. A receiver that publishes an X25519 `encryption_public_key` gets its webhook bodies encrypted to that key, then signed, so a proxy or log in the middle sees only ciphertext. An upstream that publishes `request_schemas` (JSON Schema per route) gets job bodies checked before dispatch: a mismatch is rejected with `422` instead of burning an upstream call. Schema checks are off unless `EZTHROTTLE_L8_SCHEMA_VALIDATION=true`; external `$ref`s are never fetched, and a new `X-Aqueduct-Schema-Hash` on an upstream response drops the cached schemas and the L8 trust so the handshake re-runs.
 
 ---
 

@@ -54,24 +54,34 @@ defmodule EzthrottleLocal.Proxy do
   def attempt_direct(params), do: attempt_direct(params, nil)
 
   def attempt_direct(params, account_queue_header) do
-    case Job.new(params) do
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, job} <- Job.new(params),
+         :ok <- validate_schema(job) do
+      prepare_and_attempt(job, account_queue_header)
+    end
+  end
 
-      {:ok, job} ->
-        case AccountQueueRegistry.prepare(job, account_queue_header) do
-          {:duplicate, existing_id} ->
-            {:duplicate, IdempotentStore.get_job(existing_id)}
+  defp validate_schema(%Job{url: url} = job) when is_binary(url) do
+    case EzthrottleLocal.L8.Schemas.validate(url, job.method, job.body) do
+      :ok -> :ok
+      {:error, mismatch} -> {:schema_mismatch, mismatch}
+    end
+  end
 
-          {:rejected, reason, limit, current} ->
-            {:admission_rejected, reason, limit, current}
+  defp validate_schema(_job), do: :ok
 
-          {:prepared, prepared_job} ->
-            if Job.execution_expired?(prepared_job) do
-              {:fallback, prepared_job, %{reason: "execution_deadline_exceeded", status: nil}}
-            else
-              attempt_dispatch_or_fallback(prepared_job, account_queue_header)
-            end
+  defp prepare_and_attempt(job, account_queue_header) do
+    case AccountQueueRegistry.prepare(job, account_queue_header) do
+      {:duplicate, existing_id} ->
+        {:duplicate, IdempotentStore.get_job(existing_id)}
+
+      {:rejected, reason, limit, current} ->
+        {:admission_rejected, reason, limit, current}
+
+      {:prepared, prepared_job} ->
+        if Job.execution_expired?(prepared_job) do
+          {:fallback, prepared_job, %{reason: "execution_deadline_exceeded", status: nil}}
+        else
+          attempt_dispatch_or_fallback(prepared_job, account_queue_header)
         end
     end
   end

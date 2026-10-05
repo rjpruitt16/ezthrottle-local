@@ -11,6 +11,7 @@ defmodule EzthrottleLocal.Job do
           id: String.t(),
           user_id: String.t(),
           idempotent_key: String.t(),
+          idempotency_scope: String.t() | nil,
           url: String.t() | nil,
           pool_id: String.t() | nil,
           method: String.t(),
@@ -31,6 +32,7 @@ defmodule EzthrottleLocal.Job do
     :id,
     :user_id,
     :idempotent_key,
+    :idempotency_scope,
     :url,
     :pool_id,
     :method,
@@ -57,6 +59,8 @@ defmodule EzthrottleLocal.Job do
     pool_id = blank_to_nil(Map.get(params, "pool_id"))
 
     with {:ok, user_id} <- require_field(params, "user_id"),
+         :ok <- reject_nul(user_id),
+         {:ok, scope} <- parse_idempotency_scope(Map.get(params, "idempotency_scope")),
          :ok <- require_exactly_one_of_url_or_pool_id(url, pool_id),
          {:ok, method} <- require_field(params, "method"),
          {:ok, webhook_url} <- require_field(params, "webhook_url"),
@@ -67,6 +71,7 @@ defmodule EzthrottleLocal.Job do
          id: generate_id(),
          user_id: user_id,
          idempotent_key: idempotent_key,
+         idempotency_scope: scope,
          url: url,
          pool_id: pool_id,
          method: String.upcase(method),
@@ -84,6 +89,36 @@ defmodule EzthrottleLocal.Job do
        }}
     end
   end
+
+  @doc """
+  "shared" dedups on idempotent_key alone, across every user_id, so concurrent
+  callers asking for the same resource coalesce onto one upstream call. Off
+  unless EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED=true.
+  """
+  def shared_idempotency_enabled?,
+    do: System.get_env("EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED") == "true"
+
+  defp parse_idempotency_scope(scope) when scope in [nil, "", "user"], do: {:ok, nil}
+
+  defp parse_idempotency_scope("shared") do
+    if shared_idempotency_enabled?(),
+      do: {:ok, "shared"},
+      else:
+        {:error,
+         ~s(idempotency_scope "shared" requires EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED=true)}
+  end
+
+  defp parse_idempotency_scope(_), do: {:error, ~s(idempotency_scope must be "user" or "shared")}
+
+  # A NUL-free user_id is what keeps the shared hash ("shared\0" <> key) from
+  # ever colliding with a per-user one (user_id <> ":" <> key).
+  defp reject_nul(user_id) when is_binary(user_id) do
+    if String.contains?(user_id, <<0>>),
+      do: {:error, "user_id must not contain NUL characters"},
+      else: :ok
+  end
+
+  defp reject_nul(_user_id), do: :ok
 
   defp require_exactly_one_of_url_or_pool_id(nil, nil),
     do: {:error, "either url or pool_id is required"}

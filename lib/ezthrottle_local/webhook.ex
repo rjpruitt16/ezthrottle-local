@@ -21,9 +21,10 @@ defmodule EzthrottleLocal.Webhook do
   def deliver(url, payload, attempt \\ 0)
 
   def deliver(url, payload, attempt) when attempt < @max_retries do
-    body = Jason.encode!(payload)
     EzthrottleLocal.L8.ensure_trust(url)
-    l8_headers = l8_headers_for(url, body)
+
+    {:ok, body, l8_headers} =
+      EzthrottleLocal.L8.seal_delivery(url, Jason.encode!(payload), "application/json")
 
     case do_post(url, body, l8_headers) do
       {:ok, status} when status in 200..299 ->
@@ -53,9 +54,10 @@ defmodule EzthrottleLocal.Webhook do
   end
 
   def deliver(url, payload, _attempt) do
-    body = Jason.encode!(payload)
     EzthrottleLocal.L8.ensure_trust(url)
-    l8_headers = l8_headers_for(url, body)
+
+    {:ok, body, l8_headers} =
+      EzthrottleLocal.L8.seal_delivery(url, Jason.encode!(payload), "application/json")
 
     case do_post(url, body, l8_headers) do
       {:ok, status} when status in 200..299 ->
@@ -80,26 +82,24 @@ defmodule EzthrottleLocal.Webhook do
     end
   end
 
+  # The body goes to :httpc as a binary: an encrypted body is not valid UTF-8,
+  # so it can't round-trip through a charlist. :httpc takes the content type
+  # from its own argument, so an L8 "Content-Type" override is pulled out of
+  # the header list rather than sent twice.
   defp do_post(url, body, extra_headers) do
+    {content_type, extra_headers} = Map.pop(extra_headers, "Content-Type", "application/json")
+
     headers =
       Enum.map(extra_headers, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
 
     case :httpc.request(
            :post,
-           {String.to_charlist(url), headers, ~c"application/json", String.to_charlist(body)},
+           {String.to_charlist(url), headers, String.to_charlist(content_type), body},
            [{:timeout, 5_000}],
            []
          ) do
       {:ok, {{_, status, _}, _headers, _body}} -> {:ok, status}
       {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp l8_headers_for(url, body) do
-    if EzthrottleLocal.L8.is_trusted?(url) do
-      EzthrottleLocal.L8.sign_headers(body)
-    else
-      %{}
     end
   end
 

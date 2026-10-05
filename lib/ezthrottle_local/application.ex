@@ -25,12 +25,16 @@ defmodule EzthrottleLocal.Application do
         {EzthrottleLocal.WebSocketQueue, websocket_config},
         {Registry, keys: :unique, name: EzthrottleLocal.WebSocketSessionRegistry},
         EzthrottleLocal.WebSocketSessionSupervisor,
-        EzthrottleLocal.L8,
-        EzthrottleLocal.Admission,
-        EzthrottleLocal.IdempotentStore,
-        EzthrottleLocal.PoolRegistry,
-        EzthrottleLocal.AccountQueueRegistry
-      ] ++ region_redirect_children() ++ registration_children() ++ [EzthrottleLocalWeb.Endpoint]
+        EzthrottleLocal.L8
+      ] ++
+        l8_schema_children() ++
+        [
+          EzthrottleLocal.Admission,
+          EzthrottleLocal.IdempotentStore,
+          EzthrottleLocal.PoolRegistry,
+          EzthrottleLocal.AccountQueueRegistry
+        ] ++
+        region_redirect_children() ++ registration_children() ++ [EzthrottleLocalWeb.Endpoint]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
@@ -67,6 +71,12 @@ defmodule EzthrottleLocal.Application do
           ipv6_listener_child_spec()
         ]
     end
+  end
+
+  # Same opt-in-means-no-process convention: the L8 request-schema cache only
+  # exists when EZTHROTTLE_L8_SCHEMA_VALIDATION=true.
+  defp l8_schema_children do
+    if EzthrottleLocal.L8.Schemas.enabled?(), do: [EzthrottleLocal.L8.Schemas], else: []
   end
 
   # EzthrottleLocal.Registration stays entirely out of the supervision
