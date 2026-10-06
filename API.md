@@ -63,6 +63,23 @@ This coordinates live processes; it does not turn each node's Mnesia directory i
 
 The per-user ceiling rejects only new client work with `429` and `limit_reason: "user_queue"`; duplicates are still returned normally. Internal webhook deliveries and startup recovery bypass it so admission pressure cannot discard already-accepted work.
 
+### Shared idempotency scope and request schemas
+
+`"idempotency_scope": "shared"` (requires `EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED=true`, otherwise `400`) dedups on `idempotent_key` across every `user_id`, so concurrent callers coalesce onto one job. Followers receive `200 + "duplicate": true` with the existing `job_id`; on `/proxy` they are streamed that job.
+
+With `EZTHROTTLE_L8_SCHEMA_VALIDATION=true`, a `url`-routed job whose upstream publishes L8 0.2 `request_schemas` for its method and path is validated before it is queued. A mismatch returns **422**:
+
+```json
+{
+  "error": "request body does not match the schema the upstream advertises for POST /v1/chat/completions",
+  "schema_route": "POST /v1/chat/completions",
+  "schema_hash": "sha256:9c1e...",
+  "schema_errors": "..."
+}
+```
+
+Schemas are cached per upstream domain for up to 10 minutes and refetched when the upstream sends a new `X-Aqueduct-Schema-Hash`. Routes without a schema, upstreams without L8, and metadata that fails to fetch or compile are not checked.
+
 ## POST /proxy
 
 Edge-gateway mode — see [Use cases](README.md#use-cases) for the deployment shape this is for. Same request body as `POST /jobs`, same idempotency/admission rules, but tries the upstream directly and synchronously first:

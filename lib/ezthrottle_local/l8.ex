@@ -7,6 +7,11 @@ defmodule EzthrottleLocal.L8 do
   @trust_dir "l8-trust"
   @nonce_ttl_ms 300_000
   @spec_url "https://rjpruitt16.github.io/l8-protocol/spec.json"
+  @version "0.2"
+  @enc_algorithm "x25519-hkdf-sha256-aes256gcm"
+  @enc_capability "encrypted_payloads"
+  @enc_content_type "application/l8-encrypted"
+  @enc_info "l8/0.2 payload"
 
   # ---- Public API -----------------------------------------------------------
 
@@ -16,9 +21,11 @@ defmodule EzthrottleLocal.L8 do
 
   def pub_b64, do: :persistent_term.get(:l8_pub_b64)
 
+  def version, do: @version
+
   def meta(_host) do
     %{
-      "protocol_version"     => "0.1",
+      "protocol_version"     => @version,
       "service_name"         => "ezthrottle-local",
       "public_key"           => pub_b64(),
       "challenge_endpoint"   => "/l8/challenge",
@@ -43,23 +50,122 @@ defmodule EzthrottleLocal.L8 do
 
   def is_trusted?(url), do: ets_trusted?(domain_from_url(url))
 
-  def sign_headers(body) when is_binary(body) do
+  @doc """
+  Prepares an outgoing webhook body for an L8-trusted receiver: encrypt to
+  the receiver's X25519 key when it advertised one, then sign the bytes
+  actually sent (encrypt-then-sign). Untrusted receivers get the body back
+  unchanged with no headers. Mirrors Aquifer's L8Registry.SealDelivery.
+  """
+  def seal_delivery(url, body, content_type) when is_binary(body) do
+    case :ets.lookup(:l8_trust, domain_from_url(url)) do
+      [] ->
+        {:ok, body, %{}}
+
+      [{_domain, _pub, _pub_b64, _validated_at, enc_pub}] ->
+        delivery_id = random_uuid()
+        timestamp = Integer.to_string(System.os_time(:second))
+
+        {body, enc_headers} =
+          if is_binary(enc_pub) do
+            {ciphertext, headers} = seal_payload(enc_pub, body, delivery_id, timestamp)
+
+            {ciphertext,
+             Map.merge(headers, %{
+               "X-L8-Content-Type" => content_type,
+               "Content-Type" => @enc_content_type
+             })}
+          else
+            {body, %{}}
+          end
+
+        {:ok, body, Map.merge(enc_headers, sign_headers(body, delivery_id, timestamp))}
+    end
+  end
+
+  @doc """
+  Drops the trust (and its file) for a domain so the next delivery re-runs
+  the handshake. Used when an upstream's X-Aqueduct-Schema-Hash changes.
+  """
+  def invalidate(url) do
+    domain = domain_from_url(url)
+    :ets.delete(:l8_trust, domain)
+    trust_dir = System.get_env("L8_TRUST_DIR") || @trust_dir
+    File.rm(Path.join(trust_dir, sanitize_domain(domain) <> ".json"))
+    :ok
+  end
+
+  @doc false
+  def seal_payload(receiver_pub, plaintext, delivery_id, timestamp) do
+    {eph_pub, eph_priv} = :crypto.generate_key(:ecdh, :x25519)
+    key = payload_key(eph_priv, receiver_pub, eph_pub, receiver_pub)
+    nonce = :crypto.strong_rand_bytes(12)
+    aad = "#{delivery_id}.#{timestamp}"
+    {ciphertext, tag} = :crypto.crypto_one_time_aead(:aes_256_gcm, key, nonce, plaintext, aad, true)
+
+    {ciphertext <> tag,
+     %{
+       "X-L8-Encryption" => @enc_algorithm,
+       "X-L8-Ephemeral-Key" => Base.encode64(eph_pub),
+       "X-L8-Nonce" => Base.encode64(nonce)
+     }}
+  end
+
+  @doc false
+  def open_payload(receiver_priv, receiver_pub, sealed, eph_b64, nonce_b64, delivery_id, timestamp)
+      when byte_size(sealed) >= 16 do
+    with {:ok, eph_pub} <- Base.decode64(eph_b64),
+         {:ok, nonce} <- Base.decode64(nonce_b64) do
+      key = payload_key(receiver_priv, eph_pub, eph_pub, receiver_pub)
+      ct_size = byte_size(sealed) - 16
+      <<ciphertext::binary-size(ct_size), tag::binary-16>> = sealed
+      aad = "#{delivery_id}.#{timestamp}"
+
+      case :crypto.crypto_one_time_aead(:aes_256_gcm, key, nonce, ciphertext, aad, tag, false) do
+        :error -> :error
+        plaintext -> {:ok, plaintext}
+      end
+    else
+      _ -> :error
+    end
+  end
+
+  def open_payload(_priv, _pub, _sealed, _eph, _nonce, _id, _ts), do: :error
+
+  # HKDF-SHA256 (RFC 5869) with a single 32-byte output block.
+  defp payload_key(priv, peer_pub, eph_pub, receiver_pub) do
+    shared = :crypto.compute_key(:ecdh, peer_pub, priv, :x25519)
+    prk = :crypto.mac(:hmac, :sha256, eph_pub <> receiver_pub, shared)
+    :crypto.mac(:hmac, :sha256, prk, @enc_info <> <<1>>)
+  end
+
+  defp sign_headers(body, delivery_id, timestamp) do
     priv = :persistent_term.get(:l8_priv_key)
-    pub  = :persistent_term.get(:l8_pub_key)
-    delivery_id = random_uuid()
-    timestamp   = Integer.to_string(System.os_time(:second))
-    body_hash   = :crypto.hash(:sha256, body) |> Base.encode64()
-    message     = "#{delivery_id}.#{timestamp}.#{body_hash}"
-    sig         = :crypto.sign(:eddsa, :none, message, [priv, :ed25519]) |> Base.encode64()
-    key_id      = binary_part(pub, 0, 8) |> Base.encode64()
+    pub = :persistent_term.get(:l8_pub_key)
+    body_hash = :crypto.hash(:sha256, body) |> Base.encode64()
+    message = "#{delivery_id}.#{timestamp}.#{body_hash}"
+    sig = :crypto.sign(:eddsa, :none, message, [priv, :ed25519]) |> Base.encode64()
 
     %{
       "X-L8-Delivery-Id" => delivery_id,
-      "X-L8-Timestamp"   => timestamp,
-      "X-L8-Key-Id"      => key_id,
-      "X-L8-Signature"   => sig
+      "X-L8-Timestamp" => timestamp,
+      "X-L8-Key-Id" => binary_part(pub, 0, 8) |> Base.encode64(),
+      "X-L8-Signature" => sig
     }
   end
+
+  # Only a receiver that both advertises the capability and supplies a valid
+  # 32-byte key gets encrypted deliveries; anything else stays signed plaintext.
+  defp encryption_key(capabilities, key_b64)
+       when is_list(capabilities) and is_binary(key_b64) do
+    with true <- @enc_capability in capabilities,
+         {:ok, <<_::binary-32>> = key} <- Base.decode64(key_b64) do
+      key
+    else
+      _ -> nil
+    end
+  end
+
+  defp encryption_key(_capabilities, _key_b64), do: nil
 
   # ---- GenServer ------------------------------------------------------------
 
@@ -85,10 +191,13 @@ defmodule EzthrottleLocal.L8 do
   end
 
   @impl true
-  def handle_call({:store_trust, domain, pub_b64, validated_at}, _from, state) do
+  def handle_call({:store_trust, domain, pub_b64, validated_at, meta}, _from, state) do
     pub_bytes = Base.decode64!(pub_b64)
-    :ets.insert(:l8_trust, {domain, pub_bytes, pub_b64, validated_at})
-    write_trust_file(domain, pub_b64, validated_at)
+    capabilities = Map.get(meta, "capabilities", [])
+    enc_b64 = Map.get(meta, "encryption_public_key")
+    enc_pub = encryption_key(capabilities, enc_b64)
+    :ets.insert(:l8_trust, {domain, pub_bytes, pub_b64, validated_at, enc_pub})
+    write_trust_file(domain, pub_b64, validated_at, capabilities, enc_pub && enc_b64)
     {:reply, :ok, state}
   end
 
@@ -147,8 +256,7 @@ defmodule EzthrottleLocal.L8 do
   end
 
   defp run_handshake(domain) do
-    well_known_url = "#{domain}/.well-known/l8"
-    case fetch_json(well_known_url) do
+    case fetch_meta(domain) do
       {:ok, meta} ->
         receiver_pub_b64    = Map.get(meta, "public_key", "")
         challenge_path      = Map.get(meta, "challenge_endpoint", "/l8/challenge")
@@ -179,7 +287,7 @@ defmodule EzthrottleLocal.L8 do
                  {:ok, returned_sig} <- safe_decode64(returned_sig_b64),
                  true <- :crypto.verify(:eddsa, :none, msg, returned_sig, [receiver_pub, :ed25519]) do
               validated_at = System.os_time(:second)
-              GenServer.call(__MODULE__, {:store_trust, domain, returned_pub_b64, validated_at})
+              GenServer.call(__MODULE__, {:store_trust, domain, returned_pub_b64, validated_at, meta})
               :ok
             else
               _ ->
@@ -202,7 +310,7 @@ defmodule EzthrottleLocal.L8 do
     :ets.member(:l8_trust, domain)
   end
 
-  defp domain_from_url(url) do
+  def domain_from_url(url) do
     uri          = URI.parse(url)
     scheme_port  = if uri.scheme == "https", do: 443, else: 80
     port_str     = if uri.port && uri.port != scheme_port, do: ":#{uri.port}", else: ""
@@ -244,24 +352,30 @@ defmodule EzthrottleLocal.L8 do
                {:ok, pub_bytes} <- safe_decode64(pub_b64) do
             domain       = Map.get(data, "domain", "")
             validated_at = Map.get(data, "validated_at", 0)
-            :ets.insert(:l8_trust, {domain, pub_bytes, pub_b64, validated_at})
+            enc_pub = encryption_key(Map.get(data, "capabilities"), Map.get(data, "encryption_public_key"))
+            :ets.insert(:l8_trust, {domain, pub_bytes, pub_b64, validated_at, enc_pub})
           end
         end)
       _ -> :ok
     end
   end
 
-  defp write_trust_file(domain, pub_b64, validated_at) do
+  defp write_trust_file(domain, pub_b64, validated_at, capabilities, enc_b64) do
     trust_dir = System.get_env("L8_TRUST_DIR") || @trust_dir
     File.mkdir_p!(trust_dir)
     path    = Path.join(trust_dir, sanitize_domain(domain) <> ".json")
-    content = Jason.encode!(%{
-      "domain"           => domain,
-      "public_key"       => pub_b64,
-      "validated_at"     => validated_at,
-      "protocol_version" => "0.1",
-      "capabilities"     => ["signed_payloads"]
-    })
+
+    content =
+      %{
+        "domain"           => domain,
+        "public_key"       => pub_b64,
+        "validated_at"     => validated_at,
+        "protocol_version" => @version,
+        "capabilities"     => capabilities
+      }
+      |> then(fn data -> if enc_b64, do: Map.put(data, "encryption_public_key", enc_b64), else: data end)
+      |> Jason.encode!()
+
     File.write!(path, content)
   end
 
@@ -272,9 +386,14 @@ defmodule EzthrottleLocal.L8 do
     |> String.replace("/", "-")
   end
 
+  @doc "Fetches a domain's /.well-known/l8 metadata."
+  def fetch_meta(domain), do: fetch_json("#{domain}/.well-known/l8")
+
+  @meta_max_bytes 1_048_576
+
   defp fetch_json(url) do
-    case :httpc.request(:get, {String.to_charlist(url), []}, [{:timeout, 5_000}], []) do
-      {:ok, {{_, 200, _}, _headers, body}} -> Jason.decode(to_string(body))
+    case :httpc.request(:get, {String.to_charlist(url), []}, [{:timeout, 5_000}], [body_format: :binary]) do
+      {:ok, {{_, 200, _}, _headers, body}} when byte_size(body) <= @meta_max_bytes -> Jason.decode(body)
       _                                    -> :error
     end
   end

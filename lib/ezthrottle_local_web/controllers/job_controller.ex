@@ -17,24 +17,48 @@ defmodule EzthrottleLocalWeb.JobController do
         |> json(%{error: reason})
 
       {:ok, job} ->
-        case AccountQueueRegistry.submit(job, account_queue_header(conn)) do
-          {:duplicate, existing_id} ->
-            conn
-            |> put_status(:ok)
-            |> json(duplicate_response(existing_id))
-
-          {:accepted, accepted_job} ->
-            conn
-            |> put_queue_headers(accepted_job)
-            |> put_status(:created)
-            |> json(%{job_id: accepted_job.id, status: "queued"})
-
-          {:rejected, reason, limit, current} ->
-            conn
-            |> put_queue_headers(job)
-            |> admission_rejected(reason, limit, current)
+        case validate_schema(job) do
+          :ok -> submit(conn, job)
+          {:error, mismatch} -> schema_mismatch(conn, mismatch)
         end
     end
+  end
+
+  defp submit(conn, job) do
+    case AccountQueueRegistry.submit(job, account_queue_header(conn)) do
+      {:duplicate, existing_id} ->
+        conn
+        |> put_status(:ok)
+        |> json(duplicate_response(existing_id))
+
+      {:accepted, accepted_job} ->
+        conn
+        |> put_queue_headers(accepted_job)
+        |> put_status(:created)
+        |> json(%{job_id: accepted_job.id, status: "queued"})
+
+      {:rejected, reason, limit, current} ->
+        conn
+        |> put_queue_headers(job)
+        |> admission_rejected(reason, limit, current)
+    end
+  end
+
+  # Pool-routed jobs have no caller-supplied URL to check.
+  defp validate_schema(%Job{url: url} = job) when is_binary(url),
+    do: EzthrottleLocal.L8.Schemas.validate(url, job.method, job.body)
+
+  defp validate_schema(_job), do: :ok
+
+  defp schema_mismatch(conn, %{route: route, schema_hash: hash, detail: detail}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: "request body does not match the schema the upstream advertises for #{route}",
+      schema_route: route,
+      schema_hash: hash,
+      schema_errors: detail
+    })
   end
 
   @doc """
@@ -53,6 +77,9 @@ defmodule EzthrottleLocalWeb.JobController do
 
       {:admission_rejected, reason, limit, current} ->
         admission_rejected(conn, reason, limit, current)
+
+      {:schema_mismatch, mismatch} ->
+        schema_mismatch(conn, mismatch)
 
       {:duplicate, existing_job} ->
         stream_or_status_for_duplicate(conn, existing_job)

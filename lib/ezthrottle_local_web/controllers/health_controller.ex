@@ -4,7 +4,7 @@ defmodule EzthrottleLocalWeb.HealthController do
   def index(conn, _params) do
     base = %{
       status: "ok",
-      l8_protocol: "0.1",
+      l8_protocol: EzthrottleLocal.L8.version(),
       l8_public_key: EzthrottleLocal.L8.pub_b64(),
       admission: EzthrottleLocal.Admission.snapshot(),
       queues: EzthrottleLocal.AccountQueueRegistry.node_queue_snapshot(),

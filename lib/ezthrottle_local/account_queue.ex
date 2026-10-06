@@ -897,9 +897,16 @@ defmodule EzthrottleLocal.AccountQueue do
 
     job_headers = Enum.map(job.headers, fn {k, v} -> {k, v} end)
     metric_headers = maybe_add_orca_opt_in(metric_headers, job_headers)
-    l8_headers = maybe_l8_headers(job, dispatch_url)
+    {body, l8_headers} = maybe_seal_l8(job, dispatch_url)
+    {sealed_type, l8_headers} = Map.pop(l8_headers, "Content-Type")
+    content_type = sealed_type || "application/json"
 
-    headers = headers_to_charlist(job_headers ++ metric_headers ++ l8_headers)
+    job_headers =
+      if sealed_type,
+        do: Enum.reject(job_headers, fn {k, _v} -> String.downcase(k) == "content-type" end),
+        else: job_headers
+
+    headers = headers_to_charlist(job_headers ++ metric_headers ++ Map.to_list(l8_headers))
 
     method =
       case String.upcase(job.method) do
@@ -914,19 +921,25 @@ defmodule EzthrottleLocal.AccountQueue do
     # :httpc uses {url, headers} for bodyless methods, {url, headers, content_type, body} for body methods
     request =
       if method in [:post, :put, :patch] do
-        body = job.body || ""
-        {url, headers, ~c"application/json", body}
+        {url, headers, String.to_charlist(content_type), body}
       else
         {url, headers}
       end
 
     case :httpc.request(method, request, [{:timeout, timeout}], []) do
       {:ok, {{_, status, _}, resp_headers, resp_body}} ->
+        resp_headers = charlist_headers_to_map(resp_headers)
+
+        EzthrottleLocal.L8.Schemas.observe_hash(
+          dispatch_url,
+          pacing_header(resp_headers, "schema-hash")
+        )
+
         {:ok,
          %{
            status: status,
            body: to_string(resp_body),
-           headers: charlist_headers_to_map(resp_headers)
+           headers: resp_headers
          }}
 
       {:error, reason} ->
@@ -940,22 +953,22 @@ defmodule EzthrottleLocal.AccountQueue do
     :exit, _reason -> %{active_queues: 0, upstream_backlog: 0}
   end
 
-  # L8 signing proves EZThrottle's identity to the *receiver* of a
-  # webhook -- it has no meaning for forward dispatch to an arbitrary
-  # upstream API, so this only applies when the job being dispatched is
-  # itself a webhook delivery (see Job.webhook_delivery_job?/1). Mirrors
-  # Aquifer's account_queue.go makeRequest.
-  defp maybe_l8_headers(%Job{webhook_url: url} = job, dispatch_url) when url in [nil, ""] do
+  # L8 signing and encryption prove EZThrottle's identity to (and keep the
+  # payload private for) the *receiver* of a webhook -- they have no meaning
+  # for forward dispatch to an arbitrary upstream API, so this only applies
+  # when the job being dispatched is itself a webhook delivery (see
+  # Job.webhook_delivery_job?/1). Mirrors Aquifer's account_queue.go makeRequest.
+  defp maybe_seal_l8(%Job{webhook_url: url} = job, dispatch_url) when url in [nil, ""] do
     EzthrottleLocal.L8.ensure_trust(dispatch_url)
+    content_type = Map.get(job.headers || %{}, "Content-Type", "application/json")
 
-    if EzthrottleLocal.L8.is_trusted?(dispatch_url) do
-      EzthrottleLocal.L8.sign_headers(job.body || "") |> Map.to_list()
-    else
-      []
-    end
+    {:ok, body, headers} =
+      EzthrottleLocal.L8.seal_delivery(dispatch_url, job.body || "", content_type)
+
+    {body, headers}
   end
 
-  defp maybe_l8_headers(_job, _dispatch_url), do: []
+  defp maybe_seal_l8(job, _dispatch_url), do: {job.body || "", %{}}
 
   # Opts every dispatch into ORCA reporting by default, unless the caller
   # already set the format header explicitly -- mirrors Aquifer's

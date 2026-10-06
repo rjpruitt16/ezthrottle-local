@@ -22,7 +22,7 @@ defmodule EzthrottleLocalWeb.L8Controller do
 
   defp l8_spec_document do
     """
-    # L8 Protocol — v0.1
+    # L8 Protocol — v0.2
 
     **Trustless webhook delivery via Ed25519 public key handshake.**
 
@@ -56,7 +56,7 @@ defmodule EzthrottleLocalWeb.L8Controller do
 
     ```json
     {
-      "protocol_version":     "0.1",
+      "protocol_version":     "0.2",
       "service_name":         "your-service",
       "public_key":           "<base64 Ed25519 public key>",
       "challenge_endpoint":   "/l8/challenge",
@@ -135,7 +135,7 @@ defmodule EzthrottleLocalWeb.L8Controller do
       "domain":           "https://example.com",
       "public_key":       "<base64>",
       "validated_at":     1740000000,
-      "protocol_version": "0.1",
+      "protocol_version": "0.2",
       "capabilities":     ["signed_payloads"]
     }
     ```
@@ -143,6 +143,26 @@ defmodule EzthrottleLocalWeb.L8Controller do
     To revoke: delete the file. The handshake re-runs on next delivery.
 
     ---
+
+    ## Payload encryption (0.2, optional)
+
+    Advertise an X25519 key (separate from your Ed25519 signing key) to receive encrypted bodies:
+    `"capabilities": ["signed_payloads", "encrypted_payloads"]` and
+    `"encryption_public_key": "<base64 X25519 public key>"`.
+
+    The sender generates an ephemeral X25519 key per delivery, derives a key with
+    HKDF-SHA256(ECDH(ephemeral, yours), salt = ephemeral_pub || your_pub, info = "l8/0.2 payload"),
+    and encrypts with AES-256-GCM using AAD "{delivery_id}.{timestamp}". Extra headers:
+    `X-L8-Encryption: x25519-hkdf-sha256-aes256gcm`, `X-L8-Ephemeral-Key`, `X-L8-Nonce`,
+    `X-L8-Content-Type` (original type), `Content-Type: application/l8-encrypted`.
+    X-L8-Signature covers the ciphertext. Verify it first, then decrypt.
+
+    ## Request schemas (0.2, optional)
+
+    An upstream can publish JSON Schemas (draft 2020-12) keyed by "METHOD /path" in
+    `request_schemas`, with a required `schema_hash`. Send `X-Aqueduct-Schema-Hash` on responses
+    so senders notice a change, refetch this document, and re-run the handshake. Senders cache
+    schemas for at most 10 minutes, never fetch external $refs, and reject mismatches with 422.
 
     ## Key management
 

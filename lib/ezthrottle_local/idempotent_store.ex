@@ -662,7 +662,16 @@ defmodule EzthrottleLocal.IdempotentStore do
   # This was a real porting gap, not a deliberate difference from Aquifer's documented contract
   # ("duplicate idempotent_key per user_id returns the existing job", README.md) -- found and fixed
   # while reviewing drain mode's ledger-hash documentation.
-  defp hash_key(%Job{} = job), do: hash(job.user_id <> ":" <> job.idempotent_key)
+  #
+  # Shared-scope jobs (see Job.shared_idempotency_enabled?/0) dedup on the key
+  # alone, matching Aquifer's dedupHash. Map.get, not job.idempotency_scope:
+  # jobs persisted before this field existed are stored without it.
+  defp hash_key(%Job{} = job) do
+    case Map.get(job, :idempotency_scope) do
+      "shared" -> hash("shared" <> <<0>> <> job.idempotent_key)
+      _ -> hash(job.user_id <> ":" <> job.idempotent_key)
+    end
+  end
 
   defp hash(key) do
     :crypto.hash(:sha256, key) |> Base.encode16(case: :lower)
