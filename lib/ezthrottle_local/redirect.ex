@@ -288,6 +288,7 @@ defmodule EzthrottleLocal.Redirect do
         user_id: hop_job.user_id,
         idempotent_key: hop_job.idempotent_key,
         idempotency_scope: hop_job.idempotency_scope,
+        max_retries: EzthrottleLocal.Job.max_retries(hop_job),
         url: hop_job.url,
         pool_id: hop_job.pool_id,
         method: hop_job.method,

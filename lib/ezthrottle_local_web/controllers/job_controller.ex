@@ -10,7 +10,7 @@ defmodule EzthrottleLocalWeb.JobController do
   alias EzthrottleLocalWeb.JobStreamController
 
   def create(conn, params) do
-    case Job.new(params) do
+    case Job.new(with_max_retries_header(conn, params)) do
       {:error, reason} ->
         conn
         |> put_status(:bad_request)
@@ -69,7 +69,7 @@ defmodule EzthrottleLocalWeb.JobController do
   logic -- this action is HTTP glue only.
   """
   def proxy(conn, params) do
-    case Proxy.attempt_direct(params, account_queue_header(conn)) do
+    case Proxy.attempt_direct(with_max_retries_header(conn, params), account_queue_header(conn)) do
       {:error, reason} ->
         conn
         |> put_status(:bad_request)
@@ -218,6 +218,16 @@ defmodule EzthrottleLocalWeb.JobController do
   # didn't exist at all: account-queue mode could only be toggled by the
   # *upstream's response* headers or static config, with no way for the
   # client submitting the job to ask for isolation up front.
+  # X-Aqueduct-Max-Retries (or X-EZThrottle-Max-Retries) overrides the body's
+  # max_retries; Job.new/1 validates it.
+  defp with_max_retries_header(conn, params) do
+    case Plug.Conn.get_req_header(conn, "x-aqueduct-max-retries") ++
+           Plug.Conn.get_req_header(conn, "x-ezthrottle-max-retries") do
+      [value | _] -> Map.put(params, "max_retries", value)
+      [] -> params
+    end
+  end
+
   defp account_queue_header(conn) do
     case Plug.Conn.get_req_header(conn, "x-aqueduct-account-queue") do
       [val | _] ->

@@ -219,7 +219,7 @@ defmodule EzthrottleLocal.PoolDispatchTest do
     :ok = IdempotentStore.check_or_insert(job)
     AccountQueueRegistry.enqueue(job, "")
 
-    assert_receive {:webhook_payload, %{"status" => "failed", "response_status" => 500}}, 3_000
+    assert_receive {:webhook_payload, %{"status" => "failed", "response_status" => 500}}, 10_000
     assert IdempotentStore.get_status(job.id) == "failed"
   end
 end

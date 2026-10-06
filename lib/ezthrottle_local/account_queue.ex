@@ -22,7 +22,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @default_idle_timeout_seconds 300
   @min_rps 0.5
   @position_broadcast_ms 2_000
-  @max_retries 4
+  @default_retry_max_backoff_seconds 300
   @default_max_pending_per_user 10_000
 
   defstruct [
@@ -36,6 +36,8 @@ defmodule EzthrottleLocal.AccountQueue do
     queue: :queue.new(),
     pending_by_user: %{},
     in_flight: 0,
+    # Jobs backing off before a retry: still pending, not in flight.
+    waiting: 0,
     last_request_at: 0
   ]
 
@@ -180,6 +182,34 @@ defmodule EzthrottleLocal.AccountQueue do
       {:rejected, limit, current} ->
         {:reply, {:rejected, "user_queue", limit, current}, state, arm_idle_timeout()}
     end
+  end
+
+  # A retryable failure: free the slot, halve the pace (unless the upstream
+  # set one explicitly), and send the job back to ourselves after its backoff.
+  @impl true
+  def handle_call({:job_retry, %Job{} = job, delay_ms, rps_header}, _from, state) do
+    Process.send_after(self(), {:requeue, job}, delay_ms)
+
+    new_state =
+      state
+      |> penalize_rps(rps_header)
+      |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+      |> Map.update!(:waiting, &(&1 + 1))
+
+    send(self(), :process_next)
+    {:reply, :ok, new_state, arm_idle_timeout()}
+  end
+
+  # A final failure after a retryable error still slows the queue down.
+  @impl true
+  def handle_call({:job_failed, user_id, rps_header}, _from, state) do
+    new_state =
+      state
+      |> penalize_rps(rps_header)
+      |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+
+    send(self(), :process_next)
+    {:reply, :ok, complete_user_job(new_state, user_id), arm_idle_timeout()}
   end
 
   @impl true
@@ -341,6 +371,16 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   @impl true
+  def handle_info({:requeue, %Job{} = job}, state) do
+    was_empty = :queue.is_empty(state.queue)
+    new_state = %{state | queue: :queue.in(job, state.queue), waiting: max(state.waiting - 1, 0)}
+    Metrics.queue_depth(state.upstream, :queue.len(new_state.queue))
+    if was_empty, do: schedule_position_broadcast()
+    send(self(), :process_next)
+    {:noreply, new_state, arm_idle_timeout()}
+  end
+
+  @impl true
   def handle_info(:broadcast_positions, state) do
     state.queue
     |> :queue.to_list()
@@ -372,7 +412,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info(:timeout, state) do
-    if :queue.is_empty(state.queue) and state.in_flight == 0 do
+    if :queue.is_empty(state.queue) and state.in_flight == 0 and state.waiting == 0 do
       {:stop, :normal, state}
     else
       {:noreply, state, arm_idle_timeout()}
@@ -527,22 +567,11 @@ defmodule EzthrottleLocal.AccountQueue do
        }}
     )
 
-    result =
-      dispatch_with_retries(
-        job,
-        dispatch_url,
-        flow_rate,
-        max_concurrent,
-        queue_key,
-        pool_pid,
-        member_id,
-        0
-      )
+    result = attempt_once(job, dispatch_url, flow_rate, max_concurrent, queue_key)
 
     case result do
-      {:ok, %{status: status, body: body, headers: resp_headers}, successful_member_id} ->
-        if pool_pid && successful_member_id,
-          do: Pool.record_success(pool_pid, successful_member_id)
+      {:ok, %{status: status, body: body, headers: resp_headers}} ->
+        if pool_pid && member_id, do: Pool.record_success(pool_pid, member_id)
 
         rps = parse_rps_header(resp_headers) || EzthrottleLocal.Orca.rps(resp_headers)
         max_concurrent = parse_max_concurrent_header(resp_headers)
@@ -590,135 +619,117 @@ defmodule EzthrottleLocal.AccountQueue do
           body: body
         })
 
+      {:retryable, reason, response} ->
+        if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
+        resp_headers = (response && response.headers) || %{}
+        rps_header = parse_rps_header(resp_headers)
+        delay_ms = retry_delay_ms(Job.attempts(job), resp_headers)
+        retry_at = System.system_time(:millisecond) + delay_ms
+
+        if Job.retries_left?(job) and retry_at < Job.retry_deadline_ms(job) do
+          retried = %{job | attempts: Job.attempts(job) + 1}
+          IdempotentStore.record_retry(retried)
+
+          Phoenix.PubSub.broadcast(
+            EzthrottleLocal.PubSub,
+            "job:#{job.id}",
+            {:job_event,
+             %{
+               event: "retrying",
+               job_id: job.id,
+               attempt: retried.attempts,
+               max_retries: Job.max_retries(job),
+               retry_at: retry_at,
+               reason: reason,
+               response_status: response && response.status
+             }}
+          )
+
+          GenServer.call(parent, {:job_retry, retried, delay_ms, rps_header})
+        else
+          reason =
+            if Job.retries_left?(job), do: "retry_window_exhausted: " <> reason, else: reason
+
+          GenServer.call(parent, {:job_failed, job.user_id, rps_header})
+          fail_job(job, upstream, reason, response)
+        end
+
       {:error, reason, response} ->
         GenServer.call(parent, {:job_done, job.user_id, nil, nil, nil, nil, nil})
-
-        failed_payload =
-          %{
-            job_id: job.id,
-            status: "failed",
-            reason: to_string(reason)
-          }
-          |> maybe_put_response(response)
-
-        IdempotentStore.put_result(job.id, failed_payload, :failed)
-        IdempotentStore.update_status(job.id, :failed)
-        Metrics.job_failed(job.user_id, upstream, to_string(reason))
-
-        failed_event = Map.put(failed_payload, :event, "failed")
-
-        Phoenix.PubSub.broadcast(
-          EzthrottleLocal.PubSub,
-          "job:#{job.id}",
-          {:job_event, failed_event}
-        )
-
-        maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, failed_payload)
+        fail_job(job, upstream, reason, response)
     end
   end
 
-  defp dispatch_with_retries(
-         %Job{} = job,
-         dispatch_url,
-         flow_rate,
-         max_concurrent,
-         queue_key,
-         pool_pid,
-         member_id,
-         attempt
-       ) do
+  defp fail_job(job, upstream, reason, response) do
+    failed_payload =
+      %{
+        job_id: job.id,
+        status: "failed",
+        reason: to_string(reason)
+      }
+      |> maybe_put_response(response)
+
+    IdempotentStore.put_result(job.id, failed_payload, :failed)
+    IdempotentStore.update_status(job.id, :failed)
+    Metrics.job_failed(job.user_id, upstream, to_string(reason))
+
+    Phoenix.PubSub.broadcast(
+      EzthrottleLocal.PubSub,
+      "job:#{job.id}",
+      {:job_event, Map.put(failed_payload, :event, "failed")}
+    )
+
+    maybe_deliver_webhook(IdempotentStore.get_delivery_mode(job.id), job, failed_payload)
+  end
+
+  # One attempt. Connection errors, 5xx, 408 and 429 are retryable; any other
+  # response is final.
+  defp attempt_once(job, dispatch_url, flow_rate, max_concurrent, queue_key) do
     if Job.execution_expired?(job) do
       {:error, "execution_deadline_exceeded", nil}
     else
-      dispatch_with_retries_active(
-        job,
-        dispatch_url,
-        flow_rate,
-        max_concurrent,
-        queue_key,
-        pool_pid,
-        member_id,
-        attempt
-      )
+      case make_request(job, dispatch_url, flow_rate, max_concurrent, queue_key, :infinity) do
+        {:ok, %{status: status} = response} when status >= 500 or status in [408, 429] ->
+          {:retryable, "upstream returned #{status}", response}
+
+        {:ok, response} ->
+          {:ok, response}
+
+        {:error, reason} ->
+          {:retryable, inspect(reason), nil}
+      end
     end
   end
 
-  defp dispatch_with_retries_active(
-         job,
-         dispatch_url,
-         flow_rate,
-         max_concurrent,
-         queue_key,
-         pool_pid,
-         member_id,
-         attempt
-       ) do
-    case make_request(job, dispatch_url, flow_rate, max_concurrent, queue_key, :infinity) do
-      {:ok, %{status: status} = response} when status >= 500 ->
-        if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
+  # Honors the upstream's Retry-After; otherwise 1s, 2s, 4s, ... capped at
+  # EZTHROTTLE_RETRY_MAX_BACKOFF_SECONDS (300), with jitter. :dispatch_retry_ms
+  # pins a fixed delay for tests.
+  defp retry_delay_ms(attempts, resp_headers) do
+    case Integer.parse(Map.get(resp_headers, "retry-after", "")) do
+      {secs, ""} when secs >= 0 ->
+        secs * 1_000
 
-        if attempt < max_retries() do
-          sleep_before_retry(attempt)
+      _ ->
+        case Application.get_env(:ezthrottle_local, :dispatch_retry_ms) do
+          nil ->
+            ceiling = retry_max_backoff_seconds() * 1_000
+            min(trunc(:math.pow(2, min(attempts, 30)) * 1_000), ceiling) |> Jitter.add_ms()
 
-          case next_dispatch_target(pool_pid, dispatch_url) do
-            {:ok, next_url, next_member_id} ->
-              dispatch_with_retries(
-                job,
-                next_url,
-                flow_rate,
-                max_concurrent,
-                queue_key,
-                pool_pid,
-                next_member_id,
-                attempt + 1
-              )
-
-            :no_pool_members ->
-              {:error, "no pool members registered", nil}
-          end
-        else
-          {:error, "upstream returned #{status}", response}
-        end
-
-      {:ok, %{status: _status} = response} ->
-        {:ok, response, member_id}
-
-      {:error, reason} ->
-        if pool_pid && member_id, do: Pool.record_failure(pool_pid, member_id)
-
-        if attempt < max_retries() do
-          sleep_before_retry(attempt)
-
-          case next_dispatch_target(pool_pid, dispatch_url) do
-            {:ok, next_url, next_member_id} ->
-              dispatch_with_retries(
-                job,
-                next_url,
-                flow_rate,
-                max_concurrent,
-                queue_key,
-                pool_pid,
-                next_member_id,
-                attempt + 1
-              )
-
-            :no_pool_members ->
-              {:error, "no pool members registered", nil}
-          end
-        else
-          {:error, inspect(reason), nil}
+          fixed ->
+            fixed
         end
     end
   end
 
-  defp next_dispatch_target(nil, dispatch_url), do: {:ok, dispatch_url, nil}
-
-  defp next_dispatch_target(pool_pid, _dispatch_url) do
-    case Pool.pick(pool_pid) do
-      nil -> :no_pool_members
-      member -> {:ok, member.address, member.id}
+  defp retry_max_backoff_seconds do
+    case Integer.parse(System.get_env("EZTHROTTLE_RETRY_MAX_BACKOFF_SECONDS", "")) do
+      {n, ""} when n > 0 -> n
+      _ -> @default_retry_max_backoff_seconds
     end
   end
+
+  defp penalize_rps(state, nil), do: %{state | rps: max(state.rps / 2, @min_rps)}
+  defp penalize_rps(state, rps), do: %{state | rps: max(rps, @min_rps)}
 
   defp maybe_put_response(payload, nil), do: payload
 
@@ -740,9 +751,6 @@ defmodule EzthrottleLocal.AccountQueue do
   defp maybe_deliver_webhook(_mode, job, payload) do
     AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, payload)
   end
-
-  defp max_retries,
-    do: Application.get_env(:ezthrottle_local, :dispatch_max_retries, @max_retries)
 
   @doc "Maximum queued plus in-flight jobs accepted for one user; 0 disables the ceiling."
   def max_pending_per_user do
@@ -771,15 +779,6 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp no_pool_members_retry_ms,
     do: Application.get_env(:ezthrottle_local, :no_pool_members_retry_ms, 1_000)
-
-  defp retry_backoff_ms(attempt), do: trunc(:math.pow(2, attempt) * 1_000)
-
-  defp sleep_before_retry(attempt) do
-    Process.sleep(
-      Application.get_env(:ezthrottle_local, :dispatch_retry_ms, retry_backoff_ms(attempt))
-      |> Jitter.add_ms()
-    )
-  end
 
   defp schedule_position_broadcast do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
