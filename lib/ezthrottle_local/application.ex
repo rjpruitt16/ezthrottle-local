@@ -21,6 +21,7 @@ defmodule EzthrottleLocal.Application do
     configure_mnesia_dir()
     EzthrottleLocal.IdempotentStore.ensure_schema!()
     EzthrottleLocal.WebSocketStore.ensure_tables!()
+    EzthrottleLocal.UserLoad.ensure_table!()
     websocket_config = EzthrottleLocal.WebSocketConfig.load()
 
     children =

@@ -18,6 +18,7 @@ defmodule EzthrottleLocal.AccountQueue do
   alias EzthrottleLocal.Jitter
   alias EzthrottleLocal.Admission
   alias EzthrottleLocal.Cluster
+  alias EzthrottleLocal.UserLoad
 
   @default_idle_timeout_seconds 300
   @min_rps 0.5
@@ -439,7 +440,7 @@ defmodule EzthrottleLocal.AccountQueue do
         {:duplicate, existing_id}
 
       :ok ->
-        case if(enforce_admission, do: Admission.check(), else: :ok) do
+        case if(enforce_admission, do: admit(job), else: :ok) do
           {:rejected, reason, limit, current} ->
             IdempotentStore.delete_job(job)
             {:rejected, reason, limit, current}
@@ -448,6 +449,23 @@ defmodule EzthrottleLocal.AccountQueue do
             Metrics.job_queued(job.user_id, Metrics.upstream(job.url))
             {:prepared, job}
         end
+    end
+  end
+
+  defp admit(job) do
+    with :ok <- webhook_backlog_admission(job) do
+      Admission.check()
+    end
+  end
+
+  defp webhook_backlog_admission(job) do
+    if Job.webhook_delivery_job?(job) do
+      :ok
+    else
+      case UserLoad.webhook_backlog_decision(job.user_id) do
+        :ok -> :ok
+        {:rejected, limit, backlog} -> {:rejected, "webhook_backlog", limit, backlog}
+      end
     end
   end
 
@@ -463,6 +481,7 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   defp put_job(state, job, current_user_pending) do
+    UserLoad.add(job)
     was_empty = :queue.is_empty(state.queue)
     new_queue = :queue.in(job, state.queue)
 
@@ -504,6 +523,7 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   defp fail_expired_job(job, upstream) do
+    UserLoad.done(job)
     reason = "execution_deadline_exceeded"
     payload = %{job_id: job.id, status: "failed", reason: reason}
 
@@ -584,6 +604,8 @@ defmodule EzthrottleLocal.AccountQueue do
           {:job_done, job.user_id, rps, max_concurrent, account_queue, slow_start, max_backlog}
         )
 
+        UserLoad.done(job)
+
         completed_payload = %{
           job_id: job.id,
           status: "completed",
@@ -661,6 +683,8 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   defp fail_job(job, upstream, reason, response) do
+    UserLoad.done(job)
+
     failed_payload =
       %{
         job_id: job.id,
