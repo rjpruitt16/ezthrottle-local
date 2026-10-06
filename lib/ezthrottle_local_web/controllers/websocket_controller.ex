@@ -3,6 +3,8 @@ defmodule EzthrottleLocalWeb.WebSocketController do
 
   use EzthrottleLocalWeb, :controller
 
+  plug EzthrottleLocalWeb.NodeDraining
+
   alias EzthrottleLocal.{
     WebSocketConfig,
     WebSocketProtocol,

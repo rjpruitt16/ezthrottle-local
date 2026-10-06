@@ -7,6 +7,14 @@ defmodule EzthrottleLocal.Application do
 
   require Logger
 
+  # Runs on SIGTERM (init:stop) before the supervision tree shuts down, while
+  # the endpoint still serves /ready and can reject new work.
+  @impl true
+  def prep_stop(state) do
+    EzthrottleLocal.Lifecycle.drain()
+    state
+  end
+
   @impl true
   def start(_type, _args) do
     configure_httpc_ipfamily()

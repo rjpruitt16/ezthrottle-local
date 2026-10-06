@@ -9,6 +9,8 @@ defmodule EzthrottleLocalWeb.JobController do
   alias EzthrottleLocal.Redirect
   alias EzthrottleLocalWeb.JobStreamController
 
+  plug EzthrottleLocalWeb.NodeDraining when action in [:create, :proxy]
+
   def create(conn, params) do
     case Job.new(with_max_retries_header(conn, params)) do
       {:error, reason} ->

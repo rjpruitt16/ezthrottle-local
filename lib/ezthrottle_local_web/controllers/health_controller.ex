@@ -3,7 +3,7 @@ defmodule EzthrottleLocalWeb.HealthController do
 
   def index(conn, _params) do
     base = %{
-      status: "ok",
+      status: if(EzthrottleLocal.Lifecycle.draining?(), do: "draining", else: "ok"),
       l8_protocol: EzthrottleLocal.L8.version(),
       l8_public_key: EzthrottleLocal.L8.pub_b64(),
       admission: EzthrottleLocal.Admission.snapshot(),
@@ -21,5 +21,14 @@ defmodule EzthrottleLocalWeb.HealthController do
       end
 
     json(conn, body)
+  end
+
+  @doc "Readiness for load balancers: 503 with the draining headers once shutdown starts."
+  def ready(conn, _params) do
+    if EzthrottleLocal.Lifecycle.draining?() do
+      EzthrottleLocalWeb.NodeDraining.reject(conn)
+    else
+      json(conn, %{status: "ready"})
+    end
   end
 end

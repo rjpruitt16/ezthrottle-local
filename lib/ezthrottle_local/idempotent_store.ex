@@ -300,6 +300,17 @@ defmodule EzthrottleLocal.IdempotentStore do
     %{total_jobs: total, queue_depth: queued}
   end
 
+  @doc "Jobs on this node still :queued or :in_flight, webhook deliveries included."
+  def pending_count do
+    now = System.system_time(:millisecond)
+
+    :mnesia.dirty_select(@jobs_table, [
+      {{@jobs_table, :_, :_, :"$1", :queued}, [{:>, :"$1", now}], [true]},
+      {{@jobs_table, :_, :_, :"$1", :in_flight}, [{:>, :"$1", now}], [true]}
+    ])
+    |> length()
+  end
+
   @doc """
   Get the full Job struct by job_id. Returns the Job or nil.
   """
