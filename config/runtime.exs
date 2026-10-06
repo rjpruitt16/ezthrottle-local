@@ -35,6 +35,12 @@ if query = System.get_env("DNS_CLUSTER_QUERY") do
   config :ezthrottle_local, :dns_cluster_query, query
 end
 
+# Static membership for docker-compose and tests, e.g.
+# EZTHROTTLE_CLUSTER_HOSTS=ezthrottle@node-a,ezthrottle@node-b
+if hosts = System.get_env("EZTHROTTLE_CLUSTER_HOSTS") do
+  config :ezthrottle_local, :cluster_hosts, hosts
+end
+
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you

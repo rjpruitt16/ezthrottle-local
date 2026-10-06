@@ -27,6 +27,21 @@ defmodule EzthrottleLocal.Cluster do
         ]
 
       _ ->
+        static_topology()
+    end
+  end
+
+  defp static_topology do
+    case Application.get_env(:ezthrottle_local, :cluster_hosts) do
+      hosts when is_binary(hosts) and hosts != "" ->
+        nodes =
+          hosts
+          |> String.split(",", trim: true)
+          |> Enum.map(&(&1 |> String.trim() |> String.to_atom()))
+
+        [ezthrottle_static: [strategy: Cluster.Strategy.Epmd, config: [hosts: nodes]]]
+
+      _ ->
         []
     end
   end

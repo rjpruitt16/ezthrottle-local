@@ -183,6 +183,13 @@ defmodule EzthrottleLocal.Job do
   Checks Authorization, x-api-key, api-key headers in order.
   Returns a hashed queue key scoped to the user_id, or a hashed anonymous key.
   """
+  def queue_key(%__MODULE__{idempotency_scope: "shared", idempotent_key: key}) do
+    # Shared-scope jobs get one queue per shared key instead of per user, so
+    # every caller for that key reaches the same cluster-wide queue owner,
+    # whose store dedups them. Per-user jobs are unaffected.
+    :crypto.hash(:sha256, "shared" <> <<0>> <> key) |> Base.encode16(case: :lower)
+  end
+
   def queue_key(%__MODULE__{user_id: user_id, headers: headers}) do
     api_key =
       headers["Authorization"] ||

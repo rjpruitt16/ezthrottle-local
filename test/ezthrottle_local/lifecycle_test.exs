@@ -36,6 +36,9 @@ defmodule EzthrottleLocal.LifecycleTest do
   end
 
   setup do
+    # pending_count/0 is node-wide; other tests' leftover retries would make
+    # drain correctly wait on them.
+    IdempotentStore.clear_ledger()
     Lifecycle.reset()
     on_exit(&Lifecycle.reset/0)
     :ok
