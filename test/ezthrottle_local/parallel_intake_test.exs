@@ -101,4 +101,22 @@ defmodule EzthrottleLocal.ParallelIntakeTest do
     IdempotentStore.clear_ledger()
     assert :ok = IdempotentStore.check_or_insert(%{first | id: "again-#{stamp}-4"})
   end
+
+  test "a streamed job still gets its queue position" do
+    stamp = System.unique_integer([:positive])
+    domain = "http://position-#{stamp}.example"
+    watched = job("position-#{stamp}-1", "u1", domain)
+    actor = AccountQueueRegistry.actor_for(watched)
+    UrlActor.update_max_concurrent(actor, 0)
+
+    assert {:accepted, _} = AccountQueueRegistry.submit(job("position-#{stamp}-0", "u0", domain))
+    Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, "job:#{watched.id}")
+    assert {:accepted, _} = AccountQueueRegistry.submit(watched)
+
+    queue = :sys.get_state(actor).queues.shared
+    send(queue, :broadcast_positions)
+
+    assert_receive {:job_event, %{event: "position", job_id: id, position: 2}}, 1_000
+    assert id == watched.id
+  end
 end
