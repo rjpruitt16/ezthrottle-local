@@ -41,11 +41,33 @@ defmodule EzthrottleLocal.L8 do
 
   def ensure_trust(url) do
     domain = domain_from_url(url)
-    if ets_trusted?(domain) do
-      :ok
-    else
-      run_handshake(domain)
+
+    cond do
+      ets_trusted?(domain) -> :ok
+      recently_not_l8?(domain) -> :skip
+      true -> run_handshake(domain)
     end
+  end
+
+  # Receivers without /.well-known/l8 are remembered for this long before
+  # being probed again (they may add L8 later). Without it every webhook to
+  # such a receiver cost an extra HTTP request, a fresh :httpc connection
+  # and a log line. Mirrors Aquifer's l8NegativeTTL.
+  @not_l8_ttl_ms 5 * 60 * 1000
+
+  defp recently_not_l8?(domain) do
+    case :ets.lookup(:l8_not_trusted, domain) do
+      [{^domain, at}] -> System.monotonic_time(:millisecond) - at < @not_l8_ttl_ms
+      [] -> false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp remember_not_l8(domain) do
+    :ets.insert(:l8_not_trusted, {domain, System.monotonic_time(:millisecond)})
+  rescue
+    ArgumentError -> :ok
   end
 
   def is_trusted?(url), do: ets_trusted?(domain_from_url(url))
@@ -177,6 +199,7 @@ defmodule EzthrottleLocal.L8 do
     :persistent_term.put(:l8_pub_key, pub)
     :persistent_term.put(:l8_pub_b64, pub_b64)
     :ets.new(:l8_trust, [:named_table, :public, read_concurrency: true])
+    :ets.new(:l8_not_trusted, [:named_table, :public, read_concurrency: true])
     load_trust_from_disk()
     Process.send_after(self(), :cleanup_nonces, @nonce_ttl_ms)
     {:ok, %{nonces: %{}}}
@@ -258,6 +281,7 @@ defmodule EzthrottleLocal.L8 do
   defp run_handshake(domain) do
     case fetch_meta(domain) do
       {:ok, meta} ->
+        :ets.delete(:l8_not_trusted, domain)
         receiver_pub_b64    = Map.get(meta, "public_key", "")
         challenge_path      = Map.get(meta, "challenge_endpoint", "/l8/challenge")
         challenge_url       = if String.starts_with?(challenge_path, "http"),
@@ -302,6 +326,7 @@ defmodule EzthrottleLocal.L8 do
 
       _ ->
         Logger.info("[L8] No /.well-known/l8 at #{domain}, delivering without L8")
+        remember_not_l8(domain)
         :skip
     end
   end
