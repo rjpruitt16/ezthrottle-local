@@ -40,6 +40,11 @@ defmodule EzthrottleLocal.AccountQueue do
     # and it ran on every enqueue and dispatch: with a large backlog that
     # slowed dispatch to a crawl.
     queued: 0,
+    # Whether a :broadcast_positions tick is pending. Without it, every time
+    # the queue went from empty to non-empty a new 2s loop started while the
+    # old one kept running, and under steady traffic hundreds piled up, each
+    # walking the whole queue.
+    positions_scheduled: false,
     last_request_at: 0,
     # Earliest execute_before among queued jobs (ms), nil when none has one.
     # expire_queued_jobs/1 runs on every :process_next; without this it
@@ -394,6 +399,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info(:broadcast_positions, state) do
+    state = %{state | positions_scheduled: false}
     # On a standalone node every subscriber is local, so skip jobs nobody is
     # streaming. Broadcasting for every queued job blocked this process for
     # long stretches once a backlog built, and submissions waited on it.
@@ -412,9 +418,10 @@ defmodule EzthrottleLocal.AccountQueue do
     # resets the GenServer receive-timeout that :timeout below needs a real
     # 5-minute gap in to ever fire. handle_call({:enqueue, ...}) is what
     # restarts this once the queue has real work again.
-    if not :queue.is_empty(state.queue) do
-      schedule_position_broadcast()
-    end
+    state =
+      if :queue.is_empty(state.queue),
+        do: state,
+        else: schedule_position_broadcast(state)
 
     {:noreply, state, arm_idle_timeout()}
   end
@@ -611,7 +618,7 @@ defmodule EzthrottleLocal.AccountQueue do
     # Restart the position-broadcast loop exactly when it would have
     # stopped itself (see handle_info(:broadcast_positions, ...)) -- a
     # transition from genuinely idle to having real work again.
-    if was_empty, do: schedule_position_broadcast()
+    new_state = if was_empty, do: schedule_position_broadcast(new_state), else: new_state
     send(self(), :process_next)
     new_state
   end
@@ -965,8 +972,11 @@ defmodule EzthrottleLocal.AccountQueue do
     )
   end
 
-  defp schedule_position_broadcast do
+  defp schedule_position_broadcast(%{positions_scheduled: true} = state), do: state
+
+  defp schedule_position_broadcast(state) do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
+    %{state | positions_scheduled: true}
   end
 
   @doc """
