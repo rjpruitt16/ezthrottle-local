@@ -79,4 +79,21 @@ defmodule EzthrottleLocal.StoreCountsTest do
     IdempotentStore.update_status(legacy.id, :completed)
     assert IdempotentStore.counts() == %{total_jobs: 1, queue_depth: 0}
   end
+
+  test "drain events are recorded only with drain mode on" do
+    stamp = System.unique_integer([:positive])
+    System.delete_env("EZTHROTTLE_DRAIN_ENABLED")
+    off = job(stamp, 1)
+    :ok = IdempotentStore.check_or_insert(off)
+    IdempotentStore.update_status(off.id, :completed)
+    assert IdempotentStore.list_drain_events() == []
+
+    System.put_env("EZTHROTTLE_DRAIN_ENABLED", "true")
+    on_exit(fn -> System.delete_env("EZTHROTTLE_DRAIN_ENABLED") end)
+    on = job(stamp, 2)
+    :ok = IdempotentStore.check_or_insert(on)
+    IdempotentStore.update_status(on.id, :completed)
+    assert [%{job_id: id}] = IdempotentStore.list_drain_events()
+    assert id == on.id
+  end
 end

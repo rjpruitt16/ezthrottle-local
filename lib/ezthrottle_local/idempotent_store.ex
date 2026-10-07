@@ -670,9 +670,11 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   # ---- Private ----
 
+  # Only drain mode reads drain events. With it off, recording one was a
+  # sync_transaction per finished job, into a table nothing acknowledges.
   defp maybe_record_drain_event(%Job{} = job, hashed, status)
        when status in [:completed, :failed] do
-    unless Job.webhook_delivery_job?(job) do
+    unless Job.webhook_delivery_job?(job) or not drain_events_enabled?() do
       job_id = job.id
       recorded_at = System.system_time(:millisecond)
 
@@ -693,6 +695,13 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   defp maybe_record_drain_event(_job, _hashed, _status), do: :ok
+
+  defp drain_events_enabled? do
+    case System.get_env("EZTHROTTLE_DRAIN_ENABLED") do
+      nil -> false
+      val -> String.downcase(val) in ["1", "true", "yes"]
+    end
+  end
 
   defp next_drain_sequence do
     next =

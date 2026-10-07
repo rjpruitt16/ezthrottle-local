@@ -21,6 +21,19 @@ defmodule EzthrottleLocal.Application do
         {Cluster.Supervisor,
          [EzthrottleLocal.Cluster.topologies(), [name: EzthrottleLocal.ClusterSupervisor]]},
         {Phoenix.PubSub, name: EzthrottleLocal.PubSub},
+        # Pooled, persistent connections for upstream and webhook dispatch
+        # (AccountQueue.make_request/6). inet6: true tries IPv6 first and
+        # falls back to IPv4, matching the :httpc ipfamily below, so Fly's
+        # IPv6-only private network still works.
+        {Finch,
+         name: EzthrottleLocal.Finch,
+         pools: %{
+           default: [
+             size: 256,
+             count: System.schedulers_online(),
+             conn_opts: [transport_opts: [inet6: true]]
+           ]
+         }},
         {EzthrottleLocal.WebSocketStore, websocket_config},
         {EzthrottleLocal.WebSocketQueue, websocket_config},
         {Registry, keys: :unique, name: EzthrottleLocal.WebSocketSessionRegistry},

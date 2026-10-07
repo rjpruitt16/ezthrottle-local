@@ -40,7 +40,44 @@ defmodule EzthrottleLocal.Admission do
       )
     end
 
-    Agent.start_link(fn -> %{reject_streak: 0} end, name: __MODULE__)
+    counters()
+    Agent.start_link(fn -> nil end, name: __MODULE__)
+  end
+
+  # check/0 runs on every submission. Its state lives in :counters (atomic,
+  # no process), not the Agent: an Agent.update per request made every
+  # submission take turns through one process. Slots: 1 reject streak,
+  # 2 cached Mnesia dir bytes, 3 when they were read (ms), 4 cached memory
+  # MB, 5 when it was read.
+  @sample_ttl_ms 250
+
+  defp counters do
+    case :persistent_term.get({__MODULE__, :counters}, nil) do
+      nil ->
+        ref = :counters.new(5, [:write_concurrency])
+        :persistent_term.put({__MODULE__, :counters}, ref)
+        ref
+
+      ref ->
+        ref
+    end
+  end
+
+  # Both readings are expensive per request (stat-ing every Mnesia file;
+  # summing BEAM memory) and barely move in a few hundred milliseconds.
+  defp sampled(value_slot, at_slot, read) do
+    ref = counters()
+    now = System.monotonic_time(:millisecond)
+    at = :counters.get(ref, at_slot)
+
+    if at != 0 and now - at < @sample_ttl_ms do
+      :counters.get(ref, value_slot)
+    else
+      value = read.()
+      :counters.put(ref, value_slot, value)
+      :counters.put(ref, at_slot, now)
+      value
+    end
   end
 
   def memory_limit_mb, do: env_int("EZTHROTTLE_MEMORY_LIMIT_MB", 0)
@@ -59,13 +96,13 @@ defmodule EzthrottleLocal.Admission do
   """
   def check do
     cond do
-      memory_limit_mb() > 0 and current_memory_mb() > memory_limit_mb() ->
+      memory_limit_mb() > 0 and sampled_memory_mb() > memory_limit_mb() ->
         record_rejection()
-        {:rejected, "memory", memory_limit_mb(), current_memory_mb()}
+        {:rejected, "memory", memory_limit_mb(), sampled_memory_mb()}
 
-      db_max_bytes() > 0 and mnesia_dir_bytes() > db_max_bytes() ->
+      db_max_bytes() > 0 and sampled_db_bytes() > db_max_bytes() ->
         record_rejection()
-        {:rejected, "db_size", db_max_bytes(), mnesia_dir_bytes()}
+        {:rejected, "db_size", db_max_bytes(), sampled_db_bytes()}
 
       true ->
         record_allowed()
@@ -80,7 +117,7 @@ defmodule EzthrottleLocal.Admission do
   """
   def retry_after_seconds do
     base = base_retry_after_seconds()
-    streak = Agent.get(__MODULE__, & &1.reject_streak)
+    streak = :counters.get(counters(), 1)
 
     if streak <= 1 do
       base
@@ -109,13 +146,16 @@ defmodule EzthrottleLocal.Admission do
 
   # ---- Private ----
 
-  defp record_rejection do
-    Agent.update(__MODULE__, fn s -> %{s | reject_streak: s.reject_streak + 1} end)
-  end
+  defp record_rejection, do: :counters.add(counters(), 1, 1)
 
   defp record_allowed do
-    Agent.update(__MODULE__, fn s -> %{s | reject_streak: 0} end)
+    ref = counters()
+    if :counters.get(ref, 1) != 0, do: :counters.put(ref, 1, 0)
+    :ok
   end
+
+  defp sampled_memory_mb, do: sampled(4, 5, &current_memory_mb/0)
+  defp sampled_db_bytes, do: sampled(2, 3, &mnesia_dir_bytes/0)
 
   defp current_memory_mb do
     div(:erlang.memory(:total), 1_048_576)

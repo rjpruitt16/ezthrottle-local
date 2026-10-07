@@ -36,7 +36,12 @@ defmodule EzthrottleLocal.AccountQueue do
     queue: :queue.new(),
     pending_by_user: %{},
     in_flight: 0,
-    last_request_at: 0
+    last_request_at: 0,
+    # Earliest execute_before among queued jobs (ms), nil when none has one.
+    # expire_queued_jobs/1 runs on every :process_next; without this it
+    # copied and filtered the whole queue each time, which grew
+    # quadratically once a backlog built up.
+    next_deadline: nil
   ]
 
   # ---- Public API ----
@@ -425,6 +430,7 @@ defmodule EzthrottleLocal.AccountQueue do
   defp put_job(state, job, current_user_pending) do
     was_empty = :queue.is_empty(state.queue)
     new_queue = :queue.in(job, state.queue)
+    state = %{state | next_deadline: earliest_deadline(state.next_deadline, job)}
 
     new_state = %{
       state
@@ -441,11 +447,27 @@ defmodule EzthrottleLocal.AccountQueue do
     new_state
   end
 
-  defp expire_queued_jobs(state) do
+  defp expire_queued_jobs(%{next_deadline: nil} = state), do: state
+
+  defp expire_queued_jobs(%{next_deadline: deadline} = state) do
+    if System.system_time(:millisecond) < deadline,
+      do: state,
+      else: scan_expired_jobs(state)
+  end
+
+  defp earliest_deadline(current, %Job{execute_before: before})
+       when is_integer(before) and before > 0,
+       do: if(current == nil or before < current, do: before, else: current)
+
+  defp earliest_deadline(current, _job), do: current
+
+  defp scan_expired_jobs(state) do
     {kept, expired} =
       state.queue
       |> :queue.to_list()
       |> Enum.split_with(&(not Job.execution_expired?(&1)))
+
+    state = %{state | next_deadline: Enum.reduce(kept, nil, &earliest_deadline(&2, &1))}
 
     if expired == [] do
       state
@@ -905,28 +927,46 @@ defmodule EzthrottleLocal.AccountQueue do
         do: Enum.reject(job_headers, fn {k, _v} -> String.downcase(k) == "content-type" end),
         else: job_headers
 
-    headers = headers_to_charlist(job_headers ++ metric_headers ++ Map.to_list(l8_headers))
+    headers =
+      Enum.map(job_headers ++ metric_headers ++ Map.to_list(l8_headers), fn {k, v} ->
+        {to_string(k), to_string(v)}
+      end)
 
     method =
       case String.upcase(job.method) do
-        "GET" -> :get
-        "POST" -> :post
-        "PUT" -> :put
-        "PATCH" -> :patch
-        "DELETE" -> :delete
-        _ -> :get
+        m when m in ["GET", "POST", "PUT", "PATCH", "DELETE"] -> m
+        _ -> "GET"
       end
 
-    # :httpc uses {url, headers} for bodyless methods, {url, headers, content_type, body} for body methods
-    request =
-      if method in [:post, :put, :patch] do
-        {url, headers, String.to_charlist(content_type), body}
-      else
-        {url, headers}
+    has_content_type? = Enum.any?(headers, fn {k, _} -> String.downcase(k) == "content-type" end)
+
+    {headers, body} =
+      cond do
+        method not in ["POST", "PUT", "PATCH"] -> {headers, nil}
+        has_content_type? -> {headers, body}
+        true -> {[{"content-type", content_type} | headers], body}
       end
 
-    case :httpc.request(method, request, [{:timeout, timeout}], []) do
-      {:ok, {{_, status, _}, resp_headers, resp_body}} ->
+    # Finch keeps a pool of persistent connections per host. :httpc's
+    # default profile sent every request through one manager process and
+    # kept few connections per host, which capped throughput on a single
+    # busy upstream.
+    request = Finch.build(method, to_string(url), headers, body)
+
+    result =
+      try do
+        Finch.request(request, EzthrottleLocal.Finch,
+          request_timeout: timeout,
+          pool_timeout: 30_000
+        )
+      rescue
+        e -> {:error, e}
+      catch
+        :exit, reason -> {:error, reason}
+      end
+
+    case result do
+      {:ok, %Finch.Response{status: status, headers: resp_headers, body: resp_body}} ->
         resp_headers = charlist_headers_to_map(resp_headers)
 
         EzthrottleLocal.L8.Schemas.observe_hash(
@@ -937,7 +977,7 @@ defmodule EzthrottleLocal.AccountQueue do
         {:ok,
          %{
            status: status,
-           body: to_string(resp_body),
+           body: resp_body,
            headers: resp_headers
          }}
 
@@ -988,10 +1028,6 @@ defmodule EzthrottleLocal.AccountQueue do
     else
       [{orca_header, "text"} | metric_headers]
     end
-  end
-
-  defp headers_to_charlist(headers) do
-    Enum.map(headers, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
   end
 
   defp charlist_headers_to_map(headers) do
