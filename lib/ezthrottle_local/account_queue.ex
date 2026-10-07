@@ -405,20 +405,17 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info(:broadcast_positions, state) do
+    # On a standalone node every subscriber is local, so skip jobs nobody is
+    # streaming. Broadcasting for every queued job blocked this process for
+    # long stretches once a backlog built, and submissions waited on it.
+    standalone? = Cluster.standalone?()
+
     state.queue
     |> :queue.to_list()
     |> Enum.with_index(1)
     |> Enum.each(fn {job, position} ->
-      Phoenix.PubSub.broadcast(
-        EzthrottleLocal.PubSub,
-        "job:#{job.id}",
-        {:job_event,
-         %{
-           event: "position",
-           job_id: job.id,
-           position: position
-         }}
-      )
+      if not standalone? or Registry.lookup(EzthrottleLocal.PubSub, "job:#{job.id}") != [],
+        do: broadcast_position(job, position)
     end)
 
     # Only keep rescheduling while there's still something to report --
@@ -444,6 +441,19 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   # ---- Private ----
+
+  defp broadcast_position(job, position) do
+    Phoenix.PubSub.broadcast(
+      EzthrottleLocal.PubSub,
+      "job:#{job.id}",
+      {:job_event,
+       %{
+         event: "position",
+         job_id: job.id,
+         position: position
+       }}
+    )
+  end
 
   defp submit_inserted_job(state, job, enforce_limit) do
     case enqueue_job(state, job, enforce_limit) do
