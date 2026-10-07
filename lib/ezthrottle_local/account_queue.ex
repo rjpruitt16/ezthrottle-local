@@ -514,7 +514,6 @@ defmodule EzthrottleLocal.AccountQueue do
     started_at = System.monotonic_time(:millisecond)
     upstream = Metrics.upstream(job.pool_id || dispatch_url)
 
-    IdempotentStore.update_status(job.id, :in_flight)
     Metrics.job_dispatched(job.user_id, upstream)
 
     Phoenix.PubSub.broadcast(

@@ -158,6 +158,26 @@ Ingest absorbs the burst exactly like Aquifer's — 100% success, single-digit-m
 
 ---
 
+## 7. Per-job overhead (`make perf`)
+
+The throughput ceiling above measures intake only: dispatch ran at the default 2 RPS, so it never tested receiving and sending at the same time. `make perf` does. It runs in-process against a local upstream and webhook receiver that answer instantly and advertise a very high rate, and mirrors Aquifer's `make perf` so the two can be compared on one machine.
+
+- **Job latency** sends one job at a time and splits its trip into accept (validated and stored, i.e. `POST /jobs` returns), queue (accepted until the upstream receives it) and total.
+- **Pipeline throughput** has 8 concurrent callers submit 2000 jobs and reports how many per second are accepted, dispatched, completed and have their webhook delivered. It runs on an empty store, then with 100k finished jobs retained, since completed jobs are kept for 30 minutes and a busy node always carries many.
+
+Baseline, 2026-10-06, Apple M3 Max laptop:
+
+| | accept | queue | total | jobs/s, empty | jobs/s, 100k retained |
+|---|---:|---:|---:|---:|---:|
+| Before (`counts/0` scanned the jobs table on every dispatch; `:in_flight` written per job) | 0.51 ms | 0.45 ms | 0.96 ms | 1104 | 287 |
+| After (running counters; no `:in_flight` write) | 0.48 ms | 0.41 ms | 0.89 ms | 1380 | 713 |
+
+Single-job latency barely moves, since an empty table is cheap to scan. Throughput with retained jobs is where the scan hurt: 2.5x faster after the fix. Even after it, 100k retained jobs still roughly halve throughput. Part of that is Mnesia's own disk dump: on this machine `dump_log` averages about 2.4 ms on an empty table and 6.6 ms at 100k rows, with spikes over 80 ms when it rewrites the table file. That isn't fully pinned down yet.
+
+These numbers aren't directly comparable to Aquifer's Pebble row. EZThrottle acknowledges a job before it reaches disk (flushed every 100ms, see section 1), while Pebble syncs every write.
+
+---
+
 ## Reproducing these results
 
 ```bash

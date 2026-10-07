@@ -145,8 +145,12 @@ defmodule EzthrottleLocal.IdempotentStore do
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
 
     case result do
-      :ok -> register_job_owner(job.id)
-      {:duplicate, existing_id} -> register_job_owner(existing_id)
+      :ok ->
+        count_insert(:queued)
+        register_job_owner(job.id)
+
+      {:duplicate, existing_id} ->
+        register_job_owner(existing_id)
     end
 
     result
@@ -168,11 +172,21 @@ defmodule EzthrottleLocal.IdempotentStore do
   defp delete_job_local(%Job{} = job) do
     hashed = hash_key(job)
 
-    :mnesia.sync_transaction(fn ->
-      :mnesia.delete({@jobs_table, job.id})
-      :mnesia.delete({@results_table, job.id})
-      :mnesia.delete({@keys_table, hashed})
-    end)
+    {:atomic, old_status} =
+      :mnesia.sync_transaction(fn ->
+        old_status =
+          case :mnesia.read(@jobs_table, job.id) do
+            [{@jobs_table, _, _, _, status}] -> status
+            [] -> nil
+          end
+
+        :mnesia.delete({@jobs_table, job.id})
+        :mnesia.delete({@results_table, job.id})
+        :mnesia.delete({@keys_table, hashed})
+        old_status
+      end)
+
+    if old_status, do: count_delete(old_status)
 
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
     unregister_job_owner(job.id)
@@ -191,9 +205,10 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   defp update_status_local(job_id, status) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
-      [{@jobs_table, ^job_id, job, _expires_at, _old_status}] ->
+      [{@jobs_table, ^job_id, job, _expires_at, old_status}] ->
         new_expires = System.system_time(:millisecond) + ttl_ms(status)
         :mnesia.dirty_write({@jobs_table, job_id, job, new_expires, status})
+        count_move(old_status, status)
 
         hashed = hash_key(job)
 
@@ -264,24 +279,69 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   @doc """
-  Returns total jobs and queue depth from Mnesia for autoscaler headers.
+  Returns total jobs and queue depth on this node for the autoscaler headers
+  sent with every dispatch. Reads running counters instead of scanning the
+  jobs table: completed jobs are kept for 30 minutes, so a scan grew with
+  throughput and ran on every upstream request. Expired rows count until the
+  next cleanup pass (at most a minute).
   """
   def counts do
-    now = System.system_time(:millisecond)
+    ref = counters()
+    %{total_jobs: max(:counters.get(ref, 1), 0), queue_depth: max(:counters.get(ref, 2), 0)}
+  end
 
-    total =
-      :mnesia.dirty_select(@jobs_table, [
-        {{@jobs_table, :_, :_, :"$1", :_}, [{:>, :"$1", now}], [true]}
-      ])
-      |> length()
+  # Counter 1 is every job row, counter 2 the jobs not yet completed or
+  # failed. :in_flight is a status older versions wrote; it counts as queued.
+  defp counters do
+    case :persistent_term.get({__MODULE__, :counters}, nil) do
+      nil -> seed_counts()
+      ref -> ref
+    end
+  end
 
-    queued =
-      :mnesia.dirty_select(@jobs_table, [
-        {{@jobs_table, :_, :_, :"$1", :queued}, [{:>, :"$1", now}], [true]}
-      ])
-      |> length()
+  @doc false
+  # Rebuilds the counters from a full scan: at boot, and after the tables
+  # are wiped. Public so tests can compare against a scan.
+  def seed_counts do
+    ref =
+      case :persistent_term.get({__MODULE__, :counters}, nil) do
+        nil ->
+          ref = :counters.new(2, [:write_concurrency])
+          :persistent_term.put({__MODULE__, :counters}, ref)
+          ref
 
-    %{total_jobs: total, queue_depth: queued}
+        ref ->
+          ref
+      end
+
+    statuses =
+      :mnesia.dirty_select(@jobs_table, [{{@jobs_table, :_, :_, :_, :"$1"}, [], [:"$1"]}])
+
+    :counters.put(ref, 1, length(statuses))
+    :counters.put(ref, 2, Enum.count(statuses, &pending_status?/1))
+    ref
+  end
+
+  defp pending_status?(status), do: status in [:queued, :in_flight]
+
+  defp count_insert(status) do
+    ref = counters()
+    :counters.add(ref, 1, 1)
+    if pending_status?(status), do: :counters.add(ref, 2, 1)
+  end
+
+  defp count_delete(status) do
+    ref = counters()
+    :counters.sub(ref, 1, 1)
+    if pending_status?(status), do: :counters.sub(ref, 2, 1)
+  end
+
+  defp count_move(old, new) do
+    case {pending_status?(old), pending_status?(new)} do
+      {true, false} -> :counters.sub(counters(), 2, 1)
+      {false, true} -> :counters.add(counters(), 2, 1)
+      _ -> :ok
+    end
   end
 
   @doc """
@@ -301,10 +361,8 @@ defmodule EzthrottleLocal.IdempotentStore do
   @doc """
   Returns every Job currently at :queued or :in_flight status, regardless
   of expiry. Called once at boot to re-enqueue work that survived a crash
-  or restart — :in_flight is included because a job that was mid-dispatch
-  when the node died has no way to resume on its own; treating it like a
-  fresh :queued job is the same "safety net" Aquifer applies to stale
-  in-flight jobs.
+  or restart. Jobs stay :queued until they finish; :in_flight is still
+  matched so rows written by older versions are recovered too.
   """
   def recoverable_jobs do
     {:atomic, jobs} =
@@ -415,6 +473,7 @@ defmodule EzthrottleLocal.IdempotentStore do
     :mnesia.clear_table(@delivery_table)
     :mnesia.clear_table(@drain_events_table)
     :mnesia.clear_table(@drain_sequence_table)
+    seed_counts()
     Enum.each(job_ids, &unregister_job_owner/1)
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
     :ok
@@ -452,6 +511,7 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   @impl true
   def init(_) do
+    seed_counts()
     register_existing_job_owners()
     schedule_cleanup()
     schedule_flush()
@@ -501,7 +561,8 @@ defmodule EzthrottleLocal.IdempotentStore do
 
     @jobs_table
     |> delete_matching(key_and_job_spec)
-    |> Enum.each(fn {@jobs_table, job_id, _job, _expires_at, _status} ->
+    |> Enum.each(fn {@jobs_table, job_id, _job, _expires_at, status} ->
+      count_delete(status)
       unregister_job_owner_local(job_id)
     end)
 
