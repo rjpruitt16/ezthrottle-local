@@ -63,10 +63,15 @@ defmodule EzthrottleLocal.ClusterTest do
 
     assert queue_a == queue_b
     assert Cluster.lookup_account_queue(domain, :shared) == queue_a
-    assert Cluster.lookup_job_store(accepted_job.id) == Process.whereis(IdempotentStore)
+    # A standalone node doesn't register job owners with Syn (only routing
+    # between nodes needs them); lookups miss and reads fall back to the
+    # local store. The two-node contract test covers clustered ownership.
+    assert Cluster.standalone?()
+    assert Cluster.lookup_job_store(accepted_job.id) == nil
+    assert IdempotentStore.get_job(accepted_job.id).id == accepted_job.id
 
     IdempotentStore.delete_job(accepted_job)
-    assert Cluster.lookup_job_store(accepted_job.id) == nil
+    assert IdempotentStore.get_job(accepted_job.id) == nil
   end
 
   test "per-user ceiling rejects only that user and internal work bypasses it" do

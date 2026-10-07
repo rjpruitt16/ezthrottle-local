@@ -353,7 +353,7 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   defp get_job_local(job_id) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
-      [{@jobs_table, ^job_id, job, _expires_at, _status}] -> job
+      [{@jobs_table, ^job_id, job, _expires_at, _status}] -> Job.upgrade(job)
       [] -> nil
     end
   end
@@ -373,7 +373,7 @@ defmodule EzthrottleLocal.IdempotentStore do
         ])
       end)
 
-    jobs
+    Enum.map(jobs, &Job.upgrade/1)
   end
 
   @doc """
@@ -630,6 +630,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   defp register_job_owner(job_id) do
+    if Cluster.standalone?(), do: :ok, else: register_job_owner_routed(job_id)
+  end
+
+  defp register_job_owner_routed(job_id) do
     case Process.whereis(__MODULE__) do
       pid when pid == self() -> register_job_owner_local(job_id)
       _pid -> GenServer.call(__MODULE__, {:register_job_owner, job_id})
@@ -637,6 +641,10 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   defp unregister_job_owner(job_id) do
+    if Cluster.standalone?(), do: :ok, else: unregister_job_owner_routed(job_id)
+  end
+
+  defp unregister_job_owner_routed(job_id) do
     case Process.whereis(__MODULE__) do
       pid when pid == self() -> unregister_job_owner_local(job_id)
       _pid -> GenServer.call(__MODULE__, {:unregister_job_owner, job_id})
@@ -644,6 +652,13 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   defp register_job_owner_local(job_id) do
+    # Job ownership only matters for routing between nodes. Registering every
+    # job with Syn went through one process per job, so standalone nodes skip
+    # it; lookups then miss and fall back to the local store.
+    if Cluster.standalone?(), do: :ok, else: register_job_owner_syn(job_id)
+  end
+
+  defp register_job_owner_syn(job_id) do
     case :syn.register(Cluster.job_store_scope(), job_id, self()) do
       :ok -> :ok
       {:error, :taken} -> :ok

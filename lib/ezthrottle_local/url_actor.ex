@@ -77,6 +77,11 @@ defmodule EzthrottleLocal.UrlActor do
     GenServer.call(pid, {:enqueue_prepared, job}, 15_000)
   end
 
+  @doc "Fair admission and enqueue for a job the caller already persisted (a new submission)."
+  def admit_new(pid, %Job{} = job) do
+    GenServer.call(pid, {:admit_new, job}, 15_000)
+  end
+
   def update_rps(pid, rps) do
     GenServer.cast(pid, {:update_rps, rps})
   end
@@ -210,6 +215,11 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_call({:prepare, job}, _from, state) do
     route_to_queue(:prepare, job, state)
+  end
+
+  @impl true
+  def handle_call({:admit_new, job}, _from, state) do
+    route_to_queue(:admit_new, job, state)
   end
 
   @impl true
@@ -431,6 +441,7 @@ defmodule EzthrottleLocal.UrlActor do
         :submit_internal -> AccountQueue.submit_internal(queue_pid, job)
         :prepare -> AccountQueue.prepare(queue_pid, job)
         :enqueue_prepared -> admit_prepared(queue_pid, job, new_state, :prepared)
+        :admit_new -> admit_prepared(queue_pid, job, new_state, :new)
         :enqueue -> AccountQueue.enqueue(queue_pid, job)
       end
 
@@ -525,13 +536,19 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   defp safe_queue_snapshot(pid) do
-    AccountQueue.snapshot(pid)
+    case AccountQueue.local_backlog(pid) do
+      {:ok, backlog} -> %{backlog: backlog, active: backlog > 0}
+      :unknown -> AccountQueue.snapshot(pid)
+    end
   catch
     :exit, _reason -> %{backlog: 0, active: false}
   end
 
   defp safe_queue_active?(pid) do
-    AccountQueue.active?(pid)
+    case AccountQueue.local_backlog(pid) do
+      {:ok, backlog} -> backlog > 0
+      :unknown -> AccountQueue.active?(pid)
+    end
   catch
     :exit, _reason -> false
   end

@@ -71,6 +71,63 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
+  # Each queue's backlog (queued + in flight), kept by the queue itself so
+  # fair admission can read local queues without calling every one of them
+  # on every submission. Dispatch moves a job from queued to in flight, so
+  # only enqueue, completion and expiry change it.
+  @backlog_table :ez_queue_backlog
+
+  @doc false
+  def ensure_backlog_table do
+    if :ets.whereis(@backlog_table) == :undefined do
+      :ets.new(@backlog_table, [
+        :named_table,
+        :public,
+        :set,
+        write_concurrency: true,
+        read_concurrency: true
+      ])
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc "This node's queue backlog from the shared table, or :unknown (remote or not tracked)."
+  def local_backlog(pid) when node(pid) == node() do
+    case :ets.lookup(@backlog_table, pid) do
+      [{^pid, backlog}] -> if Process.alive?(pid), do: {:ok, max(backlog, 0)}, else: :unknown
+      [] -> :unknown
+    end
+  rescue
+    ArgumentError -> :unknown
+  end
+
+  def local_backlog(_pid), do: :unknown
+
+  defp backlog_add(0), do: :ok
+
+  defp backlog_add(n) do
+    :ets.update_counter(@backlog_table, self(), {2, n}, {self(), 0})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp backlog_reset do
+    :ets.insert(@backlog_table, {self(), 0})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp backlog_forget do
+    :ets.delete(@backlog_table, self())
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc "Persists and admits a new client submission on the queue-owning node."
   def submit(pid, %Job{} = job), do: GenServer.call(pid, {:submit, job}, 15_000)
 
@@ -140,6 +197,7 @@ defmodule EzthrottleLocal.AccountQueue do
     }
 
     :ok = Cluster.join_upstream(upstream, self())
+    backlog_reset()
 
     # No schedule_position_broadcast/0 here -- a fresh queue is always
     # immediately enqueued into (find_or_spawn_queue's one caller does both
@@ -378,6 +436,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_info(:timeout, state) do
     if :queue.is_empty(state.queue) and state.in_flight == 0 do
+      backlog_forget()
       {:stop, :normal, state}
     else
       {:noreply, state, arm_idle_timeout()}
@@ -398,7 +457,12 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
-  defp prepare_submission(job, enforce_admission) do
+  @doc """
+  Persists a submission and runs instance admission without touching the
+  queue's state, so it can run in the caller's process. See
+  AccountQueueRegistry.submit/2.
+  """
+  def prepare_submission(job, enforce_admission) do
     case IdempotentStore.check_or_insert(job) do
       {:duplicate, existing_id} ->
         {:duplicate, existing_id}
@@ -430,6 +494,7 @@ defmodule EzthrottleLocal.AccountQueue do
   defp put_job(state, job, current_user_pending) do
     was_empty = :queue.is_empty(state.queue)
     new_queue = :queue.in(job, state.queue)
+    backlog_add(1)
     state = %{state | next_deadline: earliest_deadline(state.next_deadline, job)}
 
     new_state = %{
@@ -472,6 +537,7 @@ defmodule EzthrottleLocal.AccountQueue do
     if expired == [] do
       state
     else
+      backlog_add(-length(expired))
       state = %{state | queue: :queue.from_list(kept)}
 
       state =
@@ -1151,6 +1217,8 @@ defmodule EzthrottleLocal.AccountQueue do
       |> maybe_update_rps(rps_header)
       |> maybe_update_max_concurrent(max_concurrent_header)
       |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+
+    if state.in_flight > 0, do: backlog_add(-1)
 
     if new_state.rps != state.rps do
       Metrics.flow_rate(state.upstream, new_state.rps)

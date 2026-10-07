@@ -53,23 +53,61 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     |> route_to_actor(:enqueue, job, account_queue_header)
   end
 
-  @doc "Claims the job's cluster-wide queue, then persists and admits it on that owner node."
+  @doc """
+  Claims the job's cluster-wide queue, then persists and admits it on that
+  owner node.
+
+  On a standalone node the owner is always this node, so the persist step
+  (the Mnesia insert and instance admission) runs here in the caller's
+  process instead of inside the UrlActor and AccountQueue processes. Those
+  are one per domain, and doing the insert inside them made every
+  submission and webhook for a domain wait in line for the one before it.
+  """
   def submit(%Job{} = job, account_queue_header \\ nil) do
-    job
-    |> actor_for()
-    |> route_to_actor(:submit, job, account_queue_header)
+    pid = actor_for(job)
+
+    if Cluster.standalone?() do
+      apply_account_queue_header(pid, account_queue_header)
+
+      case AccountQueue.prepare_submission(job, true) do
+        {:prepared, prepared} -> UrlActor.admit_new(pid, prepared)
+        other -> other
+      end
+    else
+      route_to_actor(pid, :submit, job, account_queue_header)
+    end
   end
 
   def submit_internal(%Job{} = job, account_queue_header \\ nil) do
-    job
-    |> actor_for()
-    |> route_to_actor(:submit_internal, job, account_queue_header)
+    pid = actor_for(job)
+
+    if Cluster.standalone?() do
+      apply_account_queue_header(pid, account_queue_header)
+
+      case AccountQueue.prepare_submission(job, false) do
+        {:prepared, prepared} ->
+          case UrlActor.enqueue(pid, prepared) do
+            :ok -> {:accepted, prepared}
+            other -> other
+          end
+
+        other ->
+          other
+      end
+    else
+      route_to_actor(pid, :submit_internal, job, account_queue_header)
+    end
   end
 
   def prepare(%Job{} = job, account_queue_header \\ nil) do
-    job
-    |> actor_for()
-    |> route_to_actor(:prepare, job, account_queue_header)
+    pid = actor_for(job)
+
+    if Cluster.standalone?() do
+      apply_account_queue_header(pid, account_queue_header)
+      AccountQueue.prepare_submission(job, true)
+    else
+      route_to_actor(pid, :prepare, job, account_queue_header)
+    end
   end
 
   def enqueue_prepared(%Job{} = job, account_queue_header \\ nil) do
@@ -125,6 +163,25 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   mode's circuit breaker (EzthrottleLocal.Proxy) to check/trip breaker
   state before a job is ever actually queued.
   """
+  def actor_for(%Job{pool_id: nil, url: url} = job) when is_binary(url) do
+    # Read the actor table directly; only spawning a new actor needs the
+    # registry process, which every submission used to call.
+    key = url_key(url)
+
+    case :ets.lookup(@default_table, key) do
+      [{^key, pid}] when node(pid) != node() ->
+        pid
+
+      [{^key, pid}] ->
+        if Process.alive?(pid), do: pid, else: GenServer.call(__MODULE__, {:actor_for, job})
+
+      [] ->
+        GenServer.call(__MODULE__, {:actor_for, job})
+    end
+  rescue
+    ArgumentError -> GenServer.call(__MODULE__, {:actor_for, job})
+  end
+
   def actor_for(%Job{} = job) do
     GenServer.call(__MODULE__, {:actor_for, job})
   end
@@ -181,6 +238,7 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
   @impl true
   def init(%{table: table}) do
     :ets.new(table, [:named_table, :public, :set, read_concurrency: true])
+    EzthrottleLocal.AccountQueue.ensure_backlog_table()
 
     # Drain mode's watchdog: only scheduled at all if enabled?/0 is true at
     # startup -- disabled means exactly that no periodic check ever runs,
