@@ -504,21 +504,19 @@ defmodule EzthrottleLocal.AccountQueue do
         parent = self()
         pool_pid = state.pool_pid
         member_id = member && member.id
+        # Bind what the worker needs before spawning: a closure that mentions
+        # `state.rps` captures all of `state`, including the queue, and a new
+        # process starts with a copy of everything its closure captured. With
+        # thousands of jobs queued, every dispatch copied the whole queue
+        # (milliseconds each, and a copy held by every in-flight worker).
+        rps = state.rps
+        max_concurrent = state.max_concurrent
+        queue_key = state.queue_key
 
         # spawn, not Task.start: Task.start reads this process's info for
-        # caller metadata, which costs more the bigger this queue's state
-        # gets. Nothing awaits these.
+        # caller metadata. Nothing awaits these.
         spawn(fn ->
-          execute(
-            job,
-            dispatch_url,
-            parent,
-            state.rps,
-            state.max_concurrent,
-            state.queue_key,
-            pool_pid,
-            member_id
-          )
+          execute(job, dispatch_url, parent, rps, max_concurrent, queue_key, pool_pid, member_id)
         end)
 
         {:dispatched, new_state}
@@ -1003,8 +1001,20 @@ defmodule EzthrottleLocal.AccountQueue do
   # fresh timeout restarts it, so UrlActor's 3s budget poll (and /health) kept
   # idle queues alive forever. Real work re-arms the deadline; probes reply
   # with whatever time is left.
+  # The timeout is re-armed on every message, so it's read from the
+  # environment once per queue process rather than each time.
   defp arm_idle_timeout do
-    timeout = idle_timeout_ms()
+    timeout =
+      case Process.get(:idle_timeout_ms) do
+        nil ->
+          t = idle_timeout_ms()
+          Process.put(:idle_timeout_ms, t)
+          t
+
+        t ->
+          t
+      end
+
     Process.put(:idle_deadline_ms, System.monotonic_time(:millisecond) + timeout)
     timeout
   end
