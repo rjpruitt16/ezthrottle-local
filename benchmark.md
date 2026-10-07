@@ -190,9 +190,11 @@ This measures accepting, dispatching, completing and delivering each job's webho
 
 | Machine | Sustained jobs/s | p99, submit to webhook | Past the ceiling |
 |---|---:|---:|---|
-| performance-1x | ~700 | ~0.15 s | mostly sheds with 429; some client errors at 900 |
-| performance-2x | ~1,300 | 41 ms | sheds with 429 |
-| performance-4x | ~2,500 | 87 ms | sheds with 429 |
+| performance-1x | ~700 | ~80 ms | falls behind, drains back to 0 |
+| performance-2x | ~1,300-1,500 | ~60 ms | falls behind, drains back to 0 |
+| performance-4x | ~3,000 | ~0.3 s (1.1 s at 3,000) | sheds with 429, drains back to 0 |
+
+For comparison, Aquifer on the same harness: ~1,000 / ~1,500 / ~3,000 (its benchmark.md section 12).
 
 Before the changes below, the same test on performance-1x accepted about 60 jobs/s, and the node was OOM-killed within a minute.
 
@@ -224,10 +226,16 @@ Then the per-domain `UrlActor` came off the per-job path and overload started sh
 | One dispatch per `:process_next` message, so dispatch speed depended on how fast the mailbox drained | Dispatch up to the free concurrency per pass (64 max; paced queues unchanged) |
 | A new position-broadcast loop started each time the queue went from empty to non-empty; under steady traffic hundreds ran at once | At most one loop per queue |
 
+The last and largest fix came from timing each kind of message inside the queue process:
+
+| Problem | Fix |
+|---|---|
+| The dispatch `spawn(fn -> execute(..., state.rps, ...) end)` closure mentioned `state`, so it captured the whole queue state, and every new worker started with a copy of every queued job. With ~8,000 jobs queued, `:process_next` took ~2.4 ms and the queue spent 95% of its time there; every in-flight worker held a copy of the queue (the likely cause of the earlier OOM). | Bind the few fields the worker needs to local variables before spawning. `:process_next` went from ~2,400 µs to ~25 µs, `job_done` from ~200/s to ~5,300/s, and an overloaded queue drains in seconds instead of minutes. |
+| `arm_idle_timeout` read two environment variables on every message | Read once per queue process |
+
 **Still open.**
-- **Draining after overload is slow.** After a burst fills the backlog (10,000), the queue drains at well under its steady-state rate, and minutes later thousands of jobs can still be queued. The causes found so far are fixed (queue length, one dispatch per message, piled-up broadcast loops). The queue process still handles too few messages per second, and the remaining cost isn't identified yet. Every completion is a synchronous `job_done` call into the queue, which is the next suspect.
-- **1x still shows some client errors** past its ceiling instead of only 429s; the in-flight cap (512) may be high for one core.
 - **Clustered nodes keep the old path.** Everything above applies only to standalone nodes.
+- **One process per queue** is now the remaining serial point. At ~25 µs per message it allows tens of thousands of messages a second, well above the measured ceilings.
 
 ---
 
