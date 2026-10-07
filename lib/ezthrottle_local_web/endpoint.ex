@@ -38,6 +38,7 @@ defmodule EzthrottleLocalWeb.Endpoint do
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint], log: {__MODULE__, :log_level, []}
 
+  plug EzthrottleLocalWeb.Plugs.InFlightLimit
   plug EzthrottleLocalWeb.Plugs.BodyLimit
 
   plug Plug.Parsers,
