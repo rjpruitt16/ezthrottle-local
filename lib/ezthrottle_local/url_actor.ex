@@ -496,7 +496,12 @@ defmodule EzthrottleLocal.UrlActor do
 
   defp queue_snapshot_for_job(state, job) do
     queue_key = if state.account_queue_enabled, do: Job.queue_key(job), else: @shared_queue_key
-    queue_pid = Cluster.lookup_account_queue(state.domain, queue_key)
+
+    queue_pid =
+      if Cluster.standalone?(),
+        do: Map.get(state.queues, queue_key),
+        else: Cluster.lookup_account_queue(state.domain, queue_key)
+
     {active_queues, total_pending, queue_pending} = queue_counts(state, queue_pid, false)
 
     %{
@@ -553,7 +558,17 @@ defmodule EzthrottleLocal.UrlActor do
     :exit, _reason -> false
   end
 
+  # On a standalone node this actor's own monitored map is authoritative.
+  # A Syn lookup checks that the pid is alive, and is_process_alive on a
+  # busy local queue waits behind that queue's mailbox.
   defp find_or_spawn_queue(queue_key, state) do
+    case Cluster.standalone?() && Map.get(state.queues, queue_key) do
+      pid when is_pid(pid) -> {pid, state}
+      _ -> find_or_spawn_registered_queue(queue_key, state)
+    end
+  end
+
+  defp find_or_spawn_registered_queue(queue_key, state) do
     case Cluster.lookup_account_queue(state.domain, queue_key) do
       nil -> spawn_registered_queue(queue_key, state)
       pid -> track_queue(queue_key, pid, state)
@@ -597,7 +612,11 @@ defmodule EzthrottleLocal.UrlActor do
     Process.send_after(self(), :check_aggregate_budget, @budget_check_ms)
   end
 
-  defp all_queue_pids(state), do: Cluster.account_queues_for_upstream(state.domain)
+  defp all_queue_pids(state) do
+    if Cluster.standalone?(),
+      do: Map.values(state.queues),
+      else: Cluster.account_queues_for_upstream(state.domain)
+  end
 
   defp hydrate_cluster_state(state) do
     state.domain

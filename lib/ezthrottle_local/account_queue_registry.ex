@@ -169,11 +169,10 @@ defmodule EzthrottleLocal.AccountQueueRegistry do
     key = url_key(url)
 
     case :ets.lookup(@default_table, key) do
-      [{^key, pid}] when node(pid) != node() ->
-        pid
-
+      # The registry monitors actors and removes them on exit, so no
+      # liveness check (which would wait behind a busy actor's mailbox).
       [{^key, pid}] ->
-        if Process.alive?(pid), do: pid, else: GenServer.call(__MODULE__, {:actor_for, job})
+        pid
 
       [] ->
         GenServer.call(__MODULE__, {:actor_for, job})

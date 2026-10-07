@@ -97,7 +97,10 @@ defmodule EzthrottleLocal.AccountQueue do
   @doc "This node's queue backlog from the shared table, or :unknown (remote or not tracked)."
   def local_backlog(pid) when node(pid) == node() do
     case :ets.lookup(@backlog_table, pid) do
-      [{^pid, backlog}] -> if Process.alive?(pid), do: {:ok, max(backlog, 0)}, else: :unknown
+      # No liveness check: is_process_alive on a busy local process waits
+      # behind its mailbox. Callers only ask about queues they track by
+      # monitor.
+      [{^pid, backlog}] -> {:ok, max(backlog, 0)}
       [] -> :unknown
     end
   rescue
