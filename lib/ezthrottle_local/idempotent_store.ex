@@ -118,6 +118,72 @@ defmodule EzthrottleLocal.IdempotentStore do
     hashed = hash_key(job)
     expires_at = System.system_time(:millisecond) + ttl_ms(:queued)
 
+    result =
+      case gate_claim(hashed, job.id) do
+        :claimed ->
+          # The gate already made this the only insert for the key, so the
+          # rows are written without a transaction: no trip through
+          # Mnesia's lock manager per submission. Dirty writes are still
+          # logged and flushed on the same 100ms timer.
+          :mnesia.dirty_write({@keys_table, hashed, job.id, expires_at, :queued})
+          :mnesia.dirty_write({@jobs_table, job.id, job, expires_at, :queued})
+          :ok
+
+        {:taken, existing_id} ->
+          {:duplicate, existing_id}
+
+        :no_gate ->
+          check_or_insert_transaction(hashed, job, expires_at)
+      end
+
+    finish_check_or_insert(job, result)
+  end
+
+  # The key gate: :ets.insert_new is atomic, so of any concurrent inserts for
+  # one key exactly one claims it. It mirrors the keys table (seeded at boot,
+  # cleared wherever keys are deleted). Without the table (it's owned by this
+  # GenServer), fall back to the transaction.
+  @key_gate :idempotent_key_gate
+
+  defp gate_claim(hashed, job_id) do
+    if :ets.insert_new(@key_gate, {hashed, job_id}) do
+      :claimed
+    else
+      case :ets.lookup(@key_gate, hashed) do
+        [{^hashed, existing_id}] -> {:taken, existing_id}
+        [] -> gate_claim(hashed, job_id)
+      end
+    end
+  rescue
+    ArgumentError -> :no_gate
+  end
+
+  defp gate_release(hashed, job_id) do
+    :ets.delete_object(@key_gate, {hashed, job_id})
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp create_key_gate do
+    if :ets.whereis(@key_gate) == :undefined do
+      :ets.new(@key_gate, [
+        :named_table,
+        :public,
+        :set,
+        write_concurrency: true,
+        read_concurrency: true
+      ])
+    end
+
+    :ets.delete_all_objects(@key_gate)
+
+    :mnesia.dirty_select(@keys_table, [
+      {{@keys_table, :"$1", :"$2", :_, :_}, [], [{{:"$1", :"$2"}}]}
+    ])
+    |> Enum.each(&:ets.insert(@key_gate, &1))
+  end
+
+  defp check_or_insert_transaction(hashed, job, expires_at) do
     {:atomic, result} =
       :mnesia.sync_transaction(fn ->
         case :mnesia.read(@keys_table, hashed) do
@@ -131,6 +197,10 @@ defmodule EzthrottleLocal.IdempotentStore do
         end
       end)
 
+    result
+  end
+
+  defp finish_check_or_insert(job, result) do
     # disc_copies tables live in RAM with the disk copy kept current via a
     # transaction log that Mnesia only flushes at its own periodic
     # threshold (by default: every 100 writes or every 3 minutes,
@@ -186,6 +256,7 @@ defmodule EzthrottleLocal.IdempotentStore do
         old_status
       end)
 
+    gate_release(hashed, job.id)
     if old_status, do: count_delete(old_status)
 
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
@@ -468,6 +539,7 @@ defmodule EzthrottleLocal.IdempotentStore do
   def clear_ledger do
     job_ids = local_job_ids()
     :mnesia.clear_table(@keys_table)
+    create_key_gate()
     :mnesia.clear_table(@jobs_table)
     :mnesia.clear_table(@results_table)
     :mnesia.clear_table(@delivery_table)
@@ -511,6 +583,7 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   @impl true
   def init(_) do
+    create_key_gate()
     seed_counts()
     register_existing_job_owners()
     schedule_cleanup()
@@ -557,7 +630,11 @@ defmodule EzthrottleLocal.IdempotentStore do
     key_and_job_spec = [{{:_, :_, :_, :"$1", :_}, [{:<, :"$1", now}], [:"$_"]}]
     result_spec = [{{:_, :_, :_, :"$1"}, [{:<, :"$1", now}], [:"$_"]}]
 
-    delete_matching(@keys_table, key_and_job_spec)
+    @keys_table
+    |> delete_matching(key_and_job_spec)
+    |> Enum.each(fn {@keys_table, hashed, job_id, _expires_at, _status} ->
+      gate_release(hashed, job_id)
+    end)
 
     @jobs_table
     |> delete_matching(key_and_job_spec)

@@ -72,4 +72,33 @@ defmodule EzthrottleLocal.ParallelIntakeTest do
              &(&1.id == current.id and Map.has_key?(&1, :execute_before))
            )
   end
+
+  test "the key gate lets exactly one of many concurrent inserts for a key win" do
+    stamp = System.unique_integer([:positive])
+    base = job("gate-#{stamp}", "u", "http://gate-#{stamp}.example")
+
+    results =
+      1..50
+      |> Enum.map(fn i ->
+        Task.async(fn -> IdempotentStore.check_or_insert(%{base | id: "gate-#{stamp}-#{i}"}) end)
+      end)
+      |> Task.await_many(5_000)
+
+    assert [:ok] = Enum.filter(results, &(&1 == :ok))
+    winner = Enum.find_index(results, &(&1 == :ok)) + 1
+    assert Enum.all?(results -- [:ok], &(&1 == {:duplicate, "gate-#{stamp}-#{winner}"}))
+  end
+
+  test "a key can be claimed again after its job is deleted or the ledger is cleared" do
+    stamp = System.unique_integer([:positive])
+    first = job("again-#{stamp}-1", "u", "http://again-#{stamp}.example")
+    assert :ok = IdempotentStore.check_or_insert(first)
+    assert {:duplicate, _} = IdempotentStore.check_or_insert(%{first | id: "again-#{stamp}-2"})
+
+    IdempotentStore.delete_job(first)
+    assert :ok = IdempotentStore.check_or_insert(%{first | id: "again-#{stamp}-3"})
+
+    IdempotentStore.clear_ledger()
+    assert :ok = IdempotentStore.check_or_insert(%{first | id: "again-#{stamp}-4"})
+  end
 end
