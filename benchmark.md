@@ -178,6 +178,49 @@ These numbers aren't directly comparable to Aquifer's Pebble row. EZThrottle ack
 
 ---
 
+## 8. Capacity per machine, end to end (Fly.io, 2026-10-07)
+
+Same harness as Aquifer's benchmark.md section 12:
+- **Target:** one ezthrottle-local machine with a volume.
+- **Load generator:** Aquifer's `benchmark/loadgen` on a separate machine. It ramps `POST /jobs` across 50 users and also serves as the upstream and the webhook receiver, both answering instantly.
+- **Webhooks:** every job also delivers a webhook.
+- **Config:** `EZTHROTTLE_DEFAULT_RPS=100000`, 100ms Mnesia flush (the default), production log level.
+
+This measures accepting, dispatching, completing and delivering each job's webhook at the same time, unlike section 4, which measured intake only (dispatch at 2 RPS). The two aren't comparable.
+
+| Machine | Sustained jobs/s | p99, submit to webhook | Past the ceiling |
+|---|---:|---:|---|
+| performance-1x | ~400 (550 on one run) | ~0.6 s | collapses at 700 |
+| performance-2x | ~700 | 31 ms | collapses at 1,000 |
+| performance-4x | ~1,500 | 0.5 s | collapses at 2,000 |
+
+Before the changes below, the same test on performance-1x accepted about 60 jobs/s, and the node was OOM-killed within a minute.
+
+**What was in the way.** Each item was found by sampling the stacks of running processes and checking mailbox lengths on the live node.
+
+| Problem | Fix |
+|---|---|
+| Every submission ran its Mnesia insert inside the domain's `AccountQueue` process, which the domain's `UrlActor` called synchronously, so a domain inserted one job at a time | On a standalone node the insert runs in the request's own process |
+| The insert was a Mnesia `sync_transaction` through the lock manager | An ETS `insert_new` gate decides the winner; rows are dirty-written (still logged, still flushed every 100ms) |
+| Fair admission called every queue for a snapshot on each submission | Each queue keeps its backlog in an ETS counter |
+| `actor_for` went through the registry process on every submission | Read the actor table directly |
+| Every job was registered with Syn (two more process hops), even with no cluster | Skipped on standalone nodes |
+| Admission listed and stat-ed the Mnesia directory, and when the cached reading expired every request did it at once, all through OTP's single `:file_server` | Single-flight refresh with an atomic compare-and-swap |
+| Admission state was an Agent updated on every request | `:atomics` |
+| Queue position events were broadcast for every queued job, blocking the queue process | Only for jobs with a stream subscriber (standalone) |
+| `syn` lookups and `Process.alive?` checks on busy processes wait behind their mailboxes | Use the monitored maps that already track them |
+| `:httpc` sent every request through one manager process | Finch connection pools |
+| Every webhook to a receiver without L8 re-probed `/.well-known/l8` | Remembered for 5 minutes |
+| Every `/jobs` request logged at `:info` | Hot API routes log at `:debug` |
+| Every finished job wrote a drain event, with drain mode off | Only with drain mode on |
+
+**Still open.**
+- **Overload collapses instead of shedding.** Past the ceiling, requests queue in the domain's `UrlActor` mailbox until clients time out, rather than getting `429`s. Admission control looks at queue backlog, not at how long requests wait to be admitted.
+- **One process per domain.** Every job for a domain still passes through that domain's `UrlActor`. In this test the upstream and the webhook receiver share one domain, so it carries both.
+- **Clustered nodes keep the old path.** The fast path above applies only to standalone nodes. Clusters keep the original queue-owner path, so these numbers don't apply to them.
+
+---
+
 ## Reproducing these results
 
 ```bash
