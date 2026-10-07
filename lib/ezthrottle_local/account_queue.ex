@@ -35,6 +35,10 @@ defmodule EzthrottleLocal.AccountQueue do
     max_concurrent: 1,
     queue: :queue.new(),
     in_flight: 0,
+    # Jobs in `queue`, kept here because :queue.len/1 walks the whole queue,
+    # and it ran on every enqueue and dispatch: with a large backlog that
+    # slowed dispatch to a crawl.
+    queued: 0,
     last_request_at: 0,
     # Earliest execute_before among queued jobs (ms), nil when none has one.
     # expire_queued_jobs/1 runs on every :process_next; without this it
@@ -315,7 +319,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_call(:snapshot, _from, state) do
-    backlog = :queue.len(state.queue) + state.in_flight
+    backlog = state.queued + state.in_flight
     {:reply, %{backlog: backlog, active: backlog > 0}, state, remaining_idle_timeout()}
   end
 
@@ -371,18 +375,22 @@ defmodule EzthrottleLocal.AccountQueue do
             new_state = %{
               state
               | queue: remaining_queue,
+                queued: max(state.queued - 1, 0),
                 in_flight: state.in_flight + 1,
                 last_request_at: System.system_time(:millisecond)
             }
 
-            Metrics.queue_depth(state.upstream, :queue.len(remaining_queue))
+            Metrics.queue_depth(state.upstream, new_state.queued)
 
             # Execute in a Task so the GenServer stays responsive
             parent = self()
             pool_pid = state.pool_pid
             member_id = member && member.id
 
-            Task.start(fn ->
+            # spawn, not Task.start: Task.start reads this process's info
+            # for caller metadata, which costs more the bigger this queue's
+            # state gets. Nothing awaits these.
+            spawn(fn ->
               execute(
                 job,
                 dispatch_url,
@@ -570,9 +578,9 @@ defmodule EzthrottleLocal.AccountQueue do
     new_queue = :queue.in(job, state.queue)
     state = %{state | next_deadline: earliest_deadline(state.next_deadline, job)}
 
-    new_state = %{state | queue: new_queue}
+    new_state = %{state | queue: new_queue, queued: state.queued + 1}
 
-    Metrics.queue_depth(state.upstream, :queue.len(new_queue))
+    Metrics.queue_depth(state.upstream, new_state.queued)
     # Restart the position-broadcast loop exactly when it would have
     # stopped itself (see handle_info(:broadcast_positions, ...)) -- a
     # transition from genuinely idle to having real work again.
@@ -607,7 +615,7 @@ defmodule EzthrottleLocal.AccountQueue do
       state
     else
       backlog_add(-length(expired))
-      state = %{state | queue: :queue.from_list(kept)}
+      state = %{state | queue: :queue.from_list(kept), queued: length(kept)}
 
       state =
         Enum.reduce(expired, state, fn job, current_state ->
