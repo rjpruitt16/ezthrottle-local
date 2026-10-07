@@ -24,6 +24,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @position_broadcast_ms 2_000
   @max_retries 4
   @default_max_pending_per_user 10_000
+  @dispatch_batch 64
 
   defstruct [
     :queue_key,
@@ -343,69 +344,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_info(:process_next, state) do
     state = expire_queued_jobs(state)
-
-    cond do
-      state.in_flight >= state.max_concurrent ->
-        {:noreply, state, arm_idle_timeout()}
-
-      :queue.is_empty(state.queue) ->
-        {:noreply, state, arm_idle_timeout()}
-
-      true ->
-        case resolve_target(state) do
-          :no_pool_members ->
-            # Pool-backed queue with no live members yet. This can happen
-            # during process restart before workers have had time to
-            # heartbeat back in, so keep the head job queued and retry
-            # later instead of turning temporary absence into terminal
-            # failure.
-            Process.send_after(self(), :process_next, no_pool_members_retry_ms())
-            {:noreply, state, arm_idle_timeout()}
-
-          {:ok, job, dispatch_url, member, remaining_queue} ->
-            # Enforce RPS with jitter to prevent synchronized bursts across queues
-            now = System.system_time(:millisecond)
-            interval_ms = trunc(1_000 / state.rps)
-            elapsed = now - state.last_request_at
-
-            if elapsed < interval_ms do
-              Process.sleep(Jitter.add_ms(interval_ms - elapsed))
-            end
-
-            new_state = %{
-              state
-              | queue: remaining_queue,
-                queued: max(state.queued - 1, 0),
-                in_flight: state.in_flight + 1,
-                last_request_at: System.system_time(:millisecond)
-            }
-
-            Metrics.queue_depth(state.upstream, new_state.queued)
-
-            # Execute in a Task so the GenServer stays responsive
-            parent = self()
-            pool_pid = state.pool_pid
-            member_id = member && member.id
-
-            # spawn, not Task.start: Task.start reads this process's info
-            # for caller metadata, which costs more the bigger this queue's
-            # state gets. Nothing awaits these.
-            spawn(fn ->
-              execute(
-                job,
-                dispatch_url,
-                parent,
-                state.rps,
-                state.max_concurrent,
-                state.queue_key,
-                pool_pid,
-                member_id
-              )
-            end)
-
-            {:noreply, new_state, arm_idle_timeout()}
-        end
-    end
+    {:noreply, dispatch_batch(state, @dispatch_batch), arm_idle_timeout()}
   end
 
   @impl true
@@ -490,6 +429,94 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   # ---- Private ----
+
+  # Dispatches until concurrency is full, the queue is empty, or `budget` is
+  # spent. One job per :process_next message tied the dispatch rate to how
+  # fast this mailbox drained: with many queued submissions ahead of each
+  # :process_next, a queue allowed hundreds of concurrent requests sent only
+  # a few dozen a second. A paced queue (rps below 1000) still sends one per
+  # pass and sleeps between, as before.
+  defp dispatch_batch(state, budget) do
+    cond do
+      budget <= 0 ->
+        if state.in_flight < state.max_concurrent and not :queue.is_empty(state.queue),
+          do: send(self(), :process_next)
+
+        state
+
+      state.in_flight >= state.max_concurrent ->
+        state
+
+      :queue.is_empty(state.queue) ->
+        state
+
+      true ->
+        case dispatch_one(state) do
+          {:dispatched, new_state} ->
+            if trunc(1_000 / new_state.rps) == 0,
+              do: dispatch_batch(new_state, budget - 1),
+              else: new_state
+
+          {:wait, new_state} ->
+            new_state
+        end
+    end
+  end
+
+  defp dispatch_one(state) do
+    case resolve_target(state) do
+      :no_pool_members ->
+        # Pool-backed queue with no live members yet. This can happen
+        # during process restart before workers have had time to
+        # heartbeat back in, so keep the head job queued and retry
+        # later instead of turning temporary absence into terminal
+        # failure.
+        Process.send_after(self(), :process_next, no_pool_members_retry_ms())
+        {:wait, state}
+
+      {:ok, job, dispatch_url, member, remaining_queue} ->
+        # Enforce RPS with jitter to prevent synchronized bursts across queues
+        now = System.system_time(:millisecond)
+        interval_ms = trunc(1_000 / state.rps)
+        elapsed = now - state.last_request_at
+
+        if elapsed < interval_ms do
+          Process.sleep(Jitter.add_ms(interval_ms - elapsed))
+        end
+
+        new_state = %{
+          state
+          | queue: remaining_queue,
+            queued: max(state.queued - 1, 0),
+            in_flight: state.in_flight + 1,
+            last_request_at: System.system_time(:millisecond)
+        }
+
+        Metrics.queue_depth(state.upstream, new_state.queued)
+
+        parent = self()
+        pool_pid = state.pool_pid
+        member_id = member && member.id
+
+        # spawn, not Task.start: Task.start reads this process's info for
+        # caller metadata, which costs more the bigger this queue's state
+        # gets. Nothing awaits these.
+        spawn(fn ->
+          execute(
+            job,
+            dispatch_url,
+            parent,
+            state.rps,
+            state.max_concurrent,
+            state.queue_key,
+            pool_pid,
+            member_id
+          )
+        end)
+
+        {:dispatched, new_state}
+    end
+  end
 
   # Unregister first, then look at the backlog. A caller that reserved on
   # this queue before the unregister shows up in the backlog, and we stay;
