@@ -190,9 +190,9 @@ This measures accepting, dispatching, completing and delivering each job's webho
 
 | Machine | Sustained jobs/s | p99, submit to webhook | Past the ceiling |
 |---|---:|---:|---|
-| performance-1x | ~400 (550 on one run) | ~0.6 s | collapses at 700 |
-| performance-2x | ~700 | 31 ms | collapses at 1,000 |
-| performance-4x | ~1,500 | 0.5 s | collapses at 2,000 |
+| performance-1x | ~700 | ~0.15 s | mostly sheds with 429; some client errors at 900 |
+| performance-2x | ~1,300 | 41 ms | sheds with 429 |
+| performance-4x | ~2,500 | 87 ms | sheds with 429 |
 
 Before the changes below, the same test on performance-1x accepted about 60 jobs/s, and the node was OOM-killed within a minute.
 
@@ -214,10 +214,20 @@ Before the changes below, the same test on performance-1x accepted about 60 jobs
 | Every `/jobs` request logged at `:info` | Hot API routes log at `:debug` |
 | Every finished job wrote a drain event, with drain mode off | Only with drain mode on |
 
+Then the per-domain `UrlActor` came off the per-job path and overload started shedding instead of collapsing (1x went from ~400 to ~700, 2x from ~700 to ~1,300, 4x from ~1,500 to ~2,500):
+
+| Problem | Fix |
+|---|---|
+| Past the ceiling, requests piled up waiting for admission until clients timed out | `EZTHROTTLE_MAX_IN_FLIGHT_REQUESTS` (default 512): further `POST /jobs` and `/proxy` get `429` + `Retry-After` immediately |
+| Every job went through the domain's `UrlActor` (admission, a call to enqueue, another for response headers) | Callers reserve a backlog slot in ETS, decide fair admission and the per-user limit there, and hand the job to the queue with a cast (`EzthrottleLocal.Intake`) |
+| `:queue.len/1` walked the whole queue on every enqueue and dispatch | The queue keeps its length in state |
+| One dispatch per `:process_next` message, so dispatch speed depended on how fast the mailbox drained | Dispatch up to the free concurrency per pass (64 max; paced queues unchanged) |
+| A new position-broadcast loop started each time the queue went from empty to non-empty; under steady traffic hundreds ran at once | At most one loop per queue |
+
 **Still open.**
-- **Overload collapses instead of shedding.** Past the ceiling, requests queue in the domain's `UrlActor` mailbox until clients time out, rather than getting `429`s. Admission control looks at queue backlog, not at how long requests wait to be admitted.
-- **One process per domain.** Every job for a domain still passes through that domain's `UrlActor`. In this test the upstream and the webhook receiver share one domain, so it carries both.
-- **Clustered nodes keep the old path.** The fast path above applies only to standalone nodes. Clusters keep the original queue-owner path, so these numbers don't apply to them.
+- **Draining after overload is slow.** After a burst fills the backlog (10,000), the queue drains at well under its steady-state rate, and minutes later thousands of jobs can still be queued. The causes found so far are fixed (queue length, one dispatch per message, piled-up broadcast loops). The queue process still handles too few messages per second, and the remaining cost isn't identified yet. Every completion is a synchronous `job_done` call into the queue, which is the next suspect.
+- **1x still shows some client errors** past its ceiling instead of only 429s; the in-flight cap (512) may be high for one core.
+- **Clustered nodes keep the old path.** Everything above applies only to standalone nodes.
 
 ---
 
