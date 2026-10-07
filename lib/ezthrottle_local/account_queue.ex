@@ -34,7 +34,6 @@ defmodule EzthrottleLocal.AccountQueue do
     configured_rps: 2.0,
     max_concurrent: 1,
     queue: :queue.new(),
-    pending_by_user: %{},
     in_flight: 0,
     last_request_at: 0,
     # Earliest execute_before among queued jobs (ms), nil when none has one.
@@ -110,13 +109,47 @@ defmodule EzthrottleLocal.AccountQueue do
   def local_backlog(_pid), do: :unknown
 
   defp backlog_add(0), do: :ok
+  defp backlog_add(n), do: counter_add(self(), n) && :ok
 
-  defp backlog_add(n) do
-    :ets.update_counter(@backlog_table, self(), {2, n}, {self(), 0})
+  @doc """
+  Adds n to a counter row in the backlog table and returns the new value.
+  Keys are a queue pid (its backlog) or {pid, user_id} (that user's pending
+  jobs in the queue). Also used by Intake to reserve before handing off.
+  """
+  def counter_add(key, n) do
+    :ets.update_counter(@backlog_table, key, {2, n}, {key, 0})
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc "One fewer pending job for user_id in queue_pid; drops the row at zero."
+  def user_release(_queue_pid, nil), do: :ok
+
+  def user_release(queue_pid, user_id) do
+    key = {queue_pid, user_id}
+
+    if counter_add(key, -1) <= 0 do
+      # delete_object only removes the row if it's still zero, so a
+      # concurrent reservation isn't lost.
+      :ets.delete_object(@backlog_table, {key, 0})
+    end
+
     :ok
   rescue
     ArgumentError -> :ok
   end
+
+  defp user_pending(user_id) do
+    case :ets.lookup(@backlog_table, {self(), user_id}) do
+      [{_, n}] -> n
+      [] -> 0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc "Hands a job Intake already reserved a slot for to the queue."
+  def handoff(pid, %Job{} = job), do: GenServer.cast(pid, {:enqueue_reserved, job})
 
   defp backlog_reset do
     :ets.insert(@backlog_table, {self(), 0})
@@ -127,6 +160,7 @@ defmodule EzthrottleLocal.AccountQueue do
 
   defp backlog_forget do
     :ets.delete(@backlog_table, self())
+    :ets.match_delete(@backlog_table, {{self(), :_}, :_})
   rescue
     ArgumentError -> :ok
   end
@@ -286,6 +320,11 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   @impl true
+  def handle_cast({:enqueue_reserved, job}, state) do
+    {:noreply, put_job(state, job), arm_idle_timeout()}
+  end
+
+  @impl true
   def handle_cast({:update_rps, rps}, state) do
     safe_rps = max(rps, @min_rps)
     Metrics.flow_rate(state.upstream, safe_rps)
@@ -436,14 +475,32 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_info(:timeout, state) do
     if :queue.is_empty(state.queue) and state.in_flight == 0 do
-      backlog_forget()
-      {:stop, :normal, state}
+      retire_or_stay(state)
     else
       {:noreply, state, arm_idle_timeout()}
     end
   end
 
   # ---- Private ----
+
+  # Unregister first, then look at the backlog. A caller that reserved on
+  # this queue before the unregister shows up in the backlog, and we stay;
+  # one that reserves after it sees the queue gone when it re-checks, rolls
+  # back and finds another. Either way no job is handed to a queue that has
+  # exited.
+  defp retire_or_stay(state) do
+    EzthrottleLocal.Intake.unregister_queue(state.upstream, state.queue_key, self())
+
+    case local_backlog(self()) do
+      {:ok, n} when n > 0 ->
+        EzthrottleLocal.Intake.register_queue(state.upstream, state.queue_key, self())
+        {:noreply, state, arm_idle_timeout()}
+
+      _ ->
+        backlog_forget()
+        {:stop, :normal, state}
+    end
+  end
 
   defp broadcast_position(job, position) do
     Phoenix.PubSub.broadcast(
@@ -494,27 +551,26 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   defp enqueue_job(state, job, enforce_limit) do
-    current = Map.get(state.pending_by_user, job.user_id, 0)
+    current = user_pending(job.user_id)
     limit = max_pending_per_user()
 
     if enforce_limit and limit > 0 and current >= limit do
       {:rejected, limit, current}
     else
-      {:ok, put_job(state, job, current)}
+      backlog_add(1)
+      if job.user_id, do: counter_add({self(), job.user_id}, 1)
+      {:ok, put_job(state, job)}
     end
   end
 
-  defp put_job(state, job, current_user_pending) do
+  # Counters are already updated: by enqueue_job/3, or by Intake before the
+  # :enqueue_reserved cast.
+  defp put_job(state, job) do
     was_empty = :queue.is_empty(state.queue)
     new_queue = :queue.in(job, state.queue)
-    backlog_add(1)
     state = %{state | next_deadline: earliest_deadline(state.next_deadline, job)}
 
-    new_state = %{
-      state
-      | queue: new_queue,
-        pending_by_user: Map.put(state.pending_by_user, job.user_id, current_user_pending + 1)
-    }
+    new_state = %{state | queue: new_queue}
 
     Metrics.queue_depth(state.upstream, :queue.len(new_queue))
     # Restart the position-broadcast loop exactly when it would have
@@ -857,16 +913,9 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
-  defp complete_user_job(state, nil), do: state
-
   defp complete_user_job(state, user_id) do
-    case Map.get(state.pending_by_user, user_id, 0) do
-      count when count <= 1 ->
-        %{state | pending_by_user: Map.delete(state.pending_by_user, user_id)}
-
-      count ->
-        %{state | pending_by_user: Map.put(state.pending_by_user, user_id, count - 1)}
-    end
+    user_release(self(), user_id)
+    state
   end
 
   defp no_pool_members_retry_ms,
