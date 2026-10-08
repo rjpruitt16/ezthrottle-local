@@ -190,9 +190,11 @@ This measures accepting, dispatching, completing and delivering each job's webho
 
 | Machine | Sustained jobs/s | p99, submit to webhook | Past the ceiling |
 |---|---:|---:|---|
-| performance-1x | ~400 (550 on one run) | ~0.6 s | collapses at 700 |
-| performance-2x | ~700 | 31 ms | collapses at 1,000 |
-| performance-4x | ~1,500 | 0.5 s | collapses at 2,000 |
+| performance-1x | ~700 | ~80 ms | falls behind, drains back to 0 |
+| performance-2x | ~1,300-1,500 | ~60 ms | falls behind, drains back to 0 |
+| performance-4x | ~3,000 | ~0.3 s (1.1 s at 3,000) | sheds with 429, drains back to 0 |
+
+For comparison, Aquifer on the same harness: ~1,000 / ~1,500 / ~3,000 (its benchmark.md section 12).
 
 Before the changes below, the same test on performance-1x accepted about 60 jobs/s, and the node was OOM-killed within a minute.
 
@@ -214,10 +216,26 @@ Before the changes below, the same test on performance-1x accepted about 60 jobs
 | Every `/jobs` request logged at `:info` | Hot API routes log at `:debug` |
 | Every finished job wrote a drain event, with drain mode off | Only with drain mode on |
 
+Then the per-domain `UrlActor` came off the per-job path and overload started shedding instead of collapsing (1x went from ~400 to ~700, 2x from ~700 to ~1,300, 4x from ~1,500 to ~2,500):
+
+| Problem | Fix |
+|---|---|
+| Past the ceiling, requests piled up waiting for admission until clients timed out | `EZTHROTTLE_MAX_IN_FLIGHT_REQUESTS` (default 512): further `POST /jobs` and `/proxy` get `429` + `Retry-After` immediately |
+| Every job went through the domain's `UrlActor` (admission, a call to enqueue, another for response headers) | Callers reserve a backlog slot in ETS, decide fair admission and the per-user limit there, and hand the job to the queue with a cast (`EzthrottleLocal.Intake`) |
+| `:queue.len/1` walked the whole queue on every enqueue and dispatch | The queue keeps its length in state |
+| One dispatch per `:process_next` message, so dispatch speed depended on how fast the mailbox drained | Dispatch up to the free concurrency per pass (64 max; paced queues unchanged) |
+| A new position-broadcast loop started each time the queue went from empty to non-empty; under steady traffic hundreds ran at once | At most one loop per queue |
+
+The last and largest fix came from timing each kind of message inside the queue process:
+
+| Problem | Fix |
+|---|---|
+| The dispatch `spawn(fn -> execute(..., state.rps, ...) end)` closure mentioned `state`, so it captured the whole queue state, and every new worker started with a copy of every queued job. With ~8,000 jobs queued, `:process_next` took ~2.4 ms and the queue spent 95% of its time there; every in-flight worker held a copy of the queue (the likely cause of the earlier OOM). | Bind the few fields the worker needs to local variables before spawning. `:process_next` went from ~2,400 µs to ~25 µs, `job_done` from ~200/s to ~5,300/s, and an overloaded queue drains in seconds instead of minutes. |
+| `arm_idle_timeout` read two environment variables on every message | Read once per queue process |
+
 **Still open.**
-- **Overload collapses instead of shedding.** Past the ceiling, requests queue in the domain's `UrlActor` mailbox until clients time out, rather than getting `429`s. Admission control looks at queue backlog, not at how long requests wait to be admitted.
-- **One process per domain.** Every job for a domain still passes through that domain's `UrlActor`. In this test the upstream and the webhook receiver share one domain, so it carries both.
-- **Clustered nodes keep the old path.** The fast path above applies only to standalone nodes. Clusters keep the original queue-owner path, so these numbers don't apply to them.
+- **Clustered nodes keep the old path.** Everything above applies only to standalone nodes.
+- **One process per queue** is now the remaining serial point. At ~25 µs per message it allows tens of thousands of messages a second, well above the measured ceilings.
 
 ---
 

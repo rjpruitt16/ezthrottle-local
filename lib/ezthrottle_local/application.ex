@@ -15,6 +15,8 @@ defmodule EzthrottleLocal.Application do
     EzthrottleLocal.WebSocketStore.ensure_tables!()
     websocket_config = EzthrottleLocal.WebSocketConfig.load()
 
+    EzthrottleLocalWeb.Plugs.InFlightLimit.setup()
+
     children =
       [
         EzthrottleLocalWeb.Telemetry,

@@ -82,6 +82,12 @@ defmodule EzthrottleLocal.UrlActor do
     GenServer.call(pid, {:admit_new, job}, 15_000)
   end
 
+  @doc "Writes this domain's admission settings to ETS for EzthrottleLocal.Intake."
+  def publish_settings(pid), do: GenServer.call(pid, :publish_settings)
+
+  @doc "The queue for queue_key, spawning it if needed (Intake's slow path)."
+  def ensure_queue(pid, queue_key), do: GenServer.call(pid, {:ensure_queue, queue_key}, 15_000)
+
   def update_rps(pid, rps) do
     GenServer.cast(pid, {:update_rps, rps})
   end
@@ -169,7 +175,7 @@ defmodule EzthrottleLocal.UrlActor do
     }
 
     Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, cluster_topic(domain))
-    state = hydrate_cluster_state(initial_state)
+    state = initial_state |> hydrate_cluster_state() |> publish()
     :ok = Cluster.join_url_actor(domain, self())
 
     # No schedule_budget_check/0 here -- see handle_call({:enqueue, ...})
@@ -218,6 +224,19 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   @impl true
+  def handle_call(:publish_settings, _from, state) do
+    {:reply, :ok, publish(state), idle_timeout_ms()}
+  end
+
+  @impl true
+  def handle_call({:ensure_queue, queue_key}, _from, state) do
+    was_empty = map_size(state.queues) == 0
+    {queue_pid, new_state} = find_or_spawn_queue(queue_key, state)
+    if was_empty, do: schedule_budget_check()
+    {:reply, queue_pid, new_state, idle_timeout_ms()}
+  end
+
+  @impl true
   def handle_call({:admit_new, job}, _from, state) do
     route_to_queue(:admit_new, job, state)
   end
@@ -230,13 +249,13 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_call({:account_queue_header, "enabled"}, _from, state) do
     broadcast_cluster_state(state, :account_queue_enabled, true)
-    {:reply, :ok, %{state | account_queue_enabled: true}, idle_timeout_ms()}
+    {:reply, :ok, publish(%{state | account_queue_enabled: true}), idle_timeout_ms()}
   end
 
   @impl true
   def handle_call({:account_queue_header, "disabled"}, _from, state) do
     broadcast_cluster_state(state, :account_queue_enabled, false)
-    {:reply, :ok, %{state | account_queue_enabled: false}, idle_timeout_ms()}
+    {:reply, :ok, publish(%{state | account_queue_enabled: false}), idle_timeout_ms()}
   end
 
   @doc """
@@ -282,7 +301,7 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_call({:max_backlog_header, max_backlog}, _from, state) do
     broadcast_cluster_state(state, :max_backlog, max_backlog)
-    {:reply, :ok, %{state | max_backlog: max_backlog}, idle_timeout_ms()}
+    {:reply, :ok, publish(%{state | max_backlog: max_backlog}), idle_timeout_ms()}
   end
 
   @impl true
@@ -304,13 +323,13 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_cast(:enable_account_queue, state) do
     broadcast_cluster_state(state, :account_queue_enabled, true)
-    {:noreply, %{state | account_queue_enabled: true}, idle_timeout_ms()}
+    {:noreply, publish(%{state | account_queue_enabled: true}), idle_timeout_ms()}
   end
 
   @impl true
   def handle_cast(:disable_account_queue, state) do
     broadcast_cluster_state(state, :account_queue_enabled, false)
-    {:noreply, %{state | account_queue_enabled: false}, idle_timeout_ms()}
+    {:noreply, publish(%{state | account_queue_enabled: false}), idle_timeout_ms()}
   end
 
   @impl true
@@ -325,12 +344,12 @@ defmodule EzthrottleLocal.UrlActor do
 
   @impl true
   def handle_info({:account_queue_header, "enabled"}, state) do
-    {:noreply, %{state | account_queue_enabled: true}, idle_timeout_ms()}
+    {:noreply, publish(%{state | account_queue_enabled: true}), idle_timeout_ms()}
   end
 
   @impl true
   def handle_info({:account_queue_header, "disabled"}, state) do
-    {:noreply, %{state | account_queue_enabled: false}, idle_timeout_ms()}
+    {:noreply, publish(%{state | account_queue_enabled: false}), idle_timeout_ms()}
   end
 
   @impl true
@@ -345,7 +364,7 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   def handle_info({:cluster_url_state, :account_queue_enabled, enabled}, state) do
-    {:noreply, %{state | account_queue_enabled: enabled}, idle_timeout_ms()}
+    {:noreply, publish(%{state | account_queue_enabled: enabled}), idle_timeout_ms()}
   end
 
   def handle_info({:cluster_url_state, :slow_start_enabled, enabled}, state) do
@@ -353,7 +372,7 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   def handle_info({:cluster_url_state, :max_backlog, max_backlog}, state) do
-    {:noreply, %{state | max_backlog: max_backlog}, idle_timeout_ms()}
+    {:noreply, publish(%{state | max_backlog: max_backlog}), idle_timeout_ms()}
   end
 
   def handle_info({:cluster_url_state, :breaker, {until_ms, kind}}, state) do
@@ -362,7 +381,13 @@ defmodule EzthrottleLocal.UrlActor do
 
   @impl true
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    queues = Enum.reject(state.queues, fn {_key, p} -> p == pid end) |> Map.new()
+    {gone, kept} = Enum.split_with(state.queues, fn {_key, p} -> p == pid end)
+
+    Enum.each(gone, fn {key, p} ->
+      EzthrottleLocal.Intake.unregister_queue(state.domain, key, p)
+    end)
+
+    queues = Map.new(kept)
     new_state = %{state | queues: queues}
 
     # A child AccountQueue dying is exactly the signal that this actor
@@ -514,25 +539,34 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   defp queue_counts(state, queue_pid, include_incoming \\ true) do
-    snapshots =
+    backlogs =
       state
       |> all_queue_pids()
       |> Enum.uniq()
-      |> Enum.map(fn pid -> {pid, safe_queue_snapshot(pid)} end)
+      |> Enum.map(fn pid -> {pid, safe_queue_snapshot(pid).backlog} end)
 
-    total_pending = Enum.sum(Enum.map(snapshots, fn {_pid, snapshot} -> snapshot.backlog end))
-    active_queues = Enum.count(snapshots, fn {_pid, snapshot} -> snapshot.active end)
+    counts_from(state.account_queue_enabled, backlogs, queue_pid, include_incoming)
+  end
+
+  @doc """
+  The fair-admission inputs {active_queues, total_pending, queue_pending}
+  from each queue's backlog. Shared with EzthrottleLocal.Intake so the
+  caller-side path counts exactly the way this actor does.
+  """
+  def counts_from(account_queue_enabled, backlogs, queue_pid, include_incoming) do
+    total_pending = Enum.sum(Enum.map(backlogs, fn {_pid, b} -> b end))
+    active_queues = Enum.count(backlogs, fn {_pid, b} -> b > 0 end)
 
     queue_pending =
-      case Enum.find(snapshots, fn {pid, _snapshot} -> pid == queue_pid end) do
+      case Enum.find(backlogs, fn {pid, _b} -> pid == queue_pid end) do
         nil -> 0
-        {_pid, snapshot} -> snapshot.backlog
+        {_pid, b} -> b
       end
 
     active_queues =
       if include_incoming and queue_pending == 0, do: active_queues + 1, else: active_queues
 
-    if state.account_queue_enabled do
+    if account_queue_enabled do
       {max(active_queues, if(include_incoming, do: 1, else: 0)), total_pending, queue_pending}
     else
       active = if total_pending > 0 or include_incoming, do: 1, else: 0
@@ -605,7 +639,18 @@ defmodule EzthrottleLocal.UrlActor do
 
   defp track_queue(queue_key, pid, state) do
     if Map.get(state.queues, queue_key) != pid, do: Process.monitor(pid)
+    EzthrottleLocal.Intake.register_queue(state.domain, queue_key, pid)
     {pid, %{state | queues: Map.put(state.queues, queue_key, pid)}}
+  end
+
+  defp publish(state) do
+    EzthrottleLocal.Intake.publish_settings(
+      state.domain,
+      state.account_queue_enabled,
+      state.max_backlog
+    )
+
+    state
   end
 
   defp schedule_budget_check do

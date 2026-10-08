@@ -98,8 +98,11 @@ defmodule EzthrottleLocal.ClusterTest do
     assert {:accepted, ^quiet} = AccountQueue.submit(queue, quiet)
     assert {:accepted, ^internal} = AccountQueue.submit_internal(queue, internal)
 
-    state = :sys.get_state(queue)
-    assert state.pending_by_user == %{"noisy" => 2, "quiet" => 1}
+    # Per-user pending counts live in ETS so the caller-side intake path can
+    # check them without calling the queue.
+    pending = fn user -> :ets.lookup(:ez_queue_backlog, {queue, user}) end
+    assert pending.("noisy") == [{{queue, "noisy"}, 2}]
+    assert pending.("quiet") == [{{queue, "quiet"}, 1}]
 
     Enum.each([first, quiet, internal], &IdempotentStore.delete_job/1)
   end
