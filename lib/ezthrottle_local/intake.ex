@@ -29,7 +29,7 @@ defmodule EzthrottleLocal.Intake do
   alias EzthrottleLocal.{AccountQueue, FairAdmission, Job, UrlActor}
 
   @queues :ez_queues
-  @max_attempts 5
+  @max_attempts 10
 
   def ensure_tables do
     if :ets.whereis(@queues) == :undefined do
@@ -80,6 +80,7 @@ defmodule EzthrottleLocal.Intake do
       # The domain's actor retired (no queues left) after we looked it up.
       # Nothing is reserved yet; get a live one and start over.
       :actor_gone when attempt < @max_attempts ->
+        backoff(attempt)
         admit(replace_actor.(actor), domain, job, mode, replace_actor, attempt + 1)
 
       :actor_gone ->
@@ -119,6 +120,7 @@ defmodule EzthrottleLocal.Intake do
       # and exited. Give the slot back and find (or spawn) a live one.
       attempt < @max_attempts ->
         rollback(queue, job.user_id)
+        backoff(attempt)
         admit(actor, domain, job, mode, replace_actor, attempt + 1)
 
       true ->
@@ -126,6 +128,12 @@ defmodule EzthrottleLocal.Intake do
         {:rejected, "queue_unavailable", 0, 0}
     end
   end
+
+  # A retiring queue unregisters before it exits, and until the actor sees
+  # its exit the actor can still hand it out. Retrying immediately could
+  # use up every attempt inside that window and turn a routine retirement
+  # into a 429, so back off briefly (1, 4, 9 ... capped at 50ms).
+  defp backoff(attempt), do: Process.sleep(min(attempt * attempt, 50))
 
   @doc "Queue headers for a response, from ETS (UrlActor.queue_snapshot/2's shape)."
   def snapshot(actor, domain, %Job{} = job) do

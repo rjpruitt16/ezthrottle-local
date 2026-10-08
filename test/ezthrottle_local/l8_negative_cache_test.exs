@@ -25,6 +25,7 @@ defmodule EzthrottleLocal.L8NegativeCacheTest do
       {Bandit, plug: {ProbeCounter, test_pid: self()}, port: port, startup_log: false}
     )
 
+    EzthrottleLocal.L8.forget_not_trusted()
     url = "http://127.0.0.1:#{port}/hook"
     for _ <- 1..20, do: EzthrottleLocal.L8.ensure_trust(url)
 

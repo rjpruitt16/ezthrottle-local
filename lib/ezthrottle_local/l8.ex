@@ -25,13 +25,13 @@ defmodule EzthrottleLocal.L8 do
 
   def meta(_host) do
     %{
-      "protocol_version"     => @version,
-      "service_name"         => "ezthrottle-local",
-      "public_key"           => pub_b64(),
-      "challenge_endpoint"   => "/l8/challenge",
+      "protocol_version" => @version,
+      "service_name" => "ezthrottle-local",
+      "public_key" => pub_b64(),
+      "challenge_endpoint" => "/l8/challenge",
       "supported_algorithms" => ["ed25519"],
-      "capabilities"         => ["signed_payloads"],
-      "spec_url"             => @spec_url
+      "capabilities" => ["signed_payloads"],
+      "spec_url" => @spec_url
     }
   end
 
@@ -62,6 +62,16 @@ defmodule EzthrottleLocal.L8 do
     end
   rescue
     ArgumentError -> false
+  end
+
+  @doc false
+  # Tests start receivers on random ports; a port reused from an earlier
+  # test's non-L8 receiver would otherwise stay "not L8" for 5 minutes.
+  def forget_not_trusted do
+    :ets.delete_all_objects(:l8_not_trusted)
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   defp remember_not_l8(domain) do
@@ -122,7 +132,9 @@ defmodule EzthrottleLocal.L8 do
     key = payload_key(eph_priv, receiver_pub, eph_pub, receiver_pub)
     nonce = :crypto.strong_rand_bytes(12)
     aad = "#{delivery_id}.#{timestamp}"
-    {ciphertext, tag} = :crypto.crypto_one_time_aead(:aes_256_gcm, key, nonce, plaintext, aad, true)
+
+    {ciphertext, tag} =
+      :crypto.crypto_one_time_aead(:aes_256_gcm, key, nonce, plaintext, aad, true)
 
     {ciphertext <> tag,
      %{
@@ -133,7 +145,15 @@ defmodule EzthrottleLocal.L8 do
   end
 
   @doc false
-  def open_payload(receiver_priv, receiver_pub, sealed, eph_b64, nonce_b64, delivery_id, timestamp)
+  def open_payload(
+        receiver_priv,
+        receiver_pub,
+        sealed,
+        eph_b64,
+        nonce_b64,
+        delivery_id,
+        timestamp
+      )
       when byte_size(sealed) >= 16 do
     with {:ok, eph_pub} <- Base.decode64(eph_b64),
          {:ok, nonce} <- Base.decode64(nonce_b64) do
@@ -209,7 +229,7 @@ defmodule EzthrottleLocal.L8 do
   def handle_call({:handle_challenge, params}, _from, state) do
     case do_handle_challenge(params, state) do
       {:ok, response, new_state} -> {:reply, {:ok, response}, new_state}
-      {:error, reason}           -> {:reply, {:error, reason}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
@@ -226,7 +246,7 @@ defmodule EzthrottleLocal.L8 do
 
   @impl true
   def handle_info(:cleanup_nonces, state) do
-    now    = System.monotonic_time(:millisecond)
+    now = System.monotonic_time(:millisecond)
     nonces = Map.filter(state.nonces, fn {_k, exp} -> exp > now end)
     Process.send_after(self(), :cleanup_nonces, @nonce_ttl_ms)
     {:noreply, %{state | nonces: nonces}}
@@ -235,29 +255,33 @@ defmodule EzthrottleLocal.L8 do
   # ---- Private helpers ------------------------------------------------------
 
   defp do_handle_challenge(params, state) do
-    challenge_id    = Map.get(params, "challenge_id", "")
-    nonce           = Map.get(params, "nonce", "")
-    timestamp       = Map.get(params, "timestamp", 0)
-    sender_pub_b64  = Map.get(params, "sender_public_key", "")
-    sig_b64         = Map.get(params, "signature", "")
+    challenge_id = Map.get(params, "challenge_id", "")
+    nonce = Map.get(params, "nonce", "")
+    timestamp = Map.get(params, "timestamp", 0)
+    sender_pub_b64 = Map.get(params, "sender_public_key", "")
+    sig_b64 = Map.get(params, "signature", "")
 
     now = System.os_time(:second)
+
     if abs(now - timestamp) > 300 do
       {:error, :timestamp_expired}
     else
-      with {:ok, new_state}   <- check_nonce(nonce, state),
-           {:ok, sender_pub}  <- safe_decode64(sender_pub_b64),
-           {:ok, sig}         <- safe_decode64(sig_b64) do
+      with {:ok, new_state} <- check_nonce(nonce, state),
+           {:ok, sender_pub} <- safe_decode64(sender_pub_b64),
+           {:ok, sig} <- safe_decode64(sig_b64) do
         msg = "#{challenge_id}:#{nonce}"
+
         if :crypto.verify(:eddsa, :none, msg, sig, [sender_pub, :ed25519]) do
-          priv    = :persistent_term.get(:l8_priv_key)
+          priv = :persistent_term.get(:l8_priv_key)
           our_sig = :crypto.sign(:eddsa, :none, msg, [priv, :ed25519]) |> Base.encode64()
+
           response = %{
-            "challenge_id"        => challenge_id,
-            "nonce"               => nonce,
-            "receiver_signature"  => our_sig,
+            "challenge_id" => challenge_id,
+            "nonce" => nonce,
+            "receiver_signature" => our_sig,
             "receiver_public_key" => pub_b64()
           }
+
           {:ok, response, new_state}
         else
           {:error, :invalid_signature}
@@ -270,6 +294,7 @@ defmodule EzthrottleLocal.L8 do
 
   defp check_nonce(nonce, state) do
     now = System.monotonic_time(:millisecond)
+
     if Map.has_key?(state.nonces, nonce) do
       {:error, :replay}
     else
@@ -282,36 +307,46 @@ defmodule EzthrottleLocal.L8 do
     case fetch_meta(domain) do
       {:ok, meta} ->
         :ets.delete(:l8_not_trusted, domain)
-        receiver_pub_b64    = Map.get(meta, "public_key", "")
-        challenge_path      = Map.get(meta, "challenge_endpoint", "/l8/challenge")
-        challenge_url       = if String.starts_with?(challenge_path, "http"),
-          do: challenge_path,
-          else: "#{domain}#{challenge_path}"
+        receiver_pub_b64 = Map.get(meta, "public_key", "")
+        challenge_path = Map.get(meta, "challenge_endpoint", "/l8/challenge")
+
+        challenge_url =
+          if String.starts_with?(challenge_path, "http"),
+            do: challenge_path,
+            else: "#{domain}#{challenge_path}"
 
         challenge_id = random_uuid()
-        nonce        = random_uuid()
-        timestamp    = System.os_time(:second)
-        priv         = :persistent_term.get(:l8_priv_key)
-        msg          = "#{challenge_id}:#{nonce}"
-        sig          = :crypto.sign(:eddsa, :none, msg, [priv, :ed25519]) |> Base.encode64()
+        nonce = random_uuid()
+        timestamp = System.os_time(:second)
+        priv = :persistent_term.get(:l8_priv_key)
+        msg = "#{challenge_id}:#{nonce}"
+        sig = :crypto.sign(:eddsa, :none, msg, [priv, :ed25519]) |> Base.encode64()
 
-        body = Jason.encode!(%{
-          "challenge_id"      => challenge_id,
-          "nonce"             => nonce,
-          "timestamp"         => timestamp,
-          "sender_public_key" => pub_b64(),
-          "signature"         => sig
-        })
+        body =
+          Jason.encode!(%{
+            "challenge_id" => challenge_id,
+            "nonce" => nonce,
+            "timestamp" => timestamp,
+            "sender_public_key" => pub_b64(),
+            "signature" => sig
+          })
 
         case post_json(challenge_url, body) do
           {:ok, resp} ->
-            returned_sig_b64  = Map.get(resp, "receiver_signature", "")
-            returned_pub_b64  = Map.get(resp, "receiver_public_key", receiver_pub_b64)
+            returned_sig_b64 = Map.get(resp, "receiver_signature", "")
+            returned_pub_b64 = Map.get(resp, "receiver_public_key", receiver_pub_b64)
+
             with {:ok, receiver_pub} <- safe_decode64(returned_pub_b64),
                  {:ok, returned_sig} <- safe_decode64(returned_sig_b64),
-                 true <- :crypto.verify(:eddsa, :none, msg, returned_sig, [receiver_pub, :ed25519]) do
+                 true <-
+                   :crypto.verify(:eddsa, :none, msg, returned_sig, [receiver_pub, :ed25519]) do
               validated_at = System.os_time(:second)
-              GenServer.call(__MODULE__, {:store_trust, domain, returned_pub_b64, validated_at, meta})
+
+              GenServer.call(
+                __MODULE__,
+                {:store_trust, domain, returned_pub_b64, validated_at, meta}
+              )
+
               :ok
             else
               _ ->
@@ -336,9 +371,9 @@ defmodule EzthrottleLocal.L8 do
   end
 
   def domain_from_url(url) do
-    uri          = URI.parse(url)
-    scheme_port  = if uri.scheme == "https", do: 443, else: 80
-    port_str     = if uri.port && uri.port != scheme_port, do: ":#{uri.port}", else: ""
+    uri = URI.parse(url)
+    scheme_port = if uri.scheme == "https", do: 443, else: 80
+    port_str = if uri.port && uri.port != scheme_port, do: ":#{uri.port}", else: ""
     "#{uri.scheme}://#{uri.host}#{port_str}"
   end
 
@@ -347,6 +382,7 @@ defmodule EzthrottleLocal.L8 do
       nil ->
         key_path = System.get_env("L8_KEY_PATH") || @key_path
         load_or_generate_file_key(key_path)
+
       b64 ->
         <<priv::binary-size(32), pub::binary-size(32)>> = Base.decode64!(b64)
         {priv, pub}
@@ -357,6 +393,7 @@ defmodule EzthrottleLocal.L8 do
     case File.read(path) do
       {:ok, <<priv::binary-size(32), pub::binary-size(32)>>} ->
         {priv, pub}
+
       _ ->
         {pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
         File.write!(path, <<priv::binary, pub::binary>>)
@@ -367,38 +404,50 @@ defmodule EzthrottleLocal.L8 do
 
   defp load_trust_from_disk do
     trust_dir = System.get_env("L8_TRUST_DIR") || @trust_dir
+
     case File.ls(trust_dir) do
       {:ok, files} ->
         Enum.each(files, fn filename ->
           path = Path.join(trust_dir, filename)
-          with {:ok, content}  <- File.read(path),
-               {:ok, data}     <- Jason.decode(content),
+
+          with {:ok, content} <- File.read(path),
+               {:ok, data} <- Jason.decode(content),
                pub_b64 when is_binary(pub_b64) <- Map.get(data, "public_key"),
                {:ok, pub_bytes} <- safe_decode64(pub_b64) do
-            domain       = Map.get(data, "domain", "")
+            domain = Map.get(data, "domain", "")
             validated_at = Map.get(data, "validated_at", 0)
-            enc_pub = encryption_key(Map.get(data, "capabilities"), Map.get(data, "encryption_public_key"))
+
+            enc_pub =
+              encryption_key(
+                Map.get(data, "capabilities"),
+                Map.get(data, "encryption_public_key")
+              )
+
             :ets.insert(:l8_trust, {domain, pub_bytes, pub_b64, validated_at, enc_pub})
           end
         end)
-      _ -> :ok
+
+      _ ->
+        :ok
     end
   end
 
   defp write_trust_file(domain, pub_b64, validated_at, capabilities, enc_b64) do
     trust_dir = System.get_env("L8_TRUST_DIR") || @trust_dir
     File.mkdir_p!(trust_dir)
-    path    = Path.join(trust_dir, sanitize_domain(domain) <> ".json")
+    path = Path.join(trust_dir, sanitize_domain(domain) <> ".json")
 
     content =
       %{
-        "domain"           => domain,
-        "public_key"       => pub_b64,
-        "validated_at"     => validated_at,
+        "domain" => domain,
+        "public_key" => pub_b64,
+        "validated_at" => validated_at,
         "protocol_version" => @version,
-        "capabilities"     => capabilities
+        "capabilities" => capabilities
       }
-      |> then(fn data -> if enc_b64, do: Map.put(data, "encryption_public_key", enc_b64), else: data end)
+      |> then(fn data ->
+        if enc_b64, do: Map.put(data, "encryption_public_key", enc_b64), else: data
+      end)
       |> Jason.encode!()
 
     File.write!(path, content)
@@ -417,22 +466,29 @@ defmodule EzthrottleLocal.L8 do
   @meta_max_bytes 1_048_576
 
   defp fetch_json(url) do
-    case :httpc.request(:get, {String.to_charlist(url), []}, [{:timeout, 5_000}], [body_format: :binary]) do
-      {:ok, {{_, 200, _}, _headers, body}} when byte_size(body) <= @meta_max_bytes -> Jason.decode(body)
-      _                                    -> :error
+    case :httpc.request(:get, {String.to_charlist(url), []}, [{:timeout, 5_000}],
+           body_format: :binary
+         ) do
+      {:ok, {{_, 200, _}, _headers, body}} when byte_size(body) <= @meta_max_bytes ->
+        Jason.decode(body)
+
+      _ ->
+        :error
     end
   end
 
   defp post_json(url, body) do
     case :httpc.request(
-      :post,
-      {String.to_charlist(url), [], ~c"application/json", String.to_charlist(body)},
-      [{:timeout, 5_000}],
-      []
-    ) do
+           :post,
+           {String.to_charlist(url), [], ~c"application/json", String.to_charlist(body)},
+           [{:timeout, 5_000}],
+           []
+         ) do
       {:ok, {{_, status, _}, _headers, resp_body}} when status in 200..299 ->
         Jason.decode(to_string(resp_body))
-      _ -> :error
+
+      _ ->
+        :error
     end
   end
 
