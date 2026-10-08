@@ -12,6 +12,7 @@ defmodule EzthrottleLocalWeb.Router do
     get "/jobs/:id", JobController, :show
     post "/pools/:pool_id/members", PoolController, :register_member
     get "/health", HealthController, :index
+    get "/ready", HealthController, :ready
     get "/.well-known/l8", L8Controller, :well_known
     post "/l8/challenge", L8Controller, :challenge
     get "/l8-spec", L8Controller, :spec

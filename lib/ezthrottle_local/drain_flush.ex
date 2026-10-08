@@ -136,7 +136,8 @@ defmodule EzthrottleLocal.DrainFlush do
 
   # ---- Private ----
 
-  defp flush_all_batches(event) do
+  @doc "Sends every unacknowledged drain-event batch; {:ok, sent} or :error."
+  def flush_all_batches(event) do
     case IdempotentStore.list_drain_events(batch_max_events()) do
       [] ->
         {:ok, 0}

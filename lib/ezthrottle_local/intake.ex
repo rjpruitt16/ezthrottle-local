@@ -113,6 +113,10 @@ defmodule EzthrottleLocal.Intake do
         decision
 
       registered?(domain, key, queue) ->
+        # Record the user's load here, before the caller gets its response,
+        # not when the queue processes the cast: the next submission's
+        # webhook-backlog admission has to see it.
+        EzthrottleLocal.UserLoad.add(job)
         AccountQueue.handoff(queue, job)
         :ok
 

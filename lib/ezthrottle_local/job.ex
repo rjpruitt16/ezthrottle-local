@@ -12,6 +12,8 @@ defmodule EzthrottleLocal.Job do
           user_id: String.t(),
           idempotent_key: String.t(),
           idempotency_scope: String.t() | nil,
+          max_retries: integer(),
+          attempts: non_neg_integer(),
           url: String.t() | nil,
           pool_id: String.t() | nil,
           method: String.t(),
@@ -40,6 +42,8 @@ defmodule EzthrottleLocal.Job do
     :body,
     :webhook_url,
     status: :queued,
+    max_retries: 4,
+    attempts: 0,
     created_at: nil,
     execute_before: nil,
     origin_machine_id: nil,
@@ -61,6 +65,7 @@ defmodule EzthrottleLocal.Job do
     with {:ok, user_id} <- require_field(params, "user_id"),
          :ok <- reject_nul(user_id),
          {:ok, scope} <- parse_idempotency_scope(Map.get(params, "idempotency_scope")),
+         {:ok, max_retries} <- parse_max_retries(Map.get(params, "max_retries")),
          :ok <- require_exactly_one_of_url_or_pool_id(url, pool_id),
          {:ok, method} <- require_field(params, "method"),
          {:ok, webhook_url} <- require_field(params, "webhook_url"),
@@ -72,6 +77,7 @@ defmodule EzthrottleLocal.Job do
          user_id: user_id,
          idempotent_key: idempotent_key,
          idempotency_scope: scope,
+         max_retries: max_retries,
          url: url,
          pool_id: pool_id,
          method: String.upcase(method),
@@ -120,6 +126,46 @@ defmodule EzthrottleLocal.Job do
 
   defp reject_nul(_user_id), do: :ok
 
+  @default_max_retries 4
+  @max_allowed_retries 100
+  # Bounds retry_until_complete when there is no execute_before: the same
+  # 24h default the idempotency TTL uses for queued jobs.
+  @default_retry_window_ms 86_400_000
+
+  @doc """
+  Retries for retryable failures (connection errors, 5xx, 408, 429): 4 by
+  default, -1 to retry until the job succeeds (bounded by execute_before, or
+  24h after submission). Mirrors Aquifer's max_retries / X-Aqueduct-Max-Retries.
+  """
+  def max_retries(%__MODULE__{} = job), do: Map.get(job, :max_retries, @default_max_retries)
+  def attempts(%__MODULE__{} = job), do: Map.get(job, :attempts, 0)
+
+  def retries_left?(job), do: max_retries(job) == -1 or attempts(job) < max_retries(job)
+
+  def retry_deadline_ms(%__MODULE__{execute_before: before})
+      when is_integer(before) and before > 0,
+      do: before
+
+  def retry_deadline_ms(%__MODULE__{created_at: created_at}),
+    do: (created_at || System.system_time(:millisecond)) + @default_retry_window_ms
+
+  defp parse_max_retries(nil), do: {:ok, @default_max_retries}
+
+  defp parse_max_retries(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {n, ""} -> parse_max_retries(n)
+      _ -> {:error, max_retries_error()}
+    end
+  end
+
+  defp parse_max_retries(n) when is_integer(n) and n >= -1 and n <= @max_allowed_retries,
+    do: {:ok, n}
+
+  defp parse_max_retries(_), do: {:error, max_retries_error()}
+
+  defp max_retries_error,
+    do: "max_retries must be -1 (retry until complete) or between 0 and 100"
+
   defp require_exactly_one_of_url_or_pool_id(nil, nil),
     do: {:error, "either url or pool_id is required"}
 
@@ -137,6 +183,13 @@ defmodule EzthrottleLocal.Job do
   Checks Authorization, x-api-key, api-key headers in order.
   Returns a hashed queue key scoped to the user_id, or a hashed anonymous key.
   """
+  def queue_key(%__MODULE__{idempotency_scope: "shared", idempotent_key: key}) do
+    # Shared-scope jobs get one queue per shared key instead of per user, so
+    # every caller for that key reaches the same cluster-wide queue owner,
+    # whose store dedups them. Per-user jobs are unaffected.
+    :crypto.hash(:sha256, "shared" <> <<0>> <> key) |> Base.encode16(case: :lower)
+  end
+
   def queue_key(%__MODULE__{user_id: user_id, headers: headers}) do
     api_key =
       headers["Authorization"] ||

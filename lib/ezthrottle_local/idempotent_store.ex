@@ -301,6 +301,22 @@ defmodule EzthrottleLocal.IdempotentStore do
   end
 
   @doc """
+  Persists a failed attempt: stores the job with its new attempt count and
+  returns it to :queued, so a restart during the retry backoff recovers it
+  without resetting the count.
+  """
+  def record_retry(%Job{} = job) do
+    route_job(job.id, {:record_retry, job}, fn -> record_retry_local(job) end)
+  end
+
+  defp record_retry_local(%Job{} = job) do
+    expires_at = System.system_time(:millisecond) + ttl_ms(:queued)
+    :mnesia.dirty_write({@jobs_table, job.id, job, expires_at, :queued})
+    if flush_interval_ms() == 0, do: :mnesia.dump_log()
+    :ok
+  end
+
+  @doc """
   Get the status of a job by job_id. Returns status string or nil.
   """
   def get_status(job_id) do
@@ -413,6 +429,17 @@ defmodule EzthrottleLocal.IdempotentStore do
       {false, true} -> :counters.add(counters(), 2, 1)
       _ -> :ok
     end
+  end
+
+  @doc "Jobs on this node still :queued or :in_flight, webhook deliveries included."
+  def pending_count do
+    now = System.system_time(:millisecond)
+
+    :mnesia.dirty_select(@jobs_table, [
+      {{@jobs_table, :_, :_, :"$1", :queued}, [{:>, :"$1", now}], [true]},
+      {{@jobs_table, :_, :_, :"$1", :in_flight}, [{:>, :"$1", now}], [true]}
+    ])
+    |> length()
   end
 
   @doc """
@@ -605,6 +632,9 @@ defmodule EzthrottleLocal.IdempotentStore do
 
   def handle_call({:job_store, {:update_status, job_id, status}}, _from, state),
     do: {:reply, update_status_local(job_id, status), state}
+
+  def handle_call({:job_store, {:record_retry, job}}, _from, state),
+    do: {:reply, record_retry_local(job), state}
 
   def handle_call({:job_store, {:get_status, job_id}}, _from, state),
     do: {:reply, get_status_local(job_id), state}

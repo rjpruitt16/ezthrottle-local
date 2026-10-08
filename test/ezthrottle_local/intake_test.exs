@@ -7,6 +7,14 @@ defmodule EzthrottleLocal.IntakeTest do
 
   use ExUnit.Case, async: false
 
+  # These tests hold jobs queued on purpose (max_concurrent 0); clear them so
+  # later tests that wait for the node to be empty (graceful drain) aren't
+  # waiting on work that can never run.
+  setup do
+    on_exit(fn -> EzthrottleLocal.IdempotentStore.clear_ledger() end)
+    :ok
+  end
+
   alias EzthrottleLocal.{AccountQueue, AccountQueueRegistry, Job, UrlActor}
 
   defmodule Upstream do

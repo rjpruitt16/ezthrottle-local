@@ -60,6 +60,19 @@ defmodule EzthrottleLocal.SharedIdempotencyTest do
     assert a["job_id"] != b["job_id"]
   end
 
+  test "shared jobs share one queue key across users, so one cluster owner dedups them", %{
+    url: url
+  } do
+    {:ok, a} = Job.new(params("agent-a", "weather:sf", url, "shared"))
+    {:ok, b} = Job.new(params("agent-b", "weather:sf", url, "shared"))
+    {:ok, own_a} = Job.new(params("agent-a", "weather:sf", url, nil))
+    {:ok, own_b} = Job.new(params("agent-b", "weather:sf", url, nil))
+
+    assert Job.queue_key(a) == Job.queue_key(b)
+    assert Job.queue_key(own_a) != Job.queue_key(own_b)
+    assert Job.queue_key(a) != Job.queue_key(own_a)
+  end
+
   test "shared scope requires the flag", %{url: url} do
     System.delete_env("EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED")
 

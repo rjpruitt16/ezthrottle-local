@@ -7,12 +7,21 @@ defmodule EzthrottleLocal.Application do
 
   require Logger
 
+  # Runs on SIGTERM (init:stop) before the supervision tree shuts down, while
+  # the endpoint still serves /ready and can reject new work.
+  @impl true
+  def prep_stop(state) do
+    EzthrottleLocal.Lifecycle.drain()
+    state
+  end
+
   @impl true
   def start(_type, _args) do
     configure_httpc_ipfamily()
     configure_mnesia_dir()
     EzthrottleLocal.IdempotentStore.ensure_schema!()
     EzthrottleLocal.WebSocketStore.ensure_tables!()
+    EzthrottleLocal.UserLoad.ensure_table!()
     websocket_config = EzthrottleLocal.WebSocketConfig.load()
 
     EzthrottleLocalWeb.Plugs.InFlightLimit.setup()
