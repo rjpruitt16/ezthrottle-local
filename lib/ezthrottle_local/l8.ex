@@ -466,10 +466,8 @@ defmodule EzthrottleLocal.L8 do
   @meta_max_bytes 1_048_576
 
   defp fetch_json(url) do
-    case :httpc.request(:get, {String.to_charlist(url), []}, [{:timeout, 5_000}],
-           body_format: :binary
-         ) do
-      {:ok, {{_, 200, _}, _headers, body}} when byte_size(body) <= @meta_max_bytes ->
+    case finch_request(Finch.build(:get, url)) do
+      {:ok, %Finch.Response{status: 200, body: body}} when byte_size(body) <= @meta_max_bytes ->
         Jason.decode(body)
 
       _ ->
@@ -477,19 +475,28 @@ defmodule EzthrottleLocal.L8 do
     end
   end
 
+  # L8 requests go through the same Finch pools as dispatch. With dispatch
+  # on Finch, an L8 probe could otherwise be a node's first :httpc request,
+  # and :httpc's first request made during shutdown (the drain runs in
+  # prep_stop) hung, stranding the webhook it was checking.
   defp post_json(url, body) do
-    case :httpc.request(
-           :post,
-           {String.to_charlist(url), [], ~c"application/json", String.to_charlist(body)},
-           [{:timeout, 5_000}],
-           []
-         ) do
-      {:ok, {{_, status, _}, _headers, resp_body}} when status in 200..299 ->
-        Jason.decode(to_string(resp_body))
+    request = Finch.build(:post, url, [{"content-type", "application/json"}], body)
+
+    case finch_request(request) do
+      {:ok, %Finch.Response{status: status, body: resp_body}} when status in 200..299 ->
+        Jason.decode(resp_body)
 
       _ ->
         :error
     end
+  end
+
+  defp finch_request(request) do
+    Finch.request(request, EzthrottleLocal.Finch, receive_timeout: 5_000, request_timeout: 5_000)
+  rescue
+    e -> {:error, e}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   defp safe_decode64(b64) do

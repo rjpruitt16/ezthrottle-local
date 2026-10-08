@@ -82,25 +82,26 @@ defmodule EzthrottleLocal.Webhook do
     end
   end
 
-  # The body goes to :httpc as a binary: an encrypted body is not valid UTF-8,
-  # so it can't round-trip through a charlist. :httpc takes the content type
-  # from its own argument, so an L8 "Content-Type" override is pulled out of
-  # the header list rather than sent twice.
+  # Goes through the same Finch pools as dispatch (see L8.post_json/2 for
+  # why not :httpc). The body is sent as a binary, which keeps an encrypted
+  # (non-UTF-8) body intact; an L8 "Content-Type" override replaces the
+  # default rather than being sent twice.
   defp do_post(url, body, extra_headers) do
     {content_type, extra_headers} = Map.pop(extra_headers, "Content-Type", "application/json")
+    headers = [{"content-type", content_type} | Enum.to_list(extra_headers)]
+    request = Finch.build(:post, url, headers, body)
 
-    headers =
-      Enum.map(extra_headers, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
-
-    case :httpc.request(
-           :post,
-           {String.to_charlist(url), headers, String.to_charlist(content_type), body},
-           [{:timeout, 5_000}],
-           []
+    case Finch.request(request, EzthrottleLocal.Finch,
+           receive_timeout: 5_000,
+           request_timeout: 5_000
          ) do
-      {:ok, {{_, status, _}, _headers, _body}} -> {:ok, status}
+      {:ok, %Finch.Response{status: status}} -> {:ok, status}
       {:error, reason} -> {:error, reason}
     end
+  rescue
+    e -> {:error, e}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   defp backoff_ms(attempt), do: trunc(:math.pow(2, attempt) * 1_000)

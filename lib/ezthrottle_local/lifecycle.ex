@@ -44,7 +44,7 @@ defmodule EzthrottleLocal.Lifecycle do
 
     Process.sleep(min(quiesce_ms, timeout_ms))
 
-    result = wait_for_work(deadline)
+    result = wait_for_work(deadline, false)
 
     if DrainFlush.enabled?() do
       DrainFlush.flush_all_batches("shutdown")
@@ -53,13 +53,20 @@ defmodule EzthrottleLocal.Lifecycle do
     result
   end
 
-  defp wait_for_work(deadline) do
+  # Done only after two empty polls in a row. A finished job is marked
+  # completed a moment before its webhook delivery job is inserted, so one
+  # empty poll can land in that gap and stop the node with the webhook unsent.
+  defp wait_for_work(deadline, empty_once?) do
     pending = IdempotentStore.pending_count()
 
     cond do
-      pending == 0 ->
+      pending == 0 and empty_once? ->
         Logger.info("[Lifecycle] accepted work finished")
         :drained
+
+      pending == 0 ->
+        Process.sleep(@poll_ms)
+        wait_for_work(deadline, true)
 
       System.monotonic_time(:millisecond) >= deadline ->
         Logger.warning(
@@ -70,7 +77,7 @@ defmodule EzthrottleLocal.Lifecycle do
 
       true ->
         Process.sleep(@poll_ms)
-        wait_for_work(deadline)
+        wait_for_work(deadline, false)
     end
   end
 
