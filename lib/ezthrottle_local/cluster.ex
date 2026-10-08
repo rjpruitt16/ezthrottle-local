@@ -12,6 +12,13 @@ defmodule EzthrottleLocal.Cluster do
   def account_queue_scope, do: @account_queue_scope
   def job_store_scope, do: @job_store_scope
 
+  @doc """
+  True when this node isn't part of a cluster: no DNS discovery configured
+  and no connected nodes. The submit hot path skips cluster-only work
+  (queue-owner hops, per-job Syn registration) in that case.
+  """
+  def standalone?, do: topologies() == [] and Node.list() == []
+
   def topologies do
     case Application.get_env(:ezthrottle_local, :dns_cluster_query) do
       query when is_binary(query) and query != "" ->

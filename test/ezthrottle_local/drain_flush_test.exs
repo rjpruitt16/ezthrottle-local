@@ -35,12 +35,15 @@ defmodule EzthrottleLocal.DrainFlushTest do
   end
 
   setup do
+    # Drain events are only recorded with drain mode on.
+    System.put_env("EZTHROTTLE_DRAIN_ENABLED", "true")
     {:ok, counter} = Agent.start_link(fn -> 0 end, name: :drain_flush_test_counter)
     {:ok, bodies} = Agent.start_link(fn -> [] end, name: :drain_flush_test_bodies)
 
     on_exit(fn ->
       safe_agent_stop(counter)
       safe_agent_stop(bodies)
+      System.delete_env("EZTHROTTLE_DRAIN_ENABLED")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_ENABLED")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_INTERVAL_SECONDS")
