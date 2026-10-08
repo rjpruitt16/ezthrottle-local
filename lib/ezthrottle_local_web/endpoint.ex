@@ -36,8 +36,9 @@ defmodule EzthrottleLocalWeb.Endpoint do
     cookie_key: "request_logger"
 
   plug Plug.RequestId
-  plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
+  plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint], log: {__MODULE__, :log_level, []}
 
+  plug EzthrottleLocalWeb.Plugs.InFlightLimit
   plug EzthrottleLocalWeb.Plugs.BodyLimit
 
   plug Plug.Parsers,
@@ -49,4 +50,14 @@ defmodule EzthrottleLocalWeb.Endpoint do
   plug Plug.Head
   plug Plug.Session, @session_options
   plug EzthrottleLocalWeb.Router
+
+  # The job API is hot: logging every request at :info cost more CPU than
+  # handling it at a few hundred requests a second (stdout writes, and the
+  # logger turning synchronous once it fell behind). Those routes log at
+  # :debug; everything else keeps :info.
+  @hot_routes ["jobs", "proxy", "results", "health", "ready"]
+
+  @doc false
+  def log_level(%Plug.Conn{path_info: [first | _]}) when first in @hot_routes, do: :debug
+  def log_level(_conn), do: :info
 end

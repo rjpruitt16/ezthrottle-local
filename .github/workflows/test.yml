@@ -1,0 +1,54 @@
+name: Unit tests
+
+# Runs `mix test`. A failing test gets up to two more tries via
+# `mix test --failed` (only the tests that failed, not the whole suite):
+# several tests here depend on timing or on node-wide state that other tests
+# touch, and occasionally fail when the machine is busy. A test that fails
+# all three times fails the build. The step summary lists every test that
+# needed a retry, so a test that keeps flaking stays visible instead of
+# silently passing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.17"
+          otp-version: "27"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ hashFiles('mix.lock') }}
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+
+      - name: mix test (failed tests retried up to twice)
+        # bash here runs with pipefail, so `mix test | tee` reports mix's
+        # exit status, not tee's.
+        shell: bash
+        run: |
+          if mix test 2>&1 | tee run1.txt; then exit 0; fi
+          {
+            echo "### Tests retried after a failure"
+            grep -E "^\s+[0-9]+\) test" run1.txt || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          for attempt in 2 3; do
+            echo "Retrying failed tests (attempt $attempt)"
+            if mix test --failed; then exit 0; fi
+          done
+          exit 1

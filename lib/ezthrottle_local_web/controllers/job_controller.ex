@@ -91,13 +91,19 @@ defmodule EzthrottleLocalWeb.JobController do
         send_resp(conn, response.status, response.body)
 
       {:fallback, job, reason} ->
+        # Subscribe before queueing: dispatch can start the moment the job
+        # is queued, and a stream that subscribed afterwards would miss the
+        # live "dispatching" event.
+        Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, "job:#{job.id}")
+
         case AccountQueueRegistry.enqueue_prepared(job, account_queue_header(conn)) do
           :ok ->
             conn
             |> put_queue_headers(job)
-            |> JobStreamController.stream_events(job, reason)
+            |> JobStreamController.stream_events(job, reason, subscribed: true)
 
           {:rejected, limit_reason, limit, current} ->
+            Phoenix.PubSub.unsubscribe(EzthrottleLocal.PubSub, "job:#{job.id}")
             IdempotentStore.delete_job(job)
 
             conn

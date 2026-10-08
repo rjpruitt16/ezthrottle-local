@@ -22,6 +22,9 @@ defmodule EzthrottleLocalWeb.JobStreamController do
   fallback path (JobController.proxy/2) can reuse it verbatim
   ("automatically start streaming") instead of reimplementing it.
 
+  Pass `subscribed: true` when the caller already subscribed before
+  queueing the job (proxy mode's fallback path), so no live event is missed.
+
   proxy_fallback is nil for a plain GET /jobs/:id/stream -- this job never
   had a direct attempt to explain. When set (proxy mode's fallback path
   only, `%{reason: string, status: integer | nil}`), one extra event is
@@ -30,9 +33,11 @@ defmodule EzthrottleLocalWeb.JobStreamController do
   in the queue instead of just "queued" with no context. Mirrors Aquifer's
   streamEvents/ProxyFallbackInfo.
   """
-  def stream_events(conn, job, proxy_fallback \\ nil) do
+  def stream_events(conn, job, proxy_fallback \\ nil, opts \\ []) do
     IdempotentStore.set_delivery_mode(job.id, :stream)
-    Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, "job:#{job.id}")
+
+    unless Keyword.get(opts, :subscribed, false),
+      do: Phoenix.PubSub.subscribe(EzthrottleLocal.PubSub, "job:#{job.id}")
 
     conn =
       conn

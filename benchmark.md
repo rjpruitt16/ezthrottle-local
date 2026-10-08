@@ -158,6 +158,87 @@ Ingest absorbs the burst exactly like Aquifer's — 100% success, single-digit-m
 
 ---
 
+## 7. Per-job overhead (`make perf`)
+
+The throughput ceiling above measures intake only: dispatch ran at the default 2 RPS, so it never tested receiving and sending at the same time. `make perf` does. It runs in-process against a local upstream and webhook receiver that answer instantly and advertise a very high rate, and mirrors Aquifer's `make perf` so the two can be compared on one machine.
+
+- **Job latency** sends one job at a time and splits its trip into accept (validated and stored, i.e. `POST /jobs` returns), queue (accepted until the upstream receives it) and total.
+- **Pipeline throughput** has 8 concurrent callers submit 2000 jobs and reports how many per second are accepted, dispatched, completed and have their webhook delivered. It runs on an empty store, then with 100k finished jobs retained, since completed jobs are kept for 30 minutes and a busy node always carries many.
+
+Baseline, 2026-10-06, Apple M3 Max laptop:
+
+| | accept | queue | total | jobs/s, empty | jobs/s, 100k retained |
+|---|---:|---:|---:|---:|---:|
+| Before (`counts/0` scanned the jobs table on every dispatch; `:in_flight` written per job) | 0.51 ms | 0.45 ms | 0.96 ms | 1104 | 287 |
+| After (running counters; no `:in_flight` write) | 0.48 ms | 0.41 ms | 0.89 ms | 1380 | 713 |
+
+Single-job latency barely moves, since an empty table is cheap to scan. Throughput with retained jobs is where the scan hurt: 2.5x faster after the fix. Even after it, 100k retained jobs still roughly halve throughput. Part of that is Mnesia's own disk dump: on this machine `dump_log` averages about 2.4 ms on an empty table and 6.6 ms at 100k rows, with spikes over 80 ms when it rewrites the table file. That isn't fully pinned down yet.
+
+These numbers aren't directly comparable to Aquifer's Pebble row. EZThrottle acknowledges a job before it reaches disk (flushed every 100ms, see section 1), while Pebble syncs every write.
+
+---
+
+## 8. Capacity per machine, end to end (Fly.io, 2026-10-07)
+
+Same harness as Aquifer's benchmark.md section 12:
+- **Target:** one ezthrottle-local machine with a volume.
+- **Load generator:** Aquifer's `benchmark/loadgen` on a separate machine. It ramps `POST /jobs` across 50 users and also serves as the upstream and the webhook receiver, both answering instantly.
+- **Webhooks:** every job also delivers a webhook.
+- **Config:** `EZTHROTTLE_DEFAULT_RPS=100000`, 100ms Mnesia flush (the default), production log level.
+
+This measures accepting, dispatching, completing and delivering each job's webhook at the same time, unlike section 4, which measured intake only (dispatch at 2 RPS). The two aren't comparable.
+
+| Machine | Sustained jobs/s | p99, submit to webhook | Past the ceiling |
+|---|---:|---:|---|
+| performance-1x | ~700 | ~80 ms | falls behind, drains back to 0 |
+| performance-2x | ~1,300-1,500 | ~60 ms | falls behind, drains back to 0 |
+| performance-4x | ~3,000 | ~0.3 s (1.1 s at 3,000) | sheds with 429, drains back to 0 |
+
+For comparison, Aquifer on the same harness: ~1,000 / ~1,500 / ~3,000 (its benchmark.md section 12).
+
+Before the changes below, the same test on performance-1x accepted about 60 jobs/s, and the node was OOM-killed within a minute.
+
+**What was in the way.** Each item was found by sampling the stacks of running processes and checking mailbox lengths on the live node.
+
+| Problem | Fix |
+|---|---|
+| Every submission ran its Mnesia insert inside the domain's `AccountQueue` process, which the domain's `UrlActor` called synchronously, so a domain inserted one job at a time | On a standalone node the insert runs in the request's own process |
+| The insert was a Mnesia `sync_transaction` through the lock manager | An ETS `insert_new` gate decides the winner; rows are dirty-written (still logged, still flushed every 100ms) |
+| Fair admission called every queue for a snapshot on each submission | Each queue keeps its backlog in an ETS counter |
+| `actor_for` went through the registry process on every submission | Read the actor table directly |
+| Every job was registered with Syn (two more process hops), even with no cluster | Skipped on standalone nodes |
+| Admission listed and stat-ed the Mnesia directory, and when the cached reading expired every request did it at once, all through OTP's single `:file_server` | Single-flight refresh with an atomic compare-and-swap |
+| Admission state was an Agent updated on every request | `:atomics` |
+| Queue position events were broadcast for every queued job, blocking the queue process | Only for jobs with a stream subscriber (standalone) |
+| `syn` lookups and `Process.alive?` checks on busy processes wait behind their mailboxes | Use the monitored maps that already track them |
+| `:httpc` sent every request through one manager process | Finch connection pools |
+| Every webhook to a receiver without L8 re-probed `/.well-known/l8` | Remembered for 5 minutes |
+| Every `/jobs` request logged at `:info` | Hot API routes log at `:debug` |
+| Every finished job wrote a drain event, with drain mode off | Only with drain mode on |
+
+Then the per-domain `UrlActor` came off the per-job path and overload started shedding instead of collapsing (1x went from ~400 to ~700, 2x from ~700 to ~1,300, 4x from ~1,500 to ~2,500):
+
+| Problem | Fix |
+|---|---|
+| Past the ceiling, requests piled up waiting for admission until clients timed out | `EZTHROTTLE_MAX_IN_FLIGHT_REQUESTS` (default 512): further `POST /jobs` and `/proxy` get `429` + `Retry-After` immediately |
+| Every job went through the domain's `UrlActor` (admission, a call to enqueue, another for response headers) | Callers reserve a backlog slot in ETS, decide fair admission and the per-user limit there, and hand the job to the queue with a cast (`EzthrottleLocal.Intake`) |
+| `:queue.len/1` walked the whole queue on every enqueue and dispatch | The queue keeps its length in state |
+| One dispatch per `:process_next` message, so dispatch speed depended on how fast the mailbox drained | Dispatch up to the free concurrency per pass (64 max; paced queues unchanged) |
+| A new position-broadcast loop started each time the queue went from empty to non-empty; under steady traffic hundreds ran at once | At most one loop per queue |
+
+The last and largest fix came from timing each kind of message inside the queue process:
+
+| Problem | Fix |
+|---|---|
+| The dispatch `spawn(fn -> execute(..., state.rps, ...) end)` closure mentioned `state`, so it captured the whole queue state, and every new worker started with a copy of every queued job. With ~8,000 jobs queued, `:process_next` took ~2.4 ms and the queue spent 95% of its time there; every in-flight worker held a copy of the queue (the likely cause of the earlier OOM). | Bind the few fields the worker needs to local variables before spawning. `:process_next` went from ~2,400 µs to ~25 µs, `job_done` from ~200/s to ~5,300/s, and an overloaded queue drains in seconds instead of minutes. |
+| `arm_idle_timeout` read two environment variables on every message | Read once per queue process |
+
+**Still open.**
+- **Clustered nodes keep the old path.** Everything above applies only to standalone nodes.
+- **One process per queue** is now the remaining serial point. At ~25 µs per message it allows tens of thousands of messages a second, well above the measured ceilings.
+
+---
+
 ## Reproducing these results
 
 ```bash

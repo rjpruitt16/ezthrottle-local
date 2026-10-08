@@ -35,12 +35,15 @@ defmodule EzthrottleLocal.DrainFlushTest do
   end
 
   setup do
+    # Drain events are only recorded with drain mode on.
+    System.put_env("EZTHROTTLE_DRAIN_ENABLED", "true")
     {:ok, counter} = Agent.start_link(fn -> 0 end, name: :drain_flush_test_counter)
     {:ok, bodies} = Agent.start_link(fn -> [] end, name: :drain_flush_test_bodies)
 
     on_exit(fn ->
       safe_agent_stop(counter)
       safe_agent_stop(bodies)
+      System.delete_env("EZTHROTTLE_DRAIN_ENABLED")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_ENABLED")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_MAX_EVENTS")
       System.delete_env("EZTHROTTLE_DRAIN_BATCH_INTERVAL_SECONDS")
@@ -161,8 +164,9 @@ defmodule EzthrottleLocal.DrainFlushTest do
     job = seed_terminal_ledger_entry(:completed)
 
     assert DrainFlush.flush_batch() == false
-    assert [%{job_id: job_id}] = IdempotentStore.list_drain_events()
-    assert job_id == job.id
+    # Other tests' jobs can finish while this runs and add their own events;
+    # what matters is that this job's event wasn't acknowledged away.
+    assert Enum.any?(IdempotentStore.list_drain_events(), &(&1.job_id == job.id))
   end
 
   test "attempt/0 streams terminal batches, then clears local ledger after idle handoff" do

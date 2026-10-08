@@ -88,6 +88,10 @@ defmodule EzthrottleLocal.LifecycleTest do
   end
 
   test "drain waits for accepted work and its webhook, then returns" do
+    # Drain waits for everything pending on the node, so start from an idle
+    # node: earlier tests can leave jobs retrying against unreachable hosts.
+    EzthrottleLocal.NodeIdle.wait()
+    IdempotentStore.clear_ledger()
     upstream = start_server(SlowPlug, 800)
     webhook = start_server(WebhookPlug, self())
     job_id = submit(upstream, webhook)

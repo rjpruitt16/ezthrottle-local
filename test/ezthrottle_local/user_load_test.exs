@@ -32,22 +32,27 @@ defmodule EzthrottleLocal.UserLoadTest do
   defp user_job(user), do: %Job{id: "j", user_id: user, webhook_url: "https://example.com/hook"}
 
   test "decision: lone user never rejected; probability scales from W to 2W; 0 disables" do
+    # Unique users: another test's late webhook completions for busy would
+    # otherwise shift these counts.
+    stamp = System.unique_integer([:positive])
+    busy = "busy-#{stamp}"
+    neighbor = "neighbor-#{stamp}"
     System.put_env("EZTHROTTLE_MAX_PENDING_WEBHOOKS_PER_USER", "1000")
-    for _ <- 1..1500, do: UserLoad.add(webhook_job("busy"))
+    for _ <- 1..1500, do: UserLoad.add(webhook_job(busy))
 
-    assert UserLoad.webhook_backlog_decision("busy", 0.0) == :ok
+    assert UserLoad.webhook_backlog_decision(busy, 0.0) == :ok
 
-    UserLoad.add(user_job("neighbor"))
-    assert UserLoad.webhook_backlog_decision("busy", 0.4) == {:rejected, 1000, 1500}
-    assert UserLoad.webhook_backlog_decision("busy", 0.6) == :ok
-    assert UserLoad.webhook_backlog_decision("neighbor", 0.0) == :ok
+    UserLoad.add(user_job(neighbor))
+    assert UserLoad.webhook_backlog_decision(busy, 0.4) == {:rejected, 1000, 1500}
+    assert UserLoad.webhook_backlog_decision(busy, 0.6) == :ok
+    assert UserLoad.webhook_backlog_decision(neighbor, 0.0) == :ok
 
-    for _ <- 1..600, do: UserLoad.done(webhook_job("busy"))
-    assert UserLoad.webhook_backlog_decision("busy", 0.0) == :ok
+    for _ <- 1..600, do: UserLoad.done(webhook_job(busy))
+    assert UserLoad.webhook_backlog_decision(busy, 0.0) == :ok
 
     System.put_env("EZTHROTTLE_MAX_PENDING_WEBHOOKS_PER_USER", "0")
-    for _ <- 1..5000, do: UserLoad.add(webhook_job("busy"))
-    assert UserLoad.webhook_backlog_decision("busy", 0.0) == :ok
+    for _ <- 1..5000, do: UserLoad.add(webhook_job(busy))
+    assert UserLoad.webhook_backlog_decision(busy, 0.0) == :ok
   end
 
   test "counts never go negative" do
@@ -56,6 +61,10 @@ defmodule EzthrottleLocal.UserLoadTest do
   end
 
   test "a shared instance 429s the user whose webhooks are backing up" do
+    # "Shared" means other users have work here; leftovers from earlier tests
+    # would count, so start from an idle node.
+    EzthrottleLocal.NodeIdle.wait()
+    UserLoad.reset()
     System.put_env("EZTHROTTLE_MAX_PENDING_WEBHOOKS_PER_USER", "1")
     hook = start_server(:hang)
     upstream = start_server(:upstream)
