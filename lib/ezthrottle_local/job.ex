@@ -192,6 +192,14 @@ defmodule EzthrottleLocal.Job do
   """
   def webhook_delivery_job?(%__MODULE__{webhook_url: url}), do: url in [nil, ""]
 
+  @doc """
+  Rebuilds a job read back from Mnesia as the current struct. Records written
+  by older versions lack newer fields (execute_before, for one), and pattern
+  matches on the struct crash on them; missing fields get their defaults.
+  """
+  def upgrade(%__MODULE__{} = job), do: struct(__MODULE__, Map.from_struct(job))
+  def upgrade(other), do: other
+
   def execution_expired?(%__MODULE__{execute_before: nil}), do: false
   def execution_expired?(%__MODULE__{execute_before: 0}), do: false
 

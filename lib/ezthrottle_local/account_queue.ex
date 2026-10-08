@@ -24,6 +24,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @position_broadcast_ms 2_000
   @max_retries 4
   @default_max_pending_per_user 10_000
+  @dispatch_batch 64
 
   defstruct [
     :queue_key,
@@ -34,8 +35,16 @@ defmodule EzthrottleLocal.AccountQueue do
     configured_rps: 2.0,
     max_concurrent: 1,
     queue: :queue.new(),
-    pending_by_user: %{},
     in_flight: 0,
+    # Jobs in `queue`, kept here because :queue.len/1 walks the whole queue,
+    # and it ran on every enqueue and dispatch: with a large backlog that
+    # slowed dispatch to a crawl.
+    queued: 0,
+    # Whether a :broadcast_positions tick is pending. Without it, every time
+    # the queue went from empty to non-empty a new 2s loop started while the
+    # old one kept running, and under steady traffic hundreds piled up, each
+    # walking the whole queue.
+    positions_scheduled: false,
     last_request_at: 0,
     # Earliest execute_before among queued jobs (ms), nil when none has one.
     # expire_queued_jobs/1 runs on every :process_next; without this it
@@ -69,6 +78,101 @@ defmodule EzthrottleLocal.AccountQueue do
       nil -> GenServer.start_link(__MODULE__, state)
       name -> GenServer.start_link(__MODULE__, state, name: name)
     end
+  end
+
+  # Each queue's backlog (queued + in flight), kept by the queue itself so
+  # fair admission can read local queues without calling every one of them
+  # on every submission. Dispatch moves a job from queued to in flight, so
+  # only enqueue, completion and expiry change it.
+  @backlog_table :ez_queue_backlog
+
+  @doc false
+  def ensure_backlog_table do
+    if :ets.whereis(@backlog_table) == :undefined do
+      :ets.new(@backlog_table, [
+        :named_table,
+        :public,
+        :set,
+        write_concurrency: true,
+        read_concurrency: true
+      ])
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc "This node's queue backlog from the shared table, or :unknown (remote or not tracked)."
+  def local_backlog(pid) when node(pid) == node() do
+    case :ets.lookup(@backlog_table, pid) do
+      # No liveness check: is_process_alive on a busy local process waits
+      # behind its mailbox. Callers only ask about queues they track by
+      # monitor.
+      [{^pid, backlog}] -> {:ok, max(backlog, 0)}
+      [] -> :unknown
+    end
+  rescue
+    ArgumentError -> :unknown
+  end
+
+  def local_backlog(_pid), do: :unknown
+
+  defp backlog_add(0), do: :ok
+  defp backlog_add(n), do: counter_add(self(), n) && :ok
+
+  @doc """
+  Adds n to a counter row in the backlog table and returns the new value.
+  Keys are a queue pid (its backlog) or {pid, user_id} (that user's pending
+  jobs in the queue). Also used by Intake to reserve before handing off.
+  """
+  def counter_add(key, n) do
+    :ets.update_counter(@backlog_table, key, {2, n}, {key, 0})
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc "One fewer pending job for user_id in queue_pid; drops the row at zero."
+  def user_release(_queue_pid, nil), do: :ok
+
+  def user_release(queue_pid, user_id) do
+    key = {queue_pid, user_id}
+
+    if counter_add(key, -1) <= 0 do
+      # delete_object only removes the row if it's still zero, so a
+      # concurrent reservation isn't lost.
+      :ets.delete_object(@backlog_table, {key, 0})
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp user_pending(user_id) do
+    case :ets.lookup(@backlog_table, {self(), user_id}) do
+      [{_, n}] -> n
+      [] -> 0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc "Hands a job Intake already reserved a slot for to the queue."
+  def handoff(pid, %Job{} = job), do: GenServer.cast(pid, {:enqueue_reserved, job})
+
+  defp backlog_reset do
+    :ets.insert(@backlog_table, {self(), 0})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp backlog_forget do
+    :ets.delete(@backlog_table, self())
+    :ets.match_delete(@backlog_table, {{self(), :_}, :_})
+  rescue
+    ArgumentError -> :ok
   end
 
   @doc "Persists and admits a new client submission on the queue-owning node."
@@ -140,6 +244,7 @@ defmodule EzthrottleLocal.AccountQueue do
     }
 
     :ok = Cluster.join_upstream(upstream, self())
+    backlog_reset()
 
     # No schedule_position_broadcast/0 here -- a fresh queue is always
     # immediately enqueued into (find_or_spawn_queue's one caller does both
@@ -220,8 +325,13 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_call(:snapshot, _from, state) do
-    backlog = :queue.len(state.queue) + state.in_flight
+    backlog = state.queued + state.in_flight
     {:reply, %{backlog: backlog, active: backlog > 0}, state, remaining_idle_timeout()}
+  end
+
+  @impl true
+  def handle_cast({:enqueue_reserved, job}, state) do
+    {:noreply, put_job(state, job), arm_idle_timeout()}
   end
 
   @impl true
@@ -239,65 +349,7 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_info(:process_next, state) do
     state = expire_queued_jobs(state)
-
-    cond do
-      state.in_flight >= state.max_concurrent ->
-        {:noreply, state, arm_idle_timeout()}
-
-      :queue.is_empty(state.queue) ->
-        {:noreply, state, arm_idle_timeout()}
-
-      true ->
-        case resolve_target(state) do
-          :no_pool_members ->
-            # Pool-backed queue with no live members yet. This can happen
-            # during process restart before workers have had time to
-            # heartbeat back in, so keep the head job queued and retry
-            # later instead of turning temporary absence into terminal
-            # failure.
-            Process.send_after(self(), :process_next, no_pool_members_retry_ms())
-            {:noreply, state, arm_idle_timeout()}
-
-          {:ok, job, dispatch_url, member, remaining_queue} ->
-            # Enforce RPS with jitter to prevent synchronized bursts across queues
-            now = System.system_time(:millisecond)
-            interval_ms = trunc(1_000 / state.rps)
-            elapsed = now - state.last_request_at
-
-            if elapsed < interval_ms do
-              Process.sleep(Jitter.add_ms(interval_ms - elapsed))
-            end
-
-            new_state = %{
-              state
-              | queue: remaining_queue,
-                in_flight: state.in_flight + 1,
-                last_request_at: System.system_time(:millisecond)
-            }
-
-            Metrics.queue_depth(state.upstream, :queue.len(remaining_queue))
-
-            # Execute in a Task so the GenServer stays responsive
-            parent = self()
-            pool_pid = state.pool_pid
-            member_id = member && member.id
-
-            Task.start(fn ->
-              execute(
-                job,
-                dispatch_url,
-                parent,
-                state.rps,
-                state.max_concurrent,
-                state.queue_key,
-                pool_pid,
-                member_id
-              )
-            end)
-
-            {:noreply, new_state, arm_idle_timeout()}
-        end
-    end
+    {:noreply, dispatch_batch(state, @dispatch_batch), arm_idle_timeout()}
   end
 
   @impl true
@@ -347,20 +399,18 @@ defmodule EzthrottleLocal.AccountQueue do
 
   @impl true
   def handle_info(:broadcast_positions, state) do
+    state = %{state | positions_scheduled: false}
+    # On a standalone node every subscriber is local, so skip jobs nobody is
+    # streaming. Broadcasting for every queued job blocked this process for
+    # long stretches once a backlog built, and submissions waited on it.
+    standalone? = Cluster.standalone?()
+
     state.queue
     |> :queue.to_list()
     |> Enum.with_index(1)
     |> Enum.each(fn {job, position} ->
-      Phoenix.PubSub.broadcast(
-        EzthrottleLocal.PubSub,
-        "job:#{job.id}",
-        {:job_event,
-         %{
-           event: "position",
-           job_id: job.id,
-           position: position
-         }}
-      )
+      if not standalone? or Registry.lookup(EzthrottleLocal.PubSub, "job:#{job.id}") != [],
+        do: broadcast_position(job, position)
     end)
 
     # Only keep rescheduling while there's still something to report --
@@ -368,9 +418,10 @@ defmodule EzthrottleLocal.AccountQueue do
     # resets the GenServer receive-timeout that :timeout below needs a real
     # 5-minute gap in to ever fire. handle_call({:enqueue, ...}) is what
     # restarts this once the queue has real work again.
-    if not :queue.is_empty(state.queue) do
-      schedule_position_broadcast()
-    end
+    state =
+      if :queue.is_empty(state.queue),
+        do: state,
+        else: schedule_position_broadcast(state)
 
     {:noreply, state, arm_idle_timeout()}
   end
@@ -378,13 +429,131 @@ defmodule EzthrottleLocal.AccountQueue do
   @impl true
   def handle_info(:timeout, state) do
     if :queue.is_empty(state.queue) and state.in_flight == 0 do
-      {:stop, :normal, state}
+      retire_or_stay(state)
     else
       {:noreply, state, arm_idle_timeout()}
     end
   end
 
   # ---- Private ----
+
+  # Dispatches until concurrency is full, the queue is empty, or `budget` is
+  # spent. One job per :process_next message tied the dispatch rate to how
+  # fast this mailbox drained: with many queued submissions ahead of each
+  # :process_next, a queue allowed hundreds of concurrent requests sent only
+  # a few dozen a second. A paced queue (rps below 1000) still sends one per
+  # pass and sleeps between, as before.
+  defp dispatch_batch(state, budget) do
+    cond do
+      budget <= 0 ->
+        if state.in_flight < state.max_concurrent and not :queue.is_empty(state.queue),
+          do: send(self(), :process_next)
+
+        state
+
+      state.in_flight >= state.max_concurrent ->
+        state
+
+      :queue.is_empty(state.queue) ->
+        state
+
+      true ->
+        case dispatch_one(state) do
+          {:dispatched, new_state} ->
+            if trunc(1_000 / new_state.rps) == 0,
+              do: dispatch_batch(new_state, budget - 1),
+              else: new_state
+
+          {:wait, new_state} ->
+            new_state
+        end
+    end
+  end
+
+  defp dispatch_one(state) do
+    case resolve_target(state) do
+      :no_pool_members ->
+        # Pool-backed queue with no live members yet. This can happen
+        # during process restart before workers have had time to
+        # heartbeat back in, so keep the head job queued and retry
+        # later instead of turning temporary absence into terminal
+        # failure.
+        Process.send_after(self(), :process_next, no_pool_members_retry_ms())
+        {:wait, state}
+
+      {:ok, job, dispatch_url, member, remaining_queue} ->
+        # Enforce RPS with jitter to prevent synchronized bursts across queues
+        now = System.system_time(:millisecond)
+        interval_ms = trunc(1_000 / state.rps)
+        elapsed = now - state.last_request_at
+
+        if elapsed < interval_ms do
+          Process.sleep(Jitter.add_ms(interval_ms - elapsed))
+        end
+
+        new_state = %{
+          state
+          | queue: remaining_queue,
+            queued: max(state.queued - 1, 0),
+            in_flight: state.in_flight + 1,
+            last_request_at: System.system_time(:millisecond)
+        }
+
+        Metrics.queue_depth(state.upstream, new_state.queued)
+
+        parent = self()
+        pool_pid = state.pool_pid
+        member_id = member && member.id
+        # Bind what the worker needs before spawning: a closure that mentions
+        # `state.rps` captures all of `state`, including the queue, and a new
+        # process starts with a copy of everything its closure captured. With
+        # thousands of jobs queued, every dispatch copied the whole queue
+        # (milliseconds each, and a copy held by every in-flight worker).
+        rps = state.rps
+        max_concurrent = state.max_concurrent
+        queue_key = state.queue_key
+
+        # spawn, not Task.start: Task.start reads this process's info for
+        # caller metadata. Nothing awaits these.
+        spawn(fn ->
+          execute(job, dispatch_url, parent, rps, max_concurrent, queue_key, pool_pid, member_id)
+        end)
+
+        {:dispatched, new_state}
+    end
+  end
+
+  # Unregister first, then look at the backlog. A caller that reserved on
+  # this queue before the unregister shows up in the backlog, and we stay;
+  # one that reserves after it sees the queue gone when it re-checks, rolls
+  # back and finds another. Either way no job is handed to a queue that has
+  # exited.
+  defp retire_or_stay(state) do
+    EzthrottleLocal.Intake.unregister_queue(state.upstream, state.queue_key, self())
+
+    case local_backlog(self()) do
+      {:ok, n} when n > 0 ->
+        EzthrottleLocal.Intake.register_queue(state.upstream, state.queue_key, self())
+        {:noreply, state, arm_idle_timeout()}
+
+      _ ->
+        backlog_forget()
+        {:stop, :normal, state}
+    end
+  end
+
+  defp broadcast_position(job, position) do
+    Phoenix.PubSub.broadcast(
+      EzthrottleLocal.PubSub,
+      "job:#{job.id}",
+      {:job_event,
+       %{
+         event: "position",
+         job_id: job.id,
+         position: position
+       }}
+    )
+  end
 
   defp submit_inserted_job(state, job, enforce_limit) do
     case enqueue_job(state, job, enforce_limit) do
@@ -398,7 +567,12 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
-  defp prepare_submission(job, enforce_admission) do
+  @doc """
+  Persists a submission and runs instance admission without touching the
+  queue's state, so it can run in the caller's process. See
+  AccountQueueRegistry.submit/2.
+  """
+  def prepare_submission(job, enforce_admission) do
     case IdempotentStore.check_or_insert(job) do
       {:duplicate, existing_id} ->
         {:duplicate, existing_id}
@@ -417,32 +591,32 @@ defmodule EzthrottleLocal.AccountQueue do
   end
 
   defp enqueue_job(state, job, enforce_limit) do
-    current = Map.get(state.pending_by_user, job.user_id, 0)
+    current = user_pending(job.user_id)
     limit = max_pending_per_user()
 
     if enforce_limit and limit > 0 and current >= limit do
       {:rejected, limit, current}
     else
-      {:ok, put_job(state, job, current)}
+      backlog_add(1)
+      if job.user_id, do: counter_add({self(), job.user_id}, 1)
+      {:ok, put_job(state, job)}
     end
   end
 
-  defp put_job(state, job, current_user_pending) do
+  # Counters are already updated: by enqueue_job/3, or by Intake before the
+  # :enqueue_reserved cast.
+  defp put_job(state, job) do
     was_empty = :queue.is_empty(state.queue)
     new_queue = :queue.in(job, state.queue)
     state = %{state | next_deadline: earliest_deadline(state.next_deadline, job)}
 
-    new_state = %{
-      state
-      | queue: new_queue,
-        pending_by_user: Map.put(state.pending_by_user, job.user_id, current_user_pending + 1)
-    }
+    new_state = %{state | queue: new_queue, queued: state.queued + 1}
 
-    Metrics.queue_depth(state.upstream, :queue.len(new_queue))
+    Metrics.queue_depth(state.upstream, new_state.queued)
     # Restart the position-broadcast loop exactly when it would have
     # stopped itself (see handle_info(:broadcast_positions, ...)) -- a
     # transition from genuinely idle to having real work again.
-    if was_empty, do: schedule_position_broadcast()
+    new_state = if was_empty, do: schedule_position_broadcast(new_state), else: new_state
     send(self(), :process_next)
     new_state
   end
@@ -472,7 +646,8 @@ defmodule EzthrottleLocal.AccountQueue do
     if expired == [] do
       state
     else
-      state = %{state | queue: :queue.from_list(kept)}
+      backlog_add(-length(expired))
+      state = %{state | queue: :queue.from_list(kept), queued: length(kept)}
 
       state =
         Enum.reduce(expired, state, fn job, current_state ->
@@ -778,16 +953,9 @@ defmodule EzthrottleLocal.AccountQueue do
     end
   end
 
-  defp complete_user_job(state, nil), do: state
-
   defp complete_user_job(state, user_id) do
-    case Map.get(state.pending_by_user, user_id, 0) do
-      count when count <= 1 ->
-        %{state | pending_by_user: Map.delete(state.pending_by_user, user_id)}
-
-      count ->
-        %{state | pending_by_user: Map.put(state.pending_by_user, user_id, count - 1)}
-    end
+    user_release(self(), user_id)
+    state
   end
 
   defp no_pool_members_retry_ms,
@@ -802,8 +970,11 @@ defmodule EzthrottleLocal.AccountQueue do
     )
   end
 
-  defp schedule_position_broadcast do
+  defp schedule_position_broadcast(%{positions_scheduled: true} = state), do: state
+
+  defp schedule_position_broadcast(state) do
     Process.send_after(self(), :broadcast_positions, @position_broadcast_ms)
+    %{state | positions_scheduled: true}
   end
 
   @doc """
@@ -830,8 +1001,20 @@ defmodule EzthrottleLocal.AccountQueue do
   # fresh timeout restarts it, so UrlActor's 3s budget poll (and /health) kept
   # idle queues alive forever. Real work re-arms the deadline; probes reply
   # with whatever time is left.
+  # The timeout is re-armed on every message, so it's read from the
+  # environment once per queue process rather than each time.
   defp arm_idle_timeout do
-    timeout = idle_timeout_ms()
+    timeout =
+      case Process.get(:idle_timeout_ms) do
+        nil ->
+          t = idle_timeout_ms()
+          Process.put(:idle_timeout_ms, t)
+          t
+
+        t ->
+          t
+      end
+
     Process.put(:idle_deadline_ms, System.monotonic_time(:millisecond) + timeout)
     timeout
   end
@@ -1151,6 +1334,8 @@ defmodule EzthrottleLocal.AccountQueue do
       |> maybe_update_rps(rps_header)
       |> maybe_update_max_concurrent(max_concurrent_header)
       |> Map.put(:in_flight, max(state.in_flight - 1, 0))
+
+    if state.in_flight > 0, do: backlog_add(-1)
 
     if new_state.rps != state.rps do
       Metrics.flow_rate(state.upstream, new_state.rps)

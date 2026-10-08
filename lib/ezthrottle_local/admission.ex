@@ -44,8 +44,8 @@ defmodule EzthrottleLocal.Admission do
     Agent.start_link(fn -> nil end, name: __MODULE__)
   end
 
-  # check/0 runs on every submission. Its state lives in :counters (atomic,
-  # no process), not the Agent: an Agent.update per request made every
+  # check/0 runs on every submission. Its state lives in :atomics (no
+  # process), not the Agent: an Agent.update per request made every
   # submission take turns through one process. Slots: 1 reject streak,
   # 2 cached Mnesia dir bytes, 3 when they were read (ms), 4 cached memory
   # MB, 5 when it was read.
@@ -54,7 +54,7 @@ defmodule EzthrottleLocal.Admission do
   defp counters do
     case :persistent_term.get({__MODULE__, :counters}, nil) do
       nil ->
-        ref = :counters.new(5, [:write_concurrency])
+        ref = :atomics.new(5, signed: true)
         :persistent_term.put({__MODULE__, :counters}, ref)
         ref
 
@@ -65,18 +65,31 @@ defmodule EzthrottleLocal.Admission do
 
   # Both readings are expensive per request (stat-ing every Mnesia file;
   # summing BEAM memory) and barely move in a few hundred milliseconds.
+  # Exactly one caller refreshes an expired reading; the rest keep using the
+  # cached value. Without that, every request in flight when the reading
+  # expired listed and stat-ed the Mnesia directory at once, and those
+  # calls all queue on OTP's single :file_server process.
   defp sampled(value_slot, at_slot, read) do
     ref = counters()
     now = System.monotonic_time(:millisecond)
-    at = :counters.get(ref, at_slot)
+    at = :atomics.get(ref, at_slot)
 
-    if at != 0 and now - at < @sample_ttl_ms do
-      :counters.get(ref, value_slot)
-    else
-      value = read.()
-      :counters.put(ref, value_slot, value)
-      :counters.put(ref, at_slot, now)
-      value
+    cond do
+      at != 0 and now - at < @sample_ttl_ms ->
+        :atomics.get(ref, value_slot)
+
+      :atomics.compare_exchange(ref, at_slot, at, now) == :ok ->
+        value = read.()
+        :atomics.put(ref, value_slot, value)
+        value
+
+      # Another caller is refreshing. Before the very first reading there's
+      # no cached value to fall back on.
+      at == 0 ->
+        read.()
+
+      true ->
+        :atomics.get(ref, value_slot)
     end
   end
 
@@ -117,7 +130,7 @@ defmodule EzthrottleLocal.Admission do
   """
   def retry_after_seconds do
     base = base_retry_after_seconds()
-    streak = :counters.get(counters(), 1)
+    streak = :atomics.get(counters(), 1)
 
     if streak <= 1 do
       base
@@ -146,11 +159,11 @@ defmodule EzthrottleLocal.Admission do
 
   # ---- Private ----
 
-  defp record_rejection, do: :counters.add(counters(), 1, 1)
+  defp record_rejection, do: :atomics.add(counters(), 1, 1)
 
   defp record_allowed do
     ref = counters()
-    if :counters.get(ref, 1) != 0, do: :counters.put(ref, 1, 0)
+    if :atomics.get(ref, 1) != 0, do: :atomics.put(ref, 1, 0)
     :ok
   end
 
