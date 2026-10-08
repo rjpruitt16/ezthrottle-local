@@ -44,6 +44,7 @@ defmodule EzthrottleLocal.L8SchemasTest do
   end
 
   setup do
+    EzthrottleLocal.L8.forget_not_trusted()
     System.put_env("EZTHROTTLE_L8_SCHEMA_VALIDATION", "true")
     Application.put_env(:ezthrottle_local, :l8_schema_min_refetch_ms, 0)
 

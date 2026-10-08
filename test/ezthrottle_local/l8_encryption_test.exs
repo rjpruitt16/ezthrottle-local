@@ -49,6 +49,8 @@ defmodule EzthrottleLocal.L8EncryptionTest do
   end
 
   setup do
+    EzthrottleLocal.L8.forget_not_trusted()
+
     trust_dir =
       Path.join(System.tmp_dir!(), "l8-trust-test-#{System.unique_integer([:positive])}")
 

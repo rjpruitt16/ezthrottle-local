@@ -1,4 +1,4 @@
-.PHONY: server test integration-test l8-test start-server stop-server start-webhook stop-webhook start-l8-receiver stop-l8-receiver release \
+.PHONY: server test perf integration-test l8-test start-server stop-server start-webhook stop-webhook start-l8-receiver stop-l8-receiver release \
 	region-redirect-deploy region-redirect-test region-redirect-destroy region-redirect-e2e
 
 # Start the Phoenix server
@@ -8,6 +8,11 @@ server:
 # Run unit tests
 test:
 	mix test
+
+# EZThrottle's own overhead per job (accept, queue, dispatch) and end-to-end
+# throughput. Mirrors Aquifer's make perf. Compare runs on the same machine only.
+perf:
+	mix test --only perf --seed 0 test/perf
 
 # ---- Integration Tests ----
 

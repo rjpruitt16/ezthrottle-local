@@ -4,7 +4,7 @@ defmodule EzthrottleLocal.MixProject do
   def project do
     [
       app: :ezthrottle_local,
-      version: "0.8.0",
+      version: "0.9.0",
       elixir: "~> 1.14",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -51,7 +51,8 @@ defmodule EzthrottleLocal.MixProject do
       {:syn, "~> 3.3"},
       {:bandit, "~> 1.5"},
       {:websockex, "~> 0.5.1"},
-      {:jsv, "~> 0.26.0"}
+      {:jsv, "~> 0.26.0"},
+      {:finch, "~> 0.19"}
     ]
   end
 

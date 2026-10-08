@@ -8,6 +8,11 @@ defmodule EzthrottleLocal.WebhookPacingTest do
 
   use ExUnit.Case, async: false
 
+  setup do
+    EzthrottleLocal.L8.forget_not_trusted()
+    :ok
+  end
+
   alias EzthrottleLocal.Job
   alias EzthrottleLocal.AccountQueueRegistry
   alias EzthrottleLocal.IdempotentStore
