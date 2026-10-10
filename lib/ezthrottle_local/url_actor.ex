@@ -413,25 +413,15 @@ defmodule EzthrottleLocal.UrlActor do
   @impl true
   def handle_info(:check_aggregate_budget, state) do
     queue_pids = Enum.filter(all_queue_pids(state), &safe_queue_active?/1)
+    ceiling = budget_ceiling(state)
 
     # A single active queue (or none) can't exceed an aggregate budget by
-    # definition -- nothing to throttle.
-    if length(queue_pids) >= 2 do
-      ceiling = budget_ceiling(state)
-
-      if ceiling > 0 do
-        rates = Enum.map(queue_pids, &AccountQueue.get_rps/1)
-        total = Enum.sum(rates)
-
-        if total > ceiling do
-          scale = ceiling / total
-
-          Enum.zip(queue_pids, rates)
-          |> Enum.each(fn {pid, rate} ->
-            AccountQueue.update_rps(pid, max(rate * scale, @min_rps))
-          end)
-        end
-      end
+    # definition -- nothing to throttle. Reading each queue's rate means
+    # calling it, possibly on another node, so that runs in its own process
+    # with a short timeout: a slow node is skipped this round instead of
+    # stalling this actor (and every intake that waits on it).
+    if length(queue_pids) >= 2 and ceiling > 0 do
+      spawn(fn -> rebalance_budget(queue_pids, ceiling) end)
     end
 
     # Only keep rescheduling while there's still at least one queue --
@@ -575,21 +565,32 @@ defmodule EzthrottleLocal.UrlActor do
   end
 
   defp safe_queue_snapshot(pid) do
-    case AccountQueue.local_backlog(pid) do
-      {:ok, backlog} -> %{backlog: backlog, active: backlog > 0}
-      :unknown -> AccountQueue.snapshot(pid)
-    end
-  catch
-    :exit, _reason -> %{backlog: 0, active: false}
+    backlog = queue_backlog(pid)
+    %{backlog: backlog, active: backlog > 0}
   end
 
-  defp safe_queue_active?(pid) do
+  defp safe_queue_active?(pid), do: queue_backlog(pid) > 0
+
+  # A queue's backlog without waiting on another node: local queues read
+  # their ETS counter, remote queues the RemoteBacklog cache (refreshed every
+  # 500ms). Calling a remote queue directly would put the slowest node on
+  # this actor's path, and every intake on this node waits behind this actor.
+  defp queue_backlog(pid) do
     case AccountQueue.local_backlog(pid) do
-      {:ok, backlog} -> backlog > 0
-      :unknown -> AccountQueue.active?(pid)
+      {:ok, backlog} ->
+        backlog
+
+      :unknown when node(pid) == node() ->
+        AccountQueue.snapshot(pid).backlog
+
+      :unknown ->
+        case EzthrottleLocal.RemoteBacklog.lookup(pid) do
+          {:ok, backlog} -> backlog
+          :unknown -> 0
+        end
     end
   catch
-    :exit, _reason -> false
+    :exit, _reason -> 0
   end
 
   # On a standalone node this actor's own monitored map is authoritative.
@@ -653,6 +654,39 @@ defmodule EzthrottleLocal.UrlActor do
     state
   end
 
+  defp rebalance_budget(queue_pids, ceiling) do
+    rated =
+      queue_pids
+      |> Task.async_stream(
+        fn pid ->
+          try do
+            {pid, AccountQueue.get_rps(pid)}
+          catch
+            :exit, _reason -> :gone
+          end
+        end,
+        timeout: 500,
+        on_timeout: :kill_task,
+        max_concurrency: 32
+      )
+      |> Enum.flat_map(fn
+        {:ok, {pid, rate}} when is_number(rate) -> [{pid, rate}]
+        _slow_or_gone -> []
+      end)
+
+    total = rated |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+
+    if total > ceiling do
+      scale = ceiling / total
+
+      Enum.each(rated, fn {pid, rate} ->
+        AccountQueue.update_rps(pid, max(rate * scale, @min_rps))
+      end)
+    end
+  catch
+    _kind, _reason -> :ok
+  end
+
   defp schedule_budget_check do
     Process.send_after(self(), :check_aggregate_budget, @budget_check_ms)
   end
@@ -668,7 +702,7 @@ defmodule EzthrottleLocal.UrlActor do
     |> Cluster.url_actors_for_upstream()
     |> Enum.find_value(fn pid ->
       try do
-        GenServer.call(pid, :cluster_snapshot, 2_000)
+        GenServer.call(pid, :cluster_snapshot, 500)
       catch
         :exit, _reason -> nil
       end

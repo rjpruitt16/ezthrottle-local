@@ -66,6 +66,29 @@ defmodule EzthrottleLocal.Cluster do
     end
   end
 
+  @doc """
+  Gives up this node's claim on its account queues' cluster names, so peers
+  route new jobs for those queues elsewhere (a peer that finds no owner
+  starts the queue itself) while the local processes finish the jobs they
+  already hold. Called when the node starts draining. Returns how many
+  names were released.
+  """
+  def release_local_queues do
+    if standalone?() do
+      0
+    else
+      EzthrottleLocal.Intake.local_queues()
+      |> Enum.count(fn {upstream, queue_key, pid} ->
+        name = account_queue_name(upstream, queue_key)
+
+        case :syn.lookup(@account_queue_scope, name) do
+          {^pid, _meta} -> :syn.unregister(@account_queue_scope, name) == :ok
+          _ -> false
+        end
+      end)
+    end
+  end
+
   def join_upstream(upstream, pid) do
     :ok = :syn.join(@account_queue_scope, {:upstream, upstream}, pid)
     :syn.join(@account_queue_scope, :all_account_queues, pid)
