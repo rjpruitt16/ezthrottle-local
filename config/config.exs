@@ -12,7 +12,10 @@ config :ezthrottle_local,
   metrics_adapter: EzthrottleLocal.Metrics.Noop
 
 config :syn,
-  scopes: [:ezthrottle_account_queues, :ezthrottle_job_stores]
+  scopes: [:ezthrottle_account_queues, :ezthrottle_job_stores],
+  # Keeps both processes alive on a registry conflict (netsplit heal) so an
+  # account queue that loses its name still finishes the jobs it holds.
+  event_handler: EzthrottleLocal.SynEventHandler
 
 # Configures the endpoint
 config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,

@@ -5,7 +5,8 @@ defmodule EzthrottleLocal.Lifecycle do
   before the supervision tree (and the HTTP endpoint) shut down. drain/0:
 
   1. marks the node draining: /ready returns 503 and new /jobs and /proxy
-     requests are rejected with 503,
+     requests are rejected with 503, and releases this node's account-queue
+     names in the cluster so peers stop handing it new jobs,
   2. keeps serving for EZTHROTTLE_SHUTDOWN_QUIESCE_MS so gateways notice,
   3. waits until this node's queued and in-flight work (including completion
      webhooks) has finished, bounded by EZTHROTTLE_SHUTDOWN_TIMEOUT_SECONDS,
@@ -37,9 +38,11 @@ defmodule EzthrottleLocal.Lifecycle do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
 
     begin_drain()
+    released = EzthrottleLocal.Cluster.release_local_queues()
 
     Logger.info(
-      "[Lifecycle] draining: rejecting new work, waiting up to #{timeout_ms}ms for accepted work"
+      "[Lifecycle] draining: rejecting new work, released #{released} account queue(s) to peers, " <>
+        "waiting up to #{timeout_ms}ms for accepted work"
     )
 
     Process.sleep(min(quiesce_ms, timeout_ms))

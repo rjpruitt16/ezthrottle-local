@@ -49,6 +49,16 @@ defmodule EzthrottleLocal.Intake do
   def unregister_queue(domain, queue_key, pid),
     do: safe(fn -> :ets.delete_object(@queues, {{domain, queue_key}, pid}) end)
 
+  @doc "Every `{domain, queue_key, pid}` this node tracks whose process runs here."
+  def local_queues do
+    :ets.select(@queues, [
+      {{{:"$1", :"$2"}, :"$3"}, [{:is_pid, :"$3"}], [{{:"$1", :"$2", :"$3"}}]}
+    ])
+    |> Enum.filter(fn {_domain, _key, pid} -> node(pid) == node() end)
+  rescue
+    ArgumentError -> []
+  end
+
   def publish_settings(domain, account_queue_enabled, max_backlog),
     do:
       safe(fn ->
