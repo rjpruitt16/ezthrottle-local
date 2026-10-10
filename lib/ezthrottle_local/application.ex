@@ -56,6 +56,7 @@ defmodule EzthrottleLocal.Application do
           EzthrottleLocal.Admission,
           EzthrottleLocal.IdempotentStore,
           EzthrottleLocal.PoolRegistry,
+          EzthrottleLocal.RemoteBacklog,
           EzthrottleLocal.AccountQueueRegistry
         ] ++
         region_redirect_children() ++ registration_children() ++ [EzthrottleLocalWeb.Endpoint]

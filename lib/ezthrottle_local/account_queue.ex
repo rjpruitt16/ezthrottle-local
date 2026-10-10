@@ -121,6 +121,18 @@ defmodule EzthrottleLocal.AccountQueue do
 
   def local_backlog(_pid), do: :unknown
 
+  @doc """
+  `{pid, backlog}` for every queue on this node, read from the backlog
+  table. Peers call it over RPC (see EzthrottleLocal.RemoteBacklog), so it
+  must never wait on a queue process.
+  """
+  def local_backlogs do
+    :ets.select(@backlog_table, [{{:"$1", :"$2"}, [{:is_pid, :"$1"}], [{{:"$1", :"$2"}}]}])
+    |> Enum.map(fn {pid, backlog} -> {pid, max(backlog, 0)} end)
+  rescue
+    ArgumentError -> []
+  end
+
   defp backlog_add(0), do: :ok
   defp backlog_add(n), do: counter_add(self(), n) && :ok
 
