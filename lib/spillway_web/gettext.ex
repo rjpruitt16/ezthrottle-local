@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule SpillwayWeb.Gettext do
   @moduledoc """
   A module providing Internationalization with a gettext-based API.

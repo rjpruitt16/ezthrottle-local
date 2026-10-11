@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule SpillwayWeb.ErrorJSON do
   @moduledoc """
   This module is invoked by your endpoint in case of errors on JSON requests.

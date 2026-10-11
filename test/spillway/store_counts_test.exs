@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.StoreCountsTest do
   @moduledoc """
   counts/0 feeds the load headers on every dispatch, so it reads running

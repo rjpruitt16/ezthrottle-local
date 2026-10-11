@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.SynEventHandler do
   @moduledoc """
   Resolves Syn registry conflicts without killing the losing process.

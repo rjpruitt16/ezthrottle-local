@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.L8NegativeCacheTest do
   @moduledoc """
   A webhook receiver that doesn't speak L8 is probed once, not before every

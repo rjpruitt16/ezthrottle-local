@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.SlowStartTest do
   @moduledoc """
   Mirrors Aquifer's account_queue_test.go / registry_test.go slow-start

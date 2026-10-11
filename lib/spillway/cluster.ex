@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Cluster do
   @moduledoc """
   Region-local BEAM discovery and Syn naming for durable queue ownership.

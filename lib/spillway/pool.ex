@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Pool do
   @moduledoc """
   GenServer owning one named pool's membership, selection, and

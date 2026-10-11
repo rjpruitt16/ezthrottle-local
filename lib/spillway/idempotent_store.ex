@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.IdempotentStore do
   @moduledoc """
   Mnesia-backed store for idempotent keys and full job structs with TTL.

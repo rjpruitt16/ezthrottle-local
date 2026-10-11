@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule SpillwayWeb.Plugs.InFlightLimit do
   @moduledoc """
   Sheds new submissions with 429 + Retry-After once too many are already in

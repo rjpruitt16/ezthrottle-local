@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Registration do
   @moduledoc """
   External registration: opt-in, off by default. When SPILLWAY_REGISTRY_URL

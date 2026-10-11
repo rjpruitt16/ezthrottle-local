@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Job do
   @moduledoc """
   Job struct representing an outbound API request to be queued and executed.

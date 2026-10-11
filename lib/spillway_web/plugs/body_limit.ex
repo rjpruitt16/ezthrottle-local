@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule SpillwayWeb.Plugs.BodyLimit do
   @moduledoc """
   Rejects oversized request bodies with 413 before Plug.Parsers reads them,

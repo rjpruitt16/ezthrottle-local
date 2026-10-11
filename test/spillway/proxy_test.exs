@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.ProxyTest do
   @moduledoc """
   Mirrors Aquifer's proxy_test.go: proxy mode tries a job directly and

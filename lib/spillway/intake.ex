@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Intake do
   @moduledoc """
   The standalone submission path, run in the caller's process.

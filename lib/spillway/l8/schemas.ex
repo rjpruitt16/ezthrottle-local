@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.L8.Schemas do
   @moduledoc """
   L8 0.2 request schemas. An upstream publishes JSON Schemas per route

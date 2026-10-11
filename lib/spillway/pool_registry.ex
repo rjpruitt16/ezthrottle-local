@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.PoolRegistry do
   @moduledoc """
   Top-level registry for Pool GenServers, one per pool_id, spawned on

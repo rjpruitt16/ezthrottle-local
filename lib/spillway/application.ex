@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Application do
   # See https://hexdocs.pm/elixir/Application.html
   # for more information on OTP Applications
