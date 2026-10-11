@@ -3,6 +3,15 @@ defmodule EzthrottleLocal.AccountQueueRegistryDrainTest do
 
   alias EzthrottleLocal.{AccountQueueRegistry, IdempotentStore}
 
+  # Accepts the drain flush. The ledger is shared with async tests, which
+  # can add entries after clear_ledger/0; with an unreachable webhook URL
+  # the flush then retried for seconds and the registry's :drain_state
+  # call timed out.
+  defmodule AcceptFlush do
+    def init(opts), do: opts
+    def call(conn, _opts), do: Plug.Conn.send_resp(conn, 200, "")
+  end
+
   # AccountQueueRegistry is a globally-named singleton in production (one
   # shared instance for the whole app, its :url_actors ETS table shared
   # across every caller). That's not testable in isolation directly -- but
@@ -46,7 +55,9 @@ defmodule EzthrottleLocal.AccountQueueRegistryDrainTest do
 
     System.put_env("EZTHROTTLE_DRAIN_ENABLED", "true")
     System.put_env("EZTHROTTLE_DRAIN_TIMER_SECONDS", "1")
-    System.put_env("EZTHROTTLE_DRAIN_WEBHOOK_URL", "https://example.com/unused")
+    port = Enum.random(20_000..60_000)
+    start_supervised!({Bandit, plug: AcceptFlush, port: port})
+    System.put_env("EZTHROTTLE_DRAIN_WEBHOOK_URL", "http://127.0.0.1:#{port}/drain")
 
     on_exit(fn ->
       System.delete_env("EZTHROTTLE_DRAIN_ENABLED")
@@ -69,9 +80,8 @@ defmodule EzthrottleLocal.AccountQueueRegistryDrainTest do
     assert GenServer.call(pid, :drain_state) == :draining
 
     # Second tick: TimerSeconds(1) has long since elapsed -- attempts a
-    # flush. The ledger was cleared above, so DrainFlush.attempt/0 hits
-    # its empty-ledger fast path (no real webhook call needed) ->
-    # unassigned.
+    # flush, which either takes the empty-ledger fast path or is accepted
+    # by AcceptFlush -> unassigned.
     Process.sleep(7_000)
     assert GenServer.call(pid, :drain_state) == :unassigned
   end
