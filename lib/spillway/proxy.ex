@@ -248,7 +248,8 @@ defmodule Spillway.Proxy do
           job.id,
           job.user_id,
           job.webhook_url,
-          completed_payload
+          completed_payload,
+          Job.webhook_max_retries(job)
         )
 
         {:direct, job, response}

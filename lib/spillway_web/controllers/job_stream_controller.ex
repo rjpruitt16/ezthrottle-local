@@ -6,6 +6,7 @@ defmodule SpillwayWeb.JobStreamController do
 
   alias Spillway.IdempotentStore
   alias Spillway.AccountQueueRegistry
+  alias Spillway.Job
 
   def stream(conn, %{"id" => job_id}) do
     case IdempotentStore.get_job(job_id) do
@@ -109,20 +110,28 @@ defmodule SpillwayWeb.JobStreamController do
   # itself uses, rather than firing it synchronously on this connection's
   # own process.
   defp handle_disconnect(job, "completed", data) do
-    AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, %{
-      job_id: job.id,
-      status: "completed",
-      response_status: data[:response_status],
-      body: data[:body]
-    })
+    AccountQueueRegistry.enqueue_webhook(
+      job.id,
+      job.user_id,
+      job.webhook_url,
+      %{
+        job_id: job.id,
+        status: "completed",
+        response_status: data[:response_status],
+        body: data[:body]
+      },
+      Job.webhook_max_retries(job)
+    )
   end
 
   defp handle_disconnect(job, "failed", data) do
-    AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, %{
-      job_id: job.id,
-      status: "failed",
-      reason: data[:reason]
-    })
+    AccountQueueRegistry.enqueue_webhook(
+      job.id,
+      job.user_id,
+      job.webhook_url,
+      %{job_id: job.id, status: "failed", reason: data[:reason]},
+      Job.webhook_max_retries(job)
+    )
   end
 
   # Stream died mid-job — AccountQueue fires webhook on completion

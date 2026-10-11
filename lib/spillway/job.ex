@@ -16,6 +16,7 @@ defmodule Spillway.Job do
           idempotent_key: String.t(),
           idempotency_scope: String.t() | nil,
           max_retries: integer(),
+          webhook_max_retries: integer() | nil,
           attempts: non_neg_integer(),
           url: String.t() | nil,
           pool_id: String.t() | nil,
@@ -46,6 +47,7 @@ defmodule Spillway.Job do
     :webhook_url,
     status: :queued,
     max_retries: 4,
+    webhook_max_retries: nil,
     attempts: 0,
     created_at: nil,
     execute_before: nil,
@@ -69,6 +71,8 @@ defmodule Spillway.Job do
          :ok <- reject_nul(user_id),
          {:ok, scope} <- parse_idempotency_scope(Map.get(params, "idempotency_scope")),
          {:ok, max_retries} <- parse_max_retries(Map.get(params, "max_retries")),
+         {:ok, webhook_max_retries} <-
+           parse_webhook_max_retries(Map.get(params, "webhook_max_retries")),
          :ok <- require_exactly_one_of_url_or_pool_id(url, pool_id),
          {:ok, method} <- require_field(params, "method"),
          {:ok, webhook_url} <- require_field(params, "webhook_url"),
@@ -81,6 +85,7 @@ defmodule Spillway.Job do
          idempotent_key: idempotent_key,
          idempotency_scope: scope,
          max_retries: max_retries,
+         webhook_max_retries: webhook_max_retries,
          url: url,
          pool_id: pool_id,
          method: String.upcase(method),
@@ -145,6 +150,17 @@ defmodule Spillway.Job do
 
   def retries_left?(job), do: max_retries(job) == -1 or attempts(job) < max_retries(job)
 
+  @doc """
+  Retries for delivering this job's webhook, separate from max_retries because
+  the two calls go to different places: a non-idempotent upstream can be tried
+  once while its webhook keeps retrying through a receiver outage. Same values
+  as max_retries; nil (unset, or a job stored before this field existed) means
+  the default 4. Mirrors Aquifer's webhook_max_retries /
+  X-Aqueduct-Webhook-Max-Retries.
+  """
+  def webhook_max_retries(%__MODULE__{} = job),
+    do: Map.get(job, :webhook_max_retries) || @default_max_retries
+
   def retry_deadline_ms(%__MODULE__{execute_before: before})
       when is_integer(before) and before > 0,
       do: before
@@ -168,6 +184,18 @@ defmodule Spillway.Job do
 
   defp max_retries_error,
     do: "max_retries must be -1 (retry until complete) or between 0 and 100"
+
+  defp parse_webhook_max_retries(nil), do: {:ok, nil}
+
+  defp parse_webhook_max_retries(value) do
+    case parse_max_retries(value) do
+      {:ok, n} ->
+        {:ok, n}
+
+      {:error, _} ->
+        {:error, "webhook_max_retries must be -1 (retry until delivered) or between 0 and 100"}
+    end
+  end
 
   defp require_exactly_one_of_url_or_pool_id(nil, nil),
     do: {:error, "either url or pool_id is required"}
@@ -221,11 +249,18 @@ defmodule Spillway.Job do
   original_job_id scopes the idempotent key so a given job's webhook is
   enqueued at most once even if this is somehow called twice for it.
   """
-  def new_webhook_delivery(original_job_id, user_id, webhook_url, payload) do
+  def new_webhook_delivery(
+        original_job_id,
+        user_id,
+        webhook_url,
+        payload,
+        max_retries \\ @default_max_retries
+      ) do
     %__MODULE__{
       id: generate_id(),
       user_id: user_id,
       idempotent_key: "webhook:" <> original_job_id,
+      max_retries: max_retries,
       url: webhook_url,
       pool_id: nil,
       method: "POST",
