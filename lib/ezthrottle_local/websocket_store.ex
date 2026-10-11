@@ -77,11 +77,14 @@ defmodule EzthrottleLocal.WebSocketStore do
       session_hash = hash_session(session_id)
       now = System.system_time(:millisecond)
 
-      case :mnesia.transaction(fn -> validate_cursor(session_hash, parsed, now) end) do
-        {:atomic, result} -> result
-        {:aborted, reason} -> {:error, reason}
-      end
+      # A dirty read: this only validates the cursor at handshake (one read
+      # of one row), and a transaction per new connection was measurable
+      # under a connection burst. The replay itself (read_after) stays in
+      # a transaction, where a concurrent trim can't silently drop events.
+      :mnesia.async_dirty(fn -> validate_cursor(session_hash, parsed, now) end)
     end
+  catch
+    :exit, {:aborted, reason} -> {:error, reason}
   end
 
   def read_after(session_id, cursor, limit) when is_integer(limit) and limit > 0 do
