@@ -103,6 +103,26 @@ defmodule EzthrottleLocal.WebSocketQueueTest do
     refute_received {:websocket_admitted, ^second, _token}
   end
 
+  test "a ramp increase doesn't shorten the gap already started" do
+    # The shared contract: slow start at 1/s, the first handshake succeeds
+    # (ramp doubles to 2/s), and the second connection must still wait the
+    # first second out. Refilling at the new rate opened it after ~500 ms.
+    queue = start_queue(connect_rps: 50.0, slow_start_rps: 1.0)
+    {:ok, first, _position} = WebSocketQueue.enqueue(self(), queue)
+    assert_receive {:websocket_admitted, ^first, _token}, 200
+    WebSocketQueue.report_success(queue)
+    assert WebSocketQueue.snapshot(queue).current_ramp_rps == 2.0
+
+    {:ok, second, _position} = WebSocketQueue.enqueue(self(), queue)
+    refute_receive {:websocket_admitted, ^second, _token}, 900
+    assert_receive {:websocket_admitted, ^second, _token}, 500
+
+    # The third follows at the ramped rate, half a second later.
+    {:ok, third, _position} = WebSocketQueue.enqueue(self(), queue)
+    refute_receive {:websocket_admitted, ^third, _token}, 400
+    assert_receive {:websocket_admitted, ^third, _token}, 400
+  end
+
   test "a failed handshake resets the ramp and pauses openings" do
     queue = start_queue(connect_rps: 1_000.0, slow_start_rps: 1.0)
     for _ <- 1..3, do: WebSocketQueue.report_success(queue)
