@@ -1,7 +1,12 @@
 defmodule EzthrottleLocal.WebSocketSession do
   @moduledoc false
 
-  use GenServer
+  # Temporary: a session exits normally once its last client has been gone
+  # for the idle timeout, and its clients close when it dies; restarting
+  # it would only leave a clientless process behind. As :permanent (the
+  # default), four idle exits within 5 s exceeded the supervisor's restart
+  # intensity and it shut down every live session on the node.
+  use GenServer, restart: :temporary
 
   require Logger
 
@@ -418,6 +423,10 @@ defmodule EzthrottleLocal.WebSocketSession do
           else: {:noreply, state}
 
       {:error, :replay_gap} ->
+        Logger.info(
+          "WebSocket session #{state.session_id}: closing a client that fell behind retained history"
+        )
+
         send(client, {:websocket_close, 1011, "client fell behind retained history; reconnect"})
         {:noreply, state}
 

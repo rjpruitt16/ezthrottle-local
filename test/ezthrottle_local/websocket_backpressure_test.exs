@@ -184,6 +184,42 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
     WebSocketUpstream.close(upstream)
   end
 
+  test "sessions that exit are not restarted, so idle exits can't take down the others" do
+    sessions =
+      for n <- 1..6 do
+        {:ok, pid} =
+          WebSocketSessionSupervisor.get_or_start(
+            session_id: "temporary-#{System.unique_integer([:positive])}-#{n}",
+            upstream_url: "ws://127.0.0.1:1/ws",
+            upstream_headers: [],
+            config: %{WebSocketConfig.load() | idle_timeout_ms: 10}
+          )
+
+        pid
+      end
+
+    {:ok, survivor} =
+      WebSocketSessionSupervisor.get_or_start(
+        session_id: "survivor-#{System.unique_integer([:positive])}",
+        upstream_url: "ws://127.0.0.1:1/ws",
+        upstream_headers: [],
+        config: WebSocketConfig.load()
+      )
+
+    {:ok, _} = WebSocketSession.attach(survivor, self(), "0-0")
+
+    # Six sessions reach their idle timeout within moments of each other, as
+    # in the Fly lab, where the fourth took the supervisor down with them.
+    for pid <- sessions do
+      ref = Process.monitor(pid)
+      {:ok, _} = WebSocketSession.attach(pid, self(), "0-0")
+      WebSocketSession.detach(pid, self())
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    end
+
+    assert Process.alive?(survivor)
+  end
+
   test "the upstream stops when its session goes away" do
     {url, _sent} = start_backend(0, 0)
     owner = self()
