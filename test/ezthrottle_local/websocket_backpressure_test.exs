@@ -220,6 +220,40 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
     assert Process.alive?(survivor)
   end
 
+  test "a lagging client whose events were trimmed is closed once and dropped" do
+    {url, _sent} = start_backend(50, 10)
+    session_id = "trimmed-#{System.unique_integer([:positive])}"
+    config = %{WebSocketConfig.load() | client_buffer: 2, read_batch: 2}
+
+    {:ok, session} =
+      WebSocketSessionSupervisor.get_or_start(
+        session_id: session_id,
+        upstream_url: url,
+        upstream_headers: [],
+        config: config
+      )
+
+    {:ok, _replayed} = WebSocketSession.attach(session, self(), "0-0")
+
+    # The client takes its two-event buffer and acknowledges nothing, so it
+    # lags while the backend's 50 events are recorded.
+    wait_until(fn -> stored_events(session_id) >= 50 end)
+    assert length(drain_events()) == 2
+
+    # The transcript budget trims under the client's cursor.
+    on_exit(fn -> EzthrottleLocal.WebSocketBudget.refresh(0, 0, 0, 1) end)
+    EzthrottleLocal.WebSocketStore.enforce_budget(1, 0)
+
+    for _ <- 1..2, do: WebSocketSession.delivered(session, self())
+
+    assert_receive {:websocket_close, 1011, "client fell behind retained history; reconnect"},
+                   1_000
+
+    # Dropped from the session: later acknowledgements don't close it again.
+    for _ <- 1..5, do: WebSocketSession.delivered(session, self())
+    refute_receive {:websocket_close, _, _}, 200
+  end
+
   test "the upstream stops when its session goes away" do
     {url, _sent} = start_backend(0, 0)
     owner = self()

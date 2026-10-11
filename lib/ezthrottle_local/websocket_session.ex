@@ -428,11 +428,11 @@ defmodule EzthrottleLocal.WebSocketSession do
         )
 
         send(client, {:websocket_close, 1011, "client fell behind retained history; reconnect"})
-        {:noreply, state}
+        {:noreply, remove_client(state, client)}
 
       {:error, reason} ->
         send(client, {:websocket_close, 1011, "event store unavailable: #{inspect(reason)}"})
-        {:noreply, state}
+        {:noreply, remove_client(state, client)}
     end
   end
 
