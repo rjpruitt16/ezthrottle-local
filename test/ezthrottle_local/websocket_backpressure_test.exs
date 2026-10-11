@@ -21,7 +21,8 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
 
     @impl true
     def handle_in({raw, opcode: :text}, state) do
-      {:push, {:text, raw}, state}
+      :counters.add(state.received, 1, 1)
+      if state.echo, do: {:push, {:text, raw}, state}, else: {:ok, state}
     end
 
     @impl true
@@ -62,10 +63,18 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
     end
   end
 
-  defp start_backend(count, pad_bytes) do
+  defp start_backend(count, pad_bytes, echo \\ true) do
     port = Enum.random(20_000..60_000)
     sent = :counters.new(1, [])
-    opts = %{count: count, pad: String.duplicate("x", pad_bytes), sent: sent}
+    received = :counters.new(1, [])
+
+    opts = %{
+      count: count,
+      pad: String.duplicate("x", pad_bytes),
+      sent: sent,
+      received: received,
+      echo: echo
+    }
 
     start_supervised!(
       Supervisor.child_spec({Bandit, plug: {BackendPlug, opts}, port: port},
@@ -73,16 +82,19 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
       )
     )
 
+    Process.put(:backend_received, received)
     {"ws://127.0.0.1:#{port}/ws", sent}
   end
 
-  defp next_frame_call(timeout \\ 5_000) do
+  defp next_frame(timeout \\ 5_000) do
     receive do
-      {:"$gen_call", from, {:websocket_upstream_frame, _pid, raw}} -> {from, raw}
+      {:websocket_upstream_frame, pid, ref, raw} -> {{pid, ref}, raw}
     after
       timeout -> flunk("no frame handed off within #{timeout}ms")
     end
   end
+
+  defp recorded({pid, ref}), do: send(pid, {:websocket_upstream_frame_recorded, ref})
 
   test "the upstream reads no further while the session is still recording a frame" do
     total = 20_000
@@ -91,8 +103,8 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
     {:ok, upstream} = WebSocketUpstream.start(url, self(), [], 5_000)
     assert_receive {:websocket_upstream_connected, ^upstream, _headers}, 5_000
 
-    # Hold the first frame's call, as a session stuck on a slow store would.
-    {held, first} = next_frame_call()
+    # Hold the first frame, as a session stuck on a slow store would.
+    {held, first} = next_frame()
     Process.sleep(1_000)
 
     # Nothing queued behind it: the session's mailbox has no further frames,
@@ -101,15 +113,16 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
     assert Process.info(self(), :message_queue_len) == {:message_queue_len, 0}
     assert {:message_queue_len, upstream_queue} = Process.info(upstream, :message_queue_len)
     assert upstream_queue <= 1
+    assert length(:sys.get_state(upstream).frames) < total
     assert :counters.get(sent, 1) < total
 
     # Once the session catches up, every frame arrives, in order.
-    GenServer.reply(held, :ok)
+    recorded(held)
 
     rest =
       for _ <- 2..total do
-        {from, raw} = next_frame_call()
-        GenServer.reply(from, :ok)
+        {frame, raw} = next_frame()
+        recorded(frame)
         raw
       end
 
@@ -118,7 +131,27 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
     WebSocketUpstream.close(upstream)
   end
 
-  test "the upstream forwards commands and stops when its session goes away" do
+  test "commands reach the backend while a frame waits to be recorded" do
+    {url, _sent} = start_backend(10, 10, false)
+    received = Process.get(:backend_received)
+
+    {:ok, upstream} = WebSocketUpstream.start(url, self(), [], 5_000)
+    assert_receive {:websocket_upstream_connected, ^upstream, _headers}, 5_000
+
+    # The lab found commands queueing in the upstream's mailbox behind
+    # frames the session hadn't recorded yet.
+    {_held, _raw} = next_frame()
+
+    for n <- 1..5 do
+      WebSocketUpstream.send_message(upstream, %{"type" => "command", "message_id" => "c#{n}"})
+    end
+
+    for _ <- 1..5, do: assert_receive({:websocket_upstream_written, ^upstream}, 5_000)
+    wait_until(fn -> :counters.get(received, 1) == 5 end)
+    WebSocketUpstream.close(upstream)
+  end
+
+  test "the upstream stops when its session goes away" do
     {url, _sent} = start_backend(0, 0)
     owner = self()
 
@@ -126,30 +159,48 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
       spawn(fn ->
         {:ok, upstream} = WebSocketUpstream.start(url, self(), [], 5_000)
         send(owner, {:upstream, upstream})
-
-        receive do
-          {:"$gen_call", from, {:websocket_upstream_frame, _pid, raw}} ->
-            GenServer.reply(from, :ok)
-            send(owner, {:echo, raw})
-        end
-
         receive do: (:stop -> :ok)
       end)
 
     assert_receive {:upstream, upstream}, 5_000
     ref = Process.monitor(upstream)
-
-    WebSocketUpstream.send_message(upstream, %{
-      "type" => "event",
-      "message_id" => "c1",
-      "payload" => %{}
-    })
-
-    assert_receive {:echo, raw}, 5_000
-    assert Jason.decode!(raw)["message_id"] == "c1"
-
     send(session, :stop)
     assert_receive {:DOWN, ^ref, :process, ^upstream, :normal}, 5_000
+  end
+
+  test "a session holds command replies once the backend is behind by its buffer" do
+    session_id = "backend-buffer-#{System.unique_integer([:positive])}"
+    config = %{WebSocketConfig.load() | backend_buffer: 3}
+
+    # Nothing listens here: the upstream never connects, so recorded
+    # commands wait in the session.
+    {:ok, session} =
+      WebSocketSessionSupervisor.get_or_start(
+        session_id: session_id,
+        upstream_url: "ws://127.0.0.1:1/ws",
+        upstream_headers: [],
+        config: config
+      )
+
+    {:ok, _replayed} = WebSocketSession.attach(session, self(), "0-0")
+
+    for n <- 1..3 do
+      assert {:ok, %{"type" => "command_recorded"}} =
+               WebSocketSession.command(session, self(), %{
+                 "type" => "command",
+                 "message_id" => "c#{n}"
+               })
+    end
+
+    client = self()
+
+    fourth =
+      Task.async(fn ->
+        WebSocketSession.command(session, client, %{"type" => "command", "message_id" => "c4"})
+      end)
+
+    assert Task.yield(fourth, 300) == nil
+    Task.shutdown(fourth, :brutal_kill)
   end
 
   test "a client that stops reading holds at most its buffer; it catches up from the store" do

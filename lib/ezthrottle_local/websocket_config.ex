@@ -6,6 +6,7 @@ defmodule EzthrottleLocal.WebSocketConfig do
             stream_ttl_ms: 86_400_000,
             read_batch: 100,
             client_buffer: 256,
+            backend_buffer: 256,
             max_message_bytes: 1_048_576,
             handshake_timeout_ms: 10_000,
             reconnect_max_ms: 30_000,
@@ -25,6 +26,7 @@ defmodule EzthrottleLocal.WebSocketConfig do
       stream_ttl_ms: positive_integer("EZTHROTTLE_WS_STREAM_TTL_SECONDS", 86_400) * 1_000,
       read_batch: positive_integer("EZTHROTTLE_WS_READ_BATCH", 100),
       client_buffer: positive_integer("EZTHROTTLE_WS_CLIENT_BUFFER", 256),
+      backend_buffer: positive_integer("EZTHROTTLE_WS_BACKEND_BUFFER", 256),
       max_message_bytes: positive_integer("EZTHROTTLE_WS_MAX_MESSAGE_BYTES", 1_048_576),
       handshake_timeout_ms:
         positive_integer("EZTHROTTLE_WS_HANDSHAKE_TIMEOUT_SECONDS", 10) * 1_000,

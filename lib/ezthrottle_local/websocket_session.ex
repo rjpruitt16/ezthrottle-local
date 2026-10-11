@@ -23,7 +23,10 @@ defmodule EzthrottleLocal.WebSocketSession do
 
   def attach(pid, client, cursor), do: GenServer.call(pid, {:attach, client, cursor}, 30_000)
   def detach(pid, client), do: GenServer.cast(pid, {:detach, client})
-  def command(pid, client, message), do: GenServer.call(pid, {:command, client, message}, 30_000)
+  # No timeout: while the backend is behind, the session holds the reply,
+  # which is what stops the client handler reading further frames.
+  def command(pid, client, message),
+    do: GenServer.call(pid, {:command, client, message}, :infinity)
 
   @doc "A client finished writing one event pushed with `{:websocket_event, message}`."
   def delivered(pid, client), do: GenServer.cast(pid, {:delivered, client})
@@ -45,6 +48,8 @@ defmodule EzthrottleLocal.WebSocketSession do
        queue_ref: nil,
        queue_token: nil,
        pending_commands: :queue.new(),
+       unwritten: 0,
+       deferred: :queue.new(),
        reconnect_attempt: 0,
        reconnect_timer: nil,
        idle_timer: nil,
@@ -71,58 +76,63 @@ defmodule EzthrottleLocal.WebSocketSession do
     end
   end
 
-  def handle_call({:command, client, message}, _from, state) do
-    if Map.has_key?(state.clients, client) do
-      case WebSocketStore.append(state.session_id, "client", message) do
-        {:ok, event} ->
-          clients = advance_live_clients(state.clients, event.stream_id)
-          pending = :queue.in(message, state.pending_commands)
-          state = %{state | clients: clients, pending_commands: pending} |> flush_commands()
+  # Commands recorded but not yet written to the backend are capped at
+  # config.backend_buffer. Past that the reply is held: the client's
+  # handler waits in this call, Bandit reads no more of its frames, and TCP
+  # slows the client down to the rate the backend accepts commands.
+  def handle_call({:command, client, message}, from, state) do
+    cond do
+      not Map.has_key?(state.clients, client) ->
+        {:reply, {:error, :client_not_attached}, state}
 
-          reply = %{
-            "type" => "command_recorded",
-            "message_id" => message["message_id"],
-            "stream_id" => event.stream_id
-          }
+      not :queue.is_empty(state.deferred) or
+          commands_in_flight(state) >= state.config.backend_buffer ->
+        {:noreply, %{state | deferred: :queue.in({from, client, message}, state.deferred)}}
 
-          {:reply, {:ok, reply}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, state}
-      end
-    else
-      {:reply, {:error, :client_not_attached}, state}
+      true ->
+        {reply, state} = record_command(state, message)
+        {:reply, reply, state}
     end
   end
 
-  # The upstream process waits on this call before reading more from the
-  # backend's socket, so a session that can't record events as fast as the
-  # backend sends them slows the backend down instead of queueing frames.
-  def handle_call({:websocket_upstream_frame, pid, raw}, _from, %{upstream_pid: pid} = state) do
-    case WebSocketProtocol.decode_backend(raw) do
-      {:ok, %{"type" => "aqueduct.capacity"} = message} ->
-        WebSocketQueue.update_capacity(message["max_connections"], message["connect_rps"])
-        {:reply, :ok, state}
+  defp record_command(state, message) do
+    case WebSocketStore.append(state.session_id, "client", message) do
+      {:ok, event} ->
+        clients = advance_live_clients(state.clients, event.stream_id)
+        pending = :queue.in(message, state.pending_commands)
+        state = %{state | clients: clients, pending_commands: pending} |> flush_commands()
 
-      {:ok, message} ->
-        message = Map.put(message, "generation", state.generation)
+        reply = %{
+          "type" => "command_recorded",
+          "message_id" => message["message_id"],
+          "stream_id" => event.stream_id
+        }
 
-        case WebSocketStore.append(state.session_id, "backend", message) do
-          {:ok, event} ->
-            {:reply, :ok, deliver_event(state, event)}
-
-          {:error, reason} ->
-            {:stop, reason, :ok,
-             close_clients(state, 1011, "event store unavailable: #{inspect(reason)}")}
-        end
+        {{:ok, reply}, state}
 
       {:error, reason} ->
-        WebSocketUpstream.close(pid)
-        {:reply, :ok, notify_error(state, reason)}
+        {{:error, reason}, state}
     end
   end
 
-  def handle_call({:websocket_upstream_frame, _pid, _raw}, _from, state), do: {:reply, :ok, state}
+  defp commands_in_flight(state), do: :queue.len(state.pending_commands) + state.unwritten
+
+  defp release_deferred(state) do
+    with false <- commands_in_flight(state) >= state.config.backend_buffer,
+         {{:value, {from, client, message}}, rest} <- :queue.out(state.deferred) do
+      state = %{state | deferred: rest}
+
+      {reply, state} =
+        if Map.has_key?(state.clients, client),
+          do: record_command(state, message),
+          else: {{:error, :client_not_attached}, state}
+
+      GenServer.reply(from, reply)
+      release_deferred(state)
+    else
+      _ -> state
+    end
+  end
 
   @impl true
   def handle_cast({:detach, client}, state) do
@@ -220,6 +230,47 @@ defmodule EzthrottleLocal.WebSocketSession do
   end
 
   def handle_info({:websocket_upstream_connected, _pid, _headers}, state), do: {:noreply, state}
+
+  # The upstream reads nothing more from the backend's socket until this
+  # frame is acknowledged, so a session that can't record events as fast as
+  # the backend sends them slows the backend down instead of queueing
+  # frames. Commands keep flowing to the backend meanwhile.
+  def handle_info({:websocket_upstream_frame, pid, ref, raw}, %{upstream_pid: pid} = state) do
+    case WebSocketProtocol.decode_backend(raw) do
+      {:ok, %{"type" => "aqueduct.capacity"} = message} ->
+        WebSocketQueue.update_capacity(message["max_connections"], message["connect_rps"])
+        send(pid, {:websocket_upstream_frame_recorded, ref})
+        {:noreply, state}
+
+      {:ok, message} ->
+        message = Map.put(message, "generation", state.generation)
+
+        case WebSocketStore.append(state.session_id, "backend", message) do
+          {:ok, event} ->
+            send(pid, {:websocket_upstream_frame_recorded, ref})
+            {:noreply, deliver_event(state, event)}
+
+          {:error, reason} ->
+            stop_clients(state, 1011, "event store unavailable: #{inspect(reason)}")
+        end
+
+      {:error, reason} ->
+        WebSocketUpstream.close(pid)
+        {:noreply, notify_error(state, reason)}
+    end
+  end
+
+  def handle_info({:websocket_upstream_frame, pid, ref, _raw}, state) do
+    send(pid, {:websocket_upstream_frame_recorded, ref})
+    {:noreply, state}
+  end
+
+  def handle_info({:websocket_upstream_written, pid}, %{upstream_pid: pid} = state) do
+    state = %{state | unwritten: max(state.unwritten - 1, 0)}
+    {:noreply, release_deferred(state)}
+  end
+
+  def handle_info({:websocket_upstream_written, _pid}, state), do: {:noreply, state}
 
   def handle_info({:websocket_upstream_error, pid, reason}, %{upstream_pid: pid} = state) do
     WebSocketUpstream.close(pid)
@@ -397,7 +448,7 @@ defmodule EzthrottleLocal.WebSocketSession do
     case :queue.out(state.pending_commands) do
       {{:value, message}, rest} ->
         WebSocketUpstream.send_message(pid, message)
-        flush_commands(%{state | pending_commands: rest})
+        flush_commands(%{state | pending_commands: rest, unwritten: state.unwritten + 1})
 
       {:empty, _queue} ->
         state
@@ -418,15 +469,18 @@ defmodule EzthrottleLocal.WebSocketSession do
     if state.upstream_monitor, do: Process.demonitor(state.upstream_monitor, [:flush])
     state = release_upstream_slot(state)
 
+    # Writes not confirmed by now are lost with the socket; as before,
+    # recorded commands are not replayed after an ambiguous disconnect.
     state = %{
       state
       | upstream_pid: nil,
         upstream_monitor: nil,
-        upstream_connected: false
+        upstream_connected: false,
+        unwritten: 0
     }
 
     unless was_connected, do: WebSocketQueue.report_failure()
-    schedule_reconnect(state, reason)
+    state |> release_deferred() |> schedule_reconnect(reason)
   end
 
   defp release_upstream_slot(%{queue_token: nil} = state), do: state
@@ -499,7 +553,11 @@ defmodule EzthrottleLocal.WebSocketSession do
 
       {info, clients} ->
         if demonitor?, do: Process.demonitor(info.monitor, [:flush])
-        state = %{state | clients: clients}
+
+        deferred =
+          :queue.filter(fn {_from, waiting, _message} -> waiting != client end, state.deferred)
+
+        state = %{state | clients: clients, deferred: deferred}
 
         if map_size(clients) == 0 do
           state = quiesce_upstream(state)
@@ -533,7 +591,8 @@ defmodule EzthrottleLocal.WebSocketSession do
       queue_ref: nil,
       reconnect_timer: nil,
       reconnect_attempt: 0,
-      pending_commands: :queue.new()
+      pending_commands: :queue.new(),
+      unwritten: 0
     })
   end
 
