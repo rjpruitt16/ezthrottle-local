@@ -10,6 +10,10 @@ defmodule EzthrottleLocal.WebSocketStore do
   @streams :websocket_streams
   @events :websocket_events
   @cleanup_interval_ms 60_000
+  # The budget pass trims only streams idle this long: an active stream is
+  # trimmed on its own appends, and trimming it here as well contends with
+  # them for the stream's lock, which under load delayed the pass by minutes.
+  @idle_before_trim_ms 5_000
 
   def start_link(config) do
     GenServer.start_link(__MODULE__, config, name: __MODULE__)
@@ -151,12 +155,15 @@ defmodule EzthrottleLocal.WebSocketStore do
   every stream to the per-session limit. Active streams are also trimmed on
   each append; this pass catches idle ones.
   """
-  def enforce_budget(budget_bytes \\ WebSocketBudget.budget_bytes()) do
+  def enforce_budget(
+        budget_bytes \\ WebSocketBudget.budget_bytes(),
+        idle_ms \\ @idle_before_trim_ms
+      ) do
     {used, events, streams} = usage()
 
     case WebSocketBudget.refresh(used, events, streams, budget_bytes) do
       nil -> :ok
-      limit -> trim_streams_over(limit)
+      limit -> trim_streams_over(limit, idle_ms)
     end
   end
 
@@ -179,11 +186,15 @@ defmodule EzthrottleLocal.WebSocketStore do
     {used, :mnesia.table_info(@events, :size), :mnesia.table_info(@streams, :size)}
   end
 
-  defp trim_streams_over(limit) do
+  defp trim_streams_over(limit, idle_ms) do
+    # expires_at is the last append plus the TTL.
+    ttl_ms = WebSocketConfig.load().stream_ttl_ms
+    idle_expiry = System.system_time(:millisecond) + ttl_ms - idle_ms
+
     over =
       :mnesia.dirty_select(@streams, [
-        {{@streams, :"$1", :_, :_, :"$2", :"$3", :_}, [{:>, {:-, :"$3", :"$2"}, limit - 1}],
-         [:"$1"]}
+        {{@streams, :"$1", :_, :_, :"$2", :"$3", :"$4"},
+         [{:>, {:-, :"$3", :"$2"}, limit - 1}, {:"=<", :"$4", idle_expiry}], [:"$1"]}
       ])
 
     Enum.each(over, fn session_hash ->

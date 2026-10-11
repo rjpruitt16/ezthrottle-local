@@ -6,9 +6,14 @@ defmodule EzthrottleLocal.WebSocketUpstream do
   session one at a time, each acknowledged once the session has recorded
   it, and only when the chunk's last frame is acknowledged is the socket
   armed for the next chunk. While the session is behind nothing more is
-  read, the kernel buffers fill, and TCP slows the backend down. Commands
-  from the session are written to the backend meanwhile, each confirmed
-  back to the session so it can bound how many are outstanding. WebSockex, used before, kept its socket in
+  read, the kernel buffers fill, and TCP slows the backend down.
+
+  Writes go through a separate linked writer process, each command
+  confirmed to the session once written so it can bound how many are
+  outstanding. A blocking write must not stall this process: a backend
+  that stops reading because its own sends to us are blocked would
+  otherwise wait on us while we wait on it, and neither side would read
+  again. WebSockex, used before, kept its socket in
   `active: true`, so the VM read everything the backend sent into the
   session's mailbox; under overload that mailbox grew by 5-10 MB/s until
   the node ran out of memory (#24).
@@ -64,10 +69,15 @@ defmodule EzthrottleLocal.WebSocketUpstream do
       {:ok, conn, ref, websocket, resp_headers, leftover} ->
         send(owner, {:websocket_upstream_connected, self(), resp_headers})
 
+        upstream = self()
+        socket = Mint.HTTP.get_socket(conn)
+        writer = spawn_link(fn -> write_loop(socket, owner, upstream) end)
+
         state = %{
           conn: conn,
           ref: ref,
           websocket: websocket,
+          writer: writer,
           owner: owner,
           owner_monitor: Process.monitor(owner),
           frames: [],
@@ -90,13 +100,9 @@ defmodule EzthrottleLocal.WebSocketUpstream do
 
   @impl true
   def handle_cast({:send, raw}, state) do
-    case send_frame(state, {:text, raw}) do
-      {:ok, state} ->
-        send(state.owner, {:websocket_upstream_written, self()})
-        {:noreply, state}
-
-      {:error, state, reason} ->
-        disconnect(state, reason)
+    case send_frame(state, {:text, raw}, true) do
+      {:ok, state} -> {:noreply, state}
+      {:error, state, reason} -> disconnect(state, reason)
     end
   end
 
@@ -109,6 +115,9 @@ defmodule EzthrottleLocal.WebSocketUpstream do
     Mint.HTTP.close(state.conn)
     {:stop, :normal, state}
   end
+
+  def handle_info({:websocket_upstream_write_failed, reason}, state),
+    do: disconnect(state, reason)
 
   def handle_info({:websocket_upstream_frame_recorded, ref}, %{awaiting: ref} = state) do
     %{state | awaiting: nil} |> next_frame() |> continue()
@@ -271,16 +280,33 @@ defmodule EzthrottleLocal.WebSocketUpstream do
 
   # ---- writing / closing ----
 
-  defp send_frame(state, frame) do
+  # Encoding stays here (it carries the WebSocket state); the bytes go to
+  # the writer, in order. confirm? marks commands the session counts.
+  defp send_frame(state, frame, confirm? \\ false) do
     case Mint.WebSocket.encode(state.websocket, frame) do
       {:ok, websocket, data} ->
-        case Mint.WebSocket.stream_request_body(state.conn, state.ref, data) do
-          {:ok, conn} -> {:ok, %{state | websocket: websocket, conn: conn}}
-          {:error, conn, reason} -> {:error, %{state | websocket: websocket, conn: conn}, reason}
-        end
+        send(state.writer, {:write, data, confirm?})
+        {:ok, %{state | websocket: websocket}}
 
       {:error, websocket, reason} ->
         {:error, %{state | websocket: websocket}, reason}
+    end
+  end
+
+  defp write_loop(socket, owner, upstream) do
+    receive do
+      {:write, data, confirm?} ->
+        result =
+          if is_port(socket), do: :gen_tcp.send(socket, data), else: :ssl.send(socket, data)
+
+        case result do
+          :ok ->
+            if confirm?, do: send(owner, {:websocket_upstream_written, upstream})
+            write_loop(socket, owner, upstream)
+
+          {:error, reason} ->
+            send(upstream, {:websocket_upstream_write_failed, reason})
+        end
     end
   end
 

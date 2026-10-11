@@ -33,7 +33,8 @@ defmodule EzthrottleLocal.WebSocketBudgetTest do
       end)
 
     # A budget of 1 byte: every session falls to the 10-event floor.
-    WebSocketStore.enforce_budget(1)
+    # Freshly written streams count as active; treat them as idle here.
+    WebSocketStore.enforce_budget(1, 0)
     assert WebSocketBudget.session_limit() == 10
 
     for session <- sessions do

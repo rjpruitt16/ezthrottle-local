@@ -151,6 +151,39 @@ defmodule EzthrottleLocal.WebSocketBackpressureTest do
     WebSocketUpstream.close(upstream)
   end
 
+  test "a backend that stops reading while we stop reading doesn't deadlock the upstream" do
+    # The backend floods events and, while its own writes are blocked, reads
+    # nothing. We hold its first frame and push ~100 MB of commands at it:
+    # our writes block too. Writes happen in a separate process, so the
+    # upstream still takes frame acknowledgements and reads again.
+    total = 20_000
+    {url, _sent} = start_backend(total, 1_000, false)
+
+    {:ok, upstream} = WebSocketUpstream.start(url, self(), [], 5_000)
+    assert_receive {:websocket_upstream_connected, ^upstream, _headers}, 5_000
+    {held, _raw} = next_frame()
+
+    payload = String.duplicate("y", 50_000)
+
+    for n <- 1..2_000 do
+      WebSocketUpstream.send_message(upstream, %{
+        "type" => "command",
+        "message_id" => "big#{n}",
+        "payload" => payload
+      })
+    end
+
+    Process.sleep(200)
+    recorded(held)
+
+    for _ <- 2..total do
+      {frame, _raw} = next_frame()
+      recorded(frame)
+    end
+
+    WebSocketUpstream.close(upstream)
+  end
+
   test "the upstream stops when its session goes away" do
     {url, _sent} = start_backend(0, 0)
     owner = self()
