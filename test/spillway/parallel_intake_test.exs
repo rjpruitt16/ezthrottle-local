@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.ParallelIntakeTest do
   @moduledoc """
   The standalone submit path persists in the caller, reads queue backlog from

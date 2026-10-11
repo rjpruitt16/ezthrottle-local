@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.RegionAdapter.Noop do
   @moduledoc """
   Default RegionAdapter: no known regions, cross-region redirect never

@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.PoolMember do
   @moduledoc """
   One registered target within a pool — the Elixir port of Aquifer's

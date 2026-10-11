@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Orca do
   @moduledoc """
   ORCA (Open Request Cost Aggregation) fallback pacing -- a port of

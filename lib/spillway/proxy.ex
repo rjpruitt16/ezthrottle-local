@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Proxy do
   @moduledoc """
   Proxy mode: try the upstream directly and synchronously first; fall back

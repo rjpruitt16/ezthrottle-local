@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Simple webhook receiver for spillway integration tests.
 Run: python3 webhook_server.py [port]

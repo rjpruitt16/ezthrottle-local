@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.WebSocketBudget do
   @moduledoc """
   Bounds the memory WebSocket transcripts use on this node.

@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.PoolDispatchTest do
   @moduledoc """
   End-to-end proof that a job submitted with pool_id (no url) actually

@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.UserLoad do
   @moduledoc """
   Per-node counts of each user's accepted-but-unfinished jobs and the webhook

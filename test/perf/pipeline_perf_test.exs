@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.PipelinePerfTest do
   @moduledoc """
   Performance benchmarks: run with `make perf`, excluded from `mix test`.

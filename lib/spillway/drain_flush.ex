@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.DrainFlush do
   @moduledoc """
   Drain mode: opt-in, off by default. When this instance goes completely

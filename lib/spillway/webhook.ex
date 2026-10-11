@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Webhook do
   @moduledoc """
   Synchronous webhook delivery with exponential backoff and optional L8

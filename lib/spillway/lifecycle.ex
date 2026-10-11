@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Lifecycle do
   @moduledoc """
   Graceful shutdown, mirroring Aquifer's lifecycle contract. On SIGTERM the

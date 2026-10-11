@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Redirect do
   @moduledoc """
   Cross-region /proxy redirect on partial Fly.io outages -- direct port of

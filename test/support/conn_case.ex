@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule SpillwayWeb.ConnCase do
   @moduledoc """
   This module defines the test case to be used by

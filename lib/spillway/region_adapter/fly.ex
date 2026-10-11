@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.RegionAdapter.Fly do
   @moduledoc """
   Polls sibling regions over Fly's private 6PN network to know which are

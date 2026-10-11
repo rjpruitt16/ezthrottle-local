@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule SpillwayWeb.NodeDraining do
   @moduledoc """
   503 response for a draining node, header-for-header with Aquifer's

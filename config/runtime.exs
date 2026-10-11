@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 import Config
 
 # Spillway was called EZThrottle Local, and its variables were

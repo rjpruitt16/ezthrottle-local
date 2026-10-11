@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.AccountQueueRegistry do
   @moduledoc """
   Top-level registry for UrlActors.

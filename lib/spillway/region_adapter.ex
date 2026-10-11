@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.RegionAdapter do
   @moduledoc """
   Pluggable region-liveness adapter entrypoint, backing /proxy's cross-region

@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.NodeIdle do
   @moduledoc """
   Waits for the node to have no work left: nothing pending in the store and

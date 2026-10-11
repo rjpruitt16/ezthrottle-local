@@ -1,3 +1,6 @@
+# Copyright 2026 Rahmi Pruitt
+# SPDX-License-Identifier: Apache-2.0
+
 defmodule Spillway.Admission do
   @moduledoc """
   Memory/DB-size/body-size ceilings that protect this instance from the
