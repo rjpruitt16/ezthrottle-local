@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple webhook receiver for ezthrottle-local integration tests.
+Simple webhook receiver for spillway integration tests.
 Run: python3 webhook_server.py [port]
 """
 from flask import Flask, request, jsonify

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SSE streaming integration tests for ezthrottle-local.
+SSE streaming integration tests for spillway.
 
 Three cases:
   1. Happy path  — stream receives queued → position → dispatching → completed in order
@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 
-EZTHROTTLE_URL = os.getenv("EZTHROTTLE_URL", "http://localhost:4000")
+SPILLWAY_URL = os.getenv("SPILLWAY_URL", "http://localhost:4000")
 WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "http://localhost:9090")
 WEBHOOK_CB     = os.getenv("WEBHOOK_CALLBACK_URL", "http://localhost:9090/webhook")
 TARGET_URL      = os.getenv("TARGET_URL", "https://httpbin.org/get")
@@ -46,7 +46,7 @@ def submit_job(user_id="test-user", extra_headers=None):
         "headers": extra_headers or {},
         "webhook_url": WEBHOOK_CB,
     }
-    r = requests.post(f"{EZTHROTTLE_URL}/jobs", json=payload, timeout=5)
+    r = requests.post(f"{SPILLWAY_URL}/jobs", json=payload, timeout=5)
     r.raise_for_status()
     return r.json()["job_id"]
 
@@ -59,7 +59,7 @@ def collect_sse_events(job_id, stop_after=None, disconnect_after_event=None, tim
     Returns list of event dicts.
     """
     events = []
-    url = f"{EZTHROTTLE_URL}/jobs/{job_id}/stream"
+    url = f"{SPILLWAY_URL}/jobs/{job_id}/stream"
 
     try:
         with requests.get(url, stream=True, timeout=timeout) as resp:
@@ -180,7 +180,7 @@ def submit_local_job(user_id="test-user", extra_headers=None):
         "headers": extra_headers or {},
         "webhook_url": WEBHOOK_CB,
     }
-    r = requests.post(f"{EZTHROTTLE_URL}/jobs", json=payload, timeout=5)
+    r = requests.post(f"{SPILLWAY_URL}/jobs", json=payload, timeout=5)
     r.raise_for_status()
     return r.json()["job_id"]
 
@@ -221,7 +221,7 @@ def test_position_updates():
 # ---- Main ----------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"SSE streaming tests against {EZTHROTTLE_URL}")
+    print(f"SSE streaming tests against {SPILLWAY_URL}")
     print(f"Webhook server at {WEBHOOK_URL}")
 
     test_happy_path()

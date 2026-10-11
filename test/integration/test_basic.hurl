@@ -1,5 +1,5 @@
 # Test 1: Health check
-GET {{EZTHROTTLE_URL}}/health
+GET {{SPILLWAY_URL}}/health
 HTTP 200
 [Asserts]
 jsonpath "$.status" == "ok"
@@ -11,7 +11,7 @@ HTTP 200
 jsonpath "$.status" == "reset"
 
 # Test 3: Submit a job
-POST {{EZTHROTTLE_URL}}/jobs
+POST {{SPILLWAY_URL}}/jobs
 Content-Type: application/json
 {
   "user_id": "user_001",
@@ -28,7 +28,7 @@ jsonpath "$.status" == "queued"
 job_id: jsonpath "$.job_id"
 
 # Test 4: Poll job status — should be queued or completed
-GET {{EZTHROTTLE_URL}}/jobs/{{job_id}}
+GET {{SPILLWAY_URL}}/jobs/{{job_id}}
 HTTP 200
 [Asserts]
 jsonpath "$.job_id" == "{{job_id}}"

@@ -1,7 +1,7 @@
 # Test validation — missing required fields return 400
 
 # Missing user_id
-POST {{EZTHROTTLE_URL}}/jobs
+POST {{SPILLWAY_URL}}/jobs
 Content-Type: application/json
 {
   "idempotent_key": "val-test-001",
@@ -14,7 +14,7 @@ HTTP 400
 jsonpath "$.error" exists
 
 # Missing url
-POST {{EZTHROTTLE_URL}}/jobs
+POST {{SPILLWAY_URL}}/jobs
 Content-Type: application/json
 {
   "user_id": "user_001",
@@ -27,7 +27,7 @@ HTTP 400
 jsonpath "$.error" exists
 
 # Missing idempotent_key
-POST {{EZTHROTTLE_URL}}/jobs
+POST {{SPILLWAY_URL}}/jobs
 Content-Type: application/json
 {
   "user_id": "user_001",
@@ -40,7 +40,7 @@ HTTP 400
 jsonpath "$.error" exists
 
 # Missing webhook_url
-POST {{EZTHROTTLE_URL}}/jobs
+POST {{SPILLWAY_URL}}/jobs
 Content-Type: application/json
 {
   "user_id": "user_001",
@@ -53,7 +53,7 @@ HTTP 400
 jsonpath "$.error" exists
 
 # Unknown job id returns 404
-GET {{EZTHROTTLE_URL}}/jobs/doesnotexist000000000000000000000
+GET {{SPILLWAY_URL}}/jobs/doesnotexist000000000000000000000
 HTTP 404
 [Asserts]
 jsonpath "$.error" exists

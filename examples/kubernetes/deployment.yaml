@@ -8,25 +8,25 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ezthrottle-local
-  namespace: ezthrottle-local
+  name: spillway
+  namespace: spillway
   labels:
-    app: ezthrottle-local
+    app: spillway
 spec:
   replicas: 1
   strategy:
     type: Recreate # avoid two pods ever attaching the same RWO volume during a rollout
   selector:
     matchLabels:
-      app: ezthrottle-local
+      app: spillway
   template:
     metadata:
       labels:
-        app: ezthrottle-local
+        app: spillway
     spec:
       containers:
-        - name: ezthrottle-local
-          image: your-registry/ezthrottle-local:latest # build from this repo's Dockerfile -- not currently published
+        - name: spillway
+          image: your-registry/spillway:latest # build from this repo's Dockerfile -- not currently published
           ports:
             - containerPort: 4000
           env:
@@ -35,7 +35,7 @@ spec:
             - name: PORT
               value: "4000"
             - name: PHX_HOST
-              value: ezthrottle-local.example.com # the Gateway's own hostname/domain in your cluster
+              value: spillway.example.com # the Gateway's own hostname/domain in your cluster
             - name: MNESIA_DIR
               value: /data/mnesia
             # Required, not optional -- rel/env.sh.eex otherwise names the
@@ -52,11 +52,11 @@ spec:
             # readable after. Same fix already applied for Fly.io via
             # FLY_APP_NAME in rel/env.sh.eex -- this is the K8s equivalent.
             - name: RELEASE_NODE
-              value: ezthrottle-local@localhost
+              value: spillway@localhost
             - name: SECRET_KEY_BASE
               valueFrom:
                 secretKeyRef:
-                  name: ezthrottle-local-secret
+                  name: spillway-secret
                   key: secret-key-base
           volumeMounts:
             - name: data
@@ -86,7 +86,7 @@ spec:
             # is unaffected. Looked like a BEAM/cgroup memory-detection
             # mismatch specific to this environment, not a real app
             # memory requirement -- test carefully in your own cluster
-            # before adding one back, and set EZTHROTTLE_MEMORY_LIMIT_MB
+            # before adding one back, and set SPILLWAY_MEMORY_LIMIT_MB
             # (the app's own admission-control limit, not a cgroup one)
             # instead if you want a safety net.
             requests:
@@ -97,4 +97,4 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: ezthrottle-local-data
+            claimName: spillway-data

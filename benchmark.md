@@ -1,6 +1,6 @@
 # Benchmarks
 
-Real runs against a live deployment (`ezthrottle-local.fly.dev`), same `shared-cpu-1x`/512MB Fly.io tier and methodology as [Aquifer's benchmark.md](https://github.com/rjpruitt16/aquifer/blob/main/benchmark.md), the Go/SQLite sibling this project mirrors. Scripts are in [`benchmark/`](benchmark/).
+Real runs against a live deployment (`spillway.fly.dev`), same `shared-cpu-1x`/512MB Fly.io tier and methodology as [Aquifer's benchmark.md](https://github.com/rjpruitt16/aquifer/blob/main/benchmark.md), the Go/SQLite sibling this project mirrors. Scripts are in [`benchmark/`](benchmark/).
 
 Benchmarking surfaced two real bugs and one architecture trade-off, all fixed or characterized below.
 
@@ -8,7 +8,7 @@ Benchmarking surfaced two real bugs and one architecture trade-off, all fixed or
 
 ## Starting point: what was missing
 
-Before this round, ezthrottle-local mirrored Aquifer's file structure but had real gaps:
+Before this round, spillway mirrored Aquifer's file structure but had real gaps:
 
 - **No crash durability.** Pure ETS — kill the BEAM node, every queued job is gone.
 - **No admission control.** No memory ceiling, no shedding, no 429s.
@@ -43,7 +43,7 @@ dump_log: :dumped
 read_after_crash: {:atomic, [{:foo, "a", "hello"}]}   # survives
 ```
 
-Flushing on every write reintroduces a real latency cost (see §3), so the shipped design batches the flush on a timer instead (`EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS`, default 100ms) — bounding loss to that interval on a crash rather than eliminating it. Verified on Fly.io: 30 jobs enqueued, machine `SIGKILL`'d mid-drain:
+Flushing on every write reintroduces a real latency cost (see §3), so the shipped design batches the flush on a timer instead (`SPILLWAY_MNESIA_FLUSH_INTERVAL_MS`, default 100ms) — bounding loss to that interval on a crash rather than eliminating it. Verified on Fly.io: 30 jobs enqueued, machine `SIGKILL`'d mid-drain:
 
 ```
 jobs enqueued: 30 | completed: 30 | failed: 0 | still queued: 0 | lost: 0
@@ -64,7 +64,7 @@ Same shape of bug as Aquifer's `CheckOrInsert` (a different race there — `SELE
 
 ## 3. Admission control
 
-`EzthrottleLocal.Admission` mirrors Aquifer's `admission.go`: memory/body/DB-size limits, exponential `Retry-After` backoff. `GET /health` reports a live snapshot.
+`Spillway.Admission` mirrors Aquifer's `admission.go`: memory/body/DB-size limits, exponential `Retry-After` backoff. `GET /health` reports a live snapshot.
 
 This is where the per-write Mnesia flush cost showed up. 150 req/s for 45s, before the batched-flush fix:
 
@@ -139,11 +139,11 @@ Matches Aquifer's post-fix result (1-5s) almost exactly.
 
 ## 6. GPU inference and the retry tax (RunPod/vLLM)
 
-Ported from Aquifer's identical benchmark (see its `benchmark.md`) after porting the underlying feature: `lib/ezthrottle_local/orca.ex` reads vLLM's `kv_cache_usage_perc` from the `endpoint-load-metrics` response header as a fallback pacing signal, same thresholds as Aquifer's `orca.go`. Same GPU, same vLLM instance, same job payload shape (`POST /jobs` is schema-identical between the two).
+Ported from Aquifer's identical benchmark (see its `benchmark.md`) after porting the underlying feature: `lib/spillway/orca.ex` reads vLLM's `kv_cache_usage_perc` from the `endpoint-load-metrics` response header as a fallback pacing signal, same thresholds as Aquifer's `orca.go`. Same GPU, same vLLM instance, same job payload shape (`POST /jobs` is schema-identical between the two).
 
-**Same offered load (40 req/s for 30s), direct-to-vLLM vs. through EZThrottle:**
+**Same offered load (40 req/s for 30s), direct-to-vLLM vs. through Spillway:**
 
-| | Direct | Through EZThrottle |
+| | Direct | Through Spillway |
 |---|---|---|
 | Client success | 100% | 100% |
 | Client mean latency | 11.4s | 5.9ms |
@@ -152,9 +152,9 @@ Ported from Aquifer's identical benchmark (see its `benchmark.md`) after porting
 
 Ingest absorbs the burst exactly like Aquifer's — 100% success, single-digit-millisecond latency, full 40 req/s accepted instantly. But actual dispatch to vLLM never went above **1 concurrent request**, and stayed there for the whole run.
 
-**Why, and a real gap this surfaced:** unlike Aquifer, which has a per-upstream `max_concurrent` set via `CONFIG_PATH`, EZThrottle Local's `max_concurrent` has no config knob at all — every `UrlActor` starts at a hardcoded `1` and only rises if the upstream sends back an explicit `X-Aqueduct-Max-Concurrent`/`X-EZTHROTTLE-MAX-CONCURRENT` header. vLLM doesn't send that (it only speaks ORCA), so concurrency never left 1. That's an extremely conservative default in one sense — vLLM was never at real risk here regardless of the burst size — but it also means the ORCA rps signal had no room to matter: with only one in-flight request at a time, `kv_cache_usage_perc` never came close to the 70% threshold that would trigger a pacing cut.
+**Why, and a real gap this surfaced:** unlike Aquifer, which has a per-upstream `max_concurrent` set via `CONFIG_PATH`, Spillway's `max_concurrent` has no config knob at all — every `UrlActor` starts at a hardcoded `1` and only rises if the upstream sends back an explicit `X-Aqueduct-Max-Concurrent`/`X-EZTHROTTLE-MAX-CONCURRENT` header. vLLM doesn't send that (it only speaks ORCA), so concurrency never left 1. That's an extremely conservative default in one sense — vLLM was never at real risk here regardless of the burst size — but it also means the ORCA rps signal had no room to matter: with only one in-flight request at a time, `kv_cache_usage_perc` never came close to the 70% threshold that would trigger a pacing cut.
 
-`orca.ex` itself is correct and covered by unit tests (`test/ezthrottle_local/orca_test.exs`, 8 tests mirroring Aquifer's `orca_test.go` exactly) — the mechanism is proven at the unit level; this run just didn't have the concurrency headroom to exercise it end-to-end against a real GPU the way Aquifer's did. Filed as [issue #7](https://github.com/rjpruitt16/ezthrottle-local/issues/7) to add a `default_max_concurrent` config knob (mirroring `default_rps`, which had the same gap and was fixed as part of this port) rather than building it unprompted.
+`orca.ex` itself is correct and covered by unit tests (`test/spillway/orca_test.exs`, 8 tests mirroring Aquifer's `orca_test.go` exactly) — the mechanism is proven at the unit level; this run just didn't have the concurrency headroom to exercise it end-to-end against a real GPU the way Aquifer's did. Filed as [issue #7](https://github.com/rjpruitt16/spillway/issues/7) to add a `default_max_concurrent` config knob (mirroring `default_rps`, which had the same gap and was fixed as part of this port) rather than building it unprompted.
 
 ---
 
@@ -174,17 +174,17 @@ Baseline, 2026-10-06, Apple M3 Max laptop:
 
 Single-job latency barely moves, since an empty table is cheap to scan. Throughput with retained jobs is where the scan hurt: 2.5x faster after the fix. Even after it, 100k retained jobs still roughly halve throughput. Part of that is Mnesia's own disk dump: on this machine `dump_log` averages about 2.4 ms on an empty table and 6.6 ms at 100k rows, with spikes over 80 ms when it rewrites the table file. That isn't fully pinned down yet.
 
-These numbers aren't directly comparable to Aquifer's Pebble row. EZThrottle acknowledges a job before it reaches disk (flushed every 100ms, see section 1), while Pebble syncs every write.
+These numbers aren't directly comparable to Aquifer's Pebble row. Spillway acknowledges a job before it reaches disk (flushed every 100ms, see section 1), while Pebble syncs every write.
 
 ---
 
 ## 8. Capacity per machine, end to end (Fly.io, 2026-10-07)
 
 Same harness as Aquifer's benchmark.md section 12:
-- **Target:** one ezthrottle-local machine with a volume.
+- **Target:** one spillway machine with a volume.
 - **Load generator:** Aquifer's `benchmark/loadgen` on a separate machine. It ramps `POST /jobs` across 50 users and also serves as the upstream and the webhook receiver, both answering instantly.
 - **Webhooks:** every job also delivers a webhook.
-- **Config:** `EZTHROTTLE_DEFAULT_RPS=100000`, 100ms Mnesia flush (the default), production log level.
+- **Config:** `SPILLWAY_DEFAULT_RPS=100000`, 100ms Mnesia flush (the default), production log level.
 
 This measures accepting, dispatching, completing and delivering each job's webhook at the same time, unlike section 4, which measured intake only (dispatch at 2 RPS). The two aren't comparable.
 
@@ -220,8 +220,8 @@ Then the per-domain `UrlActor` came off the per-job path and overload started sh
 
 | Problem | Fix |
 |---|---|
-| Past the ceiling, requests piled up waiting for admission until clients timed out | `EZTHROTTLE_MAX_IN_FLIGHT_REQUESTS` (default 512): further `POST /jobs` and `/proxy` get `429` + `Retry-After` immediately |
-| Every job went through the domain's `UrlActor` (admission, a call to enqueue, another for response headers) | Callers reserve a backlog slot in ETS, decide fair admission and the per-user limit there, and hand the job to the queue with a cast (`EzthrottleLocal.Intake`) |
+| Past the ceiling, requests piled up waiting for admission until clients timed out | `SPILLWAY_MAX_IN_FLIGHT_REQUESTS` (default 512): further `POST /jobs` and `/proxy` get `429` + `Retry-After` immediately |
+| Every job went through the domain's `UrlActor` (admission, a call to enqueue, another for response headers) | Callers reserve a backlog slot in ETS, decide fair admission and the per-user limit there, and hand the job to the queue with a cast (`Spillway.Intake`) |
 | `:queue.len/1` walked the whole queue on every enqueue and dispatch | The queue keeps its length in state |
 | One dispatch per `:process_next` message, so dispatch speed depended on how fast the mailbox drained | Dispatch up to the free concurrency per pass (64 max; paced queues unchanged) |
 | A new position-broadcast loop started each time the queue went from empty to non-empty; under steady traffic hundreds ran at once | At most one loop per queue |
@@ -251,7 +251,7 @@ cd benchmark
 
 # GPU retry tax -- needs a real vLLM instance (RunPod or otherwise),
 # not part of the regular pass:
-./gpu_retry_tax.sh <vllm-url> <ezthrottle-url> 40 40 300
+./gpu_retry_tax.sh <vllm-url> <spillway-url> 40 40 300
 ```
 
-Pointed at `ezthrottle-local.fly.dev` by default.
+Pointed at `spillway.fly.dev` by default.

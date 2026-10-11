@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploys two PRIVATE-ONLY Fly apps for the cross-region /proxy redirect
 # test, fixed names (mirrors aquifer/tests/region-redirect and
-# ezthrottle-local's own real fly.toml naming): an ezthrottle-local test
+# spillway's own real fly.toml naming): an spillway test
 # instance with machines in two real regions, and aqueduct-runner/recorder
 # as a controllable fake upstream + webhook receiver. Neither app has an
 # [http_service]/[[services]] block -- no public exposure at all, driven
@@ -38,8 +38,8 @@ fly auth whoami > /dev/null 2>&1 || { echo "error: not logged in to Fly -- run '
 # (no [[services]]/[http_service] block, never internet-routable regardless
 # of name), so there's no public DNS/TLS cert to worry about on repeated
 # destroy+recreate, unlike a public Fly app.
-APP_NAME="ezthrottle-local-redirect-test"
-RECORDER_APP="ezthrottle-local-redirect-recorder"
+APP_NAME="spillway-redirect-test"
+RECORDER_APP="spillway-redirect-recorder"
 if fly apps list --org "$FLY_ORG" 2>/dev/null | grep -q "$APP_NAME\|$RECORDER_APP"; then
   echo "error: $APP_NAME or $RECORDER_APP already exists in org $FLY_ORG -- run 'make region-redirect-destroy' first" >&2
   exit 1
@@ -72,8 +72,8 @@ primary_region = "$REGION_1"
   PORT = "$APP_PORT"
   PHX_HOST = "localhost"
   MNESIA_DIR = "/tmp/mnesia"
-  EZTHROTTLE_FLY_REGIONS = "$REGION_1,$REGION_2"
-  EZTHROTTLE_FLY_POLL_INTERVAL_SECONDS = "5"
+  SPILLWAY_FLY_REGIONS = "$REGION_1,$REGION_2"
+  SPILLWAY_FLY_POLL_INTERVAL_SECONDS = "5"
 
 [[vm]]
   memory = "512mb"

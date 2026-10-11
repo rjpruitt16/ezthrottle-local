@@ -6,8 +6,8 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-TARGET_URL="${1:-https://ezthrottle-local.fly.dev}"
-FLY_APP="${2:-ezthrottle-local}"
+TARGET_URL="${1:-https://spillway.fly.dev}"
+FLY_APP="${2:-spillway}"
 N="${3:-30}"
 STAMP=$(date +%s)
 

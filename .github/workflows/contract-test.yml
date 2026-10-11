@@ -1,9 +1,9 @@
 name: Contract tests (Aqueduct Runner)
 
-# Cross-repo contract tests against the real, unmodified ezthrottle-local
+# Cross-repo contract tests against the real, unmodified spillway
 # image -- proves at the wire level that the shared
 # X-Aqueduct-*/X-EZTHROTTLE-* contract with aquifer still holds, not just
-# that ezthrottle-local's own tests pass. See
+# that spillway's own tests pass. See
 # github.com/rjpruitt16/aqueduct-runner.
 #
 # contract-test-drain mirrors aquifer's equivalent job -- both run in
@@ -25,10 +25,10 @@ jobs:
   contract-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout ezthrottle-local
+      - name: Checkout spillway
         uses: actions/checkout@v4
         with:
-          path: ezthrottle-local
+          path: spillway
 
       - name: Checkout aqueduct-runner
         uses: actions/checkout@v4
@@ -43,7 +43,7 @@ jobs:
           module: ./aqueduct-runner
           call: >-
             test-ezthrottle
-            --source=./ezthrottle-local
+            --source=./spillway
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder
 
@@ -54,7 +54,7 @@ jobs:
           module: ./aqueduct-runner
           call: >-
             test-ezthrottle-admission
-            --source=./ezthrottle-local
+            --source=./spillway
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder
 
@@ -65,7 +65,7 @@ jobs:
           module: ./aqueduct-runner
           call: >-
             test-ezthrottle-websocket
-            --source=./ezthrottle-local
+            --source=./spillway
             --websocket-dir=./aqueduct-runner/websocket
 
   # Separate job so a slow drain-mode regression doesn't hold up the fast
@@ -73,10 +73,10 @@ jobs:
   contract-test-drain:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout ezthrottle-local
+      - name: Checkout spillway
         uses: actions/checkout@v4
         with:
-          path: ezthrottle-local
+          path: spillway
 
       - name: Checkout aqueduct-runner
         uses: actions/checkout@v4
@@ -94,6 +94,6 @@ jobs:
           module: ./aqueduct-runner
           call: >-
             test-ezthrottle-drain
-            --source=./ezthrottle-local
+            --source=./spillway
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder

@@ -6,7 +6,7 @@ import Config
 # The watchers configuration can be used to run external
 # watchers to your application. For example, we can use it
 # to bundle .js and .css sources.
-config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
+config :spillway, SpillwayWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
   http: [ip: {127, 0, 0, 1}, port: 4000],
@@ -40,9 +40,9 @@ config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
 # different ports.
 
 # Enable dev routes for dashboard and mailbox
-config :ezthrottle_local, dev_routes: true
+config :spillway, dev_routes: true
 
-config :ezthrottle_local, :mnesia_dir, "priv/mnesia_dev"
+config :spillway, :mnesia_dir, "priv/mnesia_dev"
 
 # Do not include metadata nor timestamps in development logs
 config :logger, :console, format: "[$level] $message\n"

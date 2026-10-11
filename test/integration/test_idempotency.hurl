@@ -5,7 +5,7 @@ POST {{WEBHOOK_URL}}/reset
 HTTP 200
 
 # Submit first job
-POST {{EZTHROTTLE_URL}}/jobs
+POST {{SPILLWAY_URL}}/jobs
 Content-Type: application/json
 {
   "user_id": "user_001",
@@ -22,7 +22,7 @@ jsonpath "$.status" == "queued"
 first_job_id: jsonpath "$.job_id"
 
 # Submit exact same idempotent_key again — should return duplicate
-POST {{EZTHROTTLE_URL}}/jobs
+POST {{SPILLWAY_URL}}/jobs
 Content-Type: application/json
 {
   "user_id": "user_001",

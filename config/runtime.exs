@@ -1,5 +1,24 @@
 import Config
 
+# Spillway was called EZThrottle Local, and its variables were
+# EZTHROTTLE_*. Those names still work: each is copied to its SPILLWAY_*
+# name unless that is already set. This runs before the application
+# starts, so everything that reads SPILLWAY_* sees the copy.
+legacy =
+  for {"EZTHROTTLE_" <> rest = name, value} <- System.get_env(),
+      System.get_env("SPILLWAY_" <> rest) == nil do
+    System.put_env("SPILLWAY_" <> rest, value)
+    name
+  end
+
+if legacy != [] do
+  IO.puts(
+    :stderr,
+    "[spillway] renamed environment variables, please switch to SPILLWAY_*: " <>
+      Enum.join(Enum.sort(legacy), ", ")
+  )
+end
+
 # config/runtime.exs is executed for all environments, including
 # during releases. It is executed after compilation and before the
 # system starts, so it is typically used to load production configuration
@@ -12,33 +31,33 @@ import Config
 # If you use `mix release`, you need to explicitly enable the server
 # by passing the PHX_SERVER=true when you start it:
 #
-#     PHX_SERVER=true bin/ezthrottle_local start
+#     PHX_SERVER=true bin/spillway start
 #
 # Alternatively, you can use `mix phx.gen.release` to generate a `bin/server`
 # script that automatically sets the env var above.
 if System.get_env("PHX_SERVER") do
-  config :ezthrottle_local, EzthrottleLocalWeb.Endpoint, server: true
+  config :spillway, SpillwayWeb.Endpoint, server: true
 end
 
 # default_rps was already read via Application.get_env in url_actor.ex but
 # had no env var wired to it anywhere -- every UrlActor silently used the
 # 2.0 fallback regardless of deployment. Wired here the same way
-# MNESIA_DIR/EZTHROTTLE_MEMORY_LIMIT_MB already are.
-if rps = System.get_env("EZTHROTTLE_DEFAULT_RPS") do
+# MNESIA_DIR/SPILLWAY_MEMORY_LIMIT_MB already are.
+if rps = System.get_env("SPILLWAY_DEFAULT_RPS") do
   case Float.parse(rps) do
-    {value, _} -> config :ezthrottle_local, default_rps: value
+    {value, _} -> config :spillway, default_rps: value
     :error -> :ok
   end
 end
 
 if query = System.get_env("DNS_CLUSTER_QUERY") do
-  config :ezthrottle_local, :dns_cluster_query, query
+  config :spillway, :dns_cluster_query, query
 end
 
 # Static membership for docker-compose and tests, e.g.
-# EZTHROTTLE_CLUSTER_HOSTS=ezthrottle@node-a,ezthrottle@node-b
-if hosts = System.get_env("EZTHROTTLE_CLUSTER_HOSTS") do
-  config :ezthrottle_local, :cluster_hosts, hosts
+# SPILLWAY_CLUSTER_HOSTS=spillway@node-a,spillway@node-b
+if hosts = System.get_env("SPILLWAY_CLUSTER_HOSTS") do
+  config :spillway, :cluster_hosts, hosts
 end
 
 if config_env() == :prod do
@@ -57,9 +76,9 @@ if config_env() == :prod do
   host = System.get_env("PHX_HOST") || "example.com"
   port = String.to_integer(System.get_env("PORT") || "4000")
 
-  config :ezthrottle_local, :mnesia_dir, System.get_env("MNESIA_DIR", "/data/mnesia")
+  config :spillway, :mnesia_dir, System.get_env("MNESIA_DIR", "/data/mnesia")
 
-  config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
+  config :spillway, SpillwayWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [
       # IPv4 any-address, not IPv6 — fly-proxy's own health/process
@@ -79,7 +98,7 @@ if config_env() == :prod do
   # To get SSL working, you will need to add the `https` key
   # to your endpoint configuration:
   #
-  #     config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
+  #     config :spillway, SpillwayWeb.Endpoint,
   #       https: [
   #         ...,
   #         port: 443,
@@ -101,7 +120,7 @@ if config_env() == :prod do
   # We also recommend setting `force_ssl` in your config/prod.exs,
   # ensuring no data is ever sent via http, always redirecting to https:
   #
-  #     config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
+  #     config :spillway, SpillwayWeb.Endpoint,
   #       force_ssl: [hsts: true]
   #
   # Check `Plug.SSL` for all available options in `force_ssl`.

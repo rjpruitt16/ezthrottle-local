@@ -1,5 +1,5 @@
 # ReadWriteOnce is intentional, not a placeholder to loosen later.
-# EZThrottle Local's durable queue is Mnesia disc_copies backed by a local
+# Spillway's durable queue is Mnesia disc_copies backed by a local
 # directory (MNESIA_DIR) per instance, and scaling is by partitioning
 # instances (one per upstream/tenant), not by replicas sharing state -- see
 # the root README's partitioning notes (e.g. the pool-registration section).
@@ -8,8 +8,8 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: ezthrottle-local-data
-  namespace: ezthrottle-local
+  name: spillway-data
+  namespace: spillway
 spec:
   accessModes:
     - ReadWriteOnce

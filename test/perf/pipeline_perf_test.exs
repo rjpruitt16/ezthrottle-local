@@ -1,7 +1,7 @@
-defmodule EzthrottleLocal.PipelinePerfTest do
+defmodule Spillway.PipelinePerfTest do
   @moduledoc """
   Performance benchmarks: run with `make perf`, excluded from `mix test`.
-  They mirror Aquifer's perf_test.go and measure EZThrottle's own overhead
+  They mirror Aquifer's perf_test.go and measure Spillway's own overhead
   (storage writes, queueing, dispatch, webhooks) against a local upstream
   and webhook receiver that answer instantly and allow a very high rate.
   Compare numbers on the same machine only.
@@ -9,8 +9,8 @@ defmodule EzthrottleLocal.PipelinePerfTest do
 
   use ExUnit.Case, async: false
 
-  alias EzthrottleLocal.AccountQueueRegistry
-  alias EzthrottleLocal.Job
+  alias Spillway.AccountQueueRegistry
+  alias Spillway.Job
 
   @moduletag :perf
   @jobs 200
@@ -40,13 +40,13 @@ defmodule EzthrottleLocal.PipelinePerfTest do
   end
 
   setup do
-    previous = Application.get_env(:ezthrottle_local, :default_rps)
-    Application.put_env(:ezthrottle_local, :default_rps, 100_000.0)
+    previous = Application.get_env(:spillway, :default_rps)
+    Application.put_env(:spillway, :default_rps, 100_000.0)
 
     on_exit(fn ->
       if previous,
-        do: Application.put_env(:ezthrottle_local, :default_rps, previous),
-        else: Application.delete_env(:ezthrottle_local, :default_rps)
+        do: Application.put_env(:spillway, :default_rps, previous),
+        else: Application.delete_env(:spillway, :default_rps)
     end)
 
     {:ok, upstream: start_server(:upstream), webhook: start_server(:webhook)}
@@ -110,7 +110,7 @@ defmodule EzthrottleLocal.PipelinePerfTest do
     retain(@retained)
     throughput(ctx, "#{div(@retained, 1000)}k retained jobs")
   after
-    EzthrottleLocal.IdempotentStore.clear_ledger()
+    Spillway.IdempotentStore.clear_ledger()
   end
 
   defp throughput(ctx, label) do
@@ -151,7 +151,7 @@ defmodule EzthrottleLocal.PipelinePerfTest do
             {:jobs, "retained-#{i}", %{job | id: "retained-#{i}"}, expires, :completed}
           )
 
-    EzthrottleLocal.IdempotentStore.seed_counts()
+    Spillway.IdempotentStore.seed_counts()
   end
 
   defp flush_mailbox do

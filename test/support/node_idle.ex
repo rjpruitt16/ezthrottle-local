@@ -1,4 +1,4 @@
-defmodule EzthrottleLocal.NodeIdle do
+defmodule Spillway.NodeIdle do
   @moduledoc """
   Waits for the node to have no work left: nothing pending in the store and
   no backlog in any account queue. Tests that measure node-wide state (a
@@ -19,7 +19,7 @@ defmodule EzthrottleLocal.NodeIdle do
     for pid <- Process.list(),
         match?({:dictionary, d} when is_list(d), Process.info(pid, :dictionary)),
         {:dictionary, d} = Process.info(pid, :dictionary),
-        d[:"$initial_call"] == {EzthrottleLocal.AccountQueue, :init, 1},
+        d[:"$initial_call"] == {Spillway.AccountQueue, :init, 1},
         held?(pid) do
       Process.exit(pid, :kill)
       :ets.delete(:ez_queue_backlog, pid)
@@ -46,7 +46,7 @@ defmodule EzthrottleLocal.NodeIdle do
   end
 
   defp idle? do
-    EzthrottleLocal.IdempotentStore.pending_count() == 0 and queue_backlog() == 0
+    Spillway.IdempotentStore.pending_count() == 0 and queue_backlog() == 0
   end
 
   # Rows keyed by a queue pid are that queue's backlog; {pid, user} rows are per-user.

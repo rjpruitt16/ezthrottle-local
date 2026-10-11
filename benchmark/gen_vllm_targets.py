@@ -2,13 +2,13 @@
 """Generate vegeta JSON targets for the GPU retry tax benchmark.
 
 Ported from Aquifer's benchmark/gen_vllm_targets.py -- same job shape,
-since EZThrottle Local's POST /jobs speaks the identical schema.
+since Spillway's POST /jobs speaks the identical schema.
 
 Two modes:
   - "direct": fires straight at vLLM's OpenAI-compatible chat completions
     endpoint, unpaced -- this is the naive baseline.
-  - "ezthrottle": fires at EZThrottle's POST /jobs, wrapping the same vLLM
-    request as the job's url/body/method, so EZThrottle durably queues it
+  - "spillway": fires at Spillway's POST /jobs, wrapping the same vLLM
+    request as the job's url/body/method, so Spillway durably queues it
     and paces dispatch to vLLM instead of the raw burst hitting it directly.
 
 Both use unique idempotent_key/request content so nothing gets deduped or
@@ -43,10 +43,10 @@ def main():
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 100
     prefix = sys.argv[3] if len(sys.argv) > 3 else "bench"
     base_url = sys.argv[4] if len(sys.argv) > 4 else "http://localhost:8000"
-    # Only used in ezthrottle mode: where EZThrottle itself is listening,
+    # Only used in spillway mode: where Spillway itself is listening,
     # and where it should dispatch to -- these differ from base_url when
-    # EZThrottle isn't co-located with vLLM.
-    ezthrottle_url = sys.argv[5] if len(sys.argv) > 5 else "http://localhost:4000"
+    # Spillway isn't co-located with vLLM.
+    spillway_url = sys.argv[5] if len(sys.argv) > 5 else "http://localhost:4000"
     vllm_url = sys.argv[6] if len(sys.argv) > 6 else base_url
     max_tokens = int(sys.argv[7]) if len(sys.argv) > 7 else 32
 
@@ -58,7 +58,7 @@ def main():
                 "header": {"Content-Type": ["application/json"]},
                 "body": base64.b64encode(json.dumps(vllm_body(prefix, i, max_tokens)).encode()).decode(),
             }
-        elif mode == "ezthrottle":
+        elif mode == "spillway":
             job_body = {
                 "user_id": f"{prefix}-user",
                 "idempotent_key": f"{prefix}-{uuid.uuid4()}",
@@ -72,12 +72,12 @@ def main():
             }
             target = {
                 "method": "POST",
-                "url": f"{ezthrottle_url}/jobs",
+                "url": f"{spillway_url}/jobs",
                 "header": {"Content-Type": ["application/json"]},
                 "body": base64.b64encode(json.dumps(job_body).encode()).decode(),
             }
         else:
-            print(f"unknown mode {mode!r}, expected 'direct' or 'ezthrottle'", file=sys.stderr)
+            print(f"unknown mode {mode!r}, expected 'direct' or 'spillway'", file=sys.stderr)
             sys.exit(1)
         print(json.dumps(target))
 

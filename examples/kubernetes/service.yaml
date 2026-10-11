@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: ezthrottle-local
-  namespace: ezthrottle-local
+  name: spillway
+  namespace: spillway
 spec:
   selector:
-    app: ezthrottle-local
+    app: spillway
   ports:
     - port: 4000
       targetPort: 4000
