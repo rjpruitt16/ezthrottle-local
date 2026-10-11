@@ -58,14 +58,26 @@ defmodule EzthrottleLocal.WebSocketBudgetTest do
     assert WebSocketBudget.session_limit() == nil
   end
 
-  test "the derived budget is a quarter of EZTHROTTLE_MEMORY_LIMIT_MB, overridable" do
-    System.put_env("EZTHROTTLE_MEMORY_LIMIT_MB", "400")
-    assert WebSocketBudget.budget_bytes() == 100 * 1_048_576
+  test "the derived budget is what the rest of the node leaves, at most a quarter" do
+    mb = 1_048_576
+    # 2 GB machine, rest of the node at 100 MB: target 40% = 819 MB, so
+    # 719 MB of room, capped at a quarter (512 MB).
+    assert WebSocketBudget.derive_budget_bytes(2048, nil, 100 * mb) == 512 * mb
+    # Rest of the node at 600 MB (the lab's overload): 219 MB of room.
+    assert WebSocketBudget.derive_budget_bytes(2048, nil, 600 * mb) ==
+             trunc(2048 * 0.4 * mb) - 600 * mb
 
+    # Past the target, the floor.
+    assert WebSocketBudget.derive_budget_bytes(2048, nil, 900 * mb) == 16 * mb
+    # EZTHROTTLE_MEMORY_LIMIT_MB=400: target 90% = 360 MB, ceiling 100 MB.
+    assert WebSocketBudget.derive_budget_bytes(2048, 400, 200 * mb) == 100 * mb
+    assert WebSocketBudget.derive_budget_bytes(2048, 400, 300 * mb) == trunc(360 * mb) - 300 * mb
+  end
+
+  test "EZTHROTTLE_WS_TRANSCRIPT_MAX_MB overrides the derived budget" do
     System.put_env("EZTHROTTLE_WS_TRANSCRIPT_MAX_MB", "32")
-    assert WebSocketBudget.budget_bytes() == 32 * 1_048_576
+    assert WebSocketBudget.budget_bytes(0) == 32 * 1_048_576
   after
-    System.delete_env("EZTHROTTLE_MEMORY_LIMIT_MB")
     System.delete_env("EZTHROTTLE_WS_TRANSCRIPT_MAX_MB")
   end
 end

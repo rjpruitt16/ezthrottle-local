@@ -194,14 +194,14 @@ Neither direction buffers without bound:
 
 New handshakes are refused with **429** when `EZTHROTTLE_MEMORY_LIMIT_MB` or the database size limit is exceeded, with the same body and `Retry-After` as job admission.
 
-Transcripts retain the newest configured events and expire after an idle TTL. They are held in memory, so the node also caps their total size: `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` when set, otherwise a quarter of `EZTHROTTLE_MEMORY_LIMIT_MB`, otherwise a quarter of the machine's memory. While transcripts are over that budget, each session keeps an equal share of it (at least 10 events), so the largest transcripts lose their oldest events first. A client whose cursor was trimmed gets **409** on reconnect. `GET /health` reports `transcript_mb`, `transcript_budget_mb` and the current `session_event_limit` under `websocket`. Mnesia uses the same `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
+Transcripts retain the newest configured events and expire after an idle TTL. They are held in memory, so the node also caps their total size: `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` when set; otherwise whatever room the rest of the node leaves under a memory target (90% of `EZTHROTTLE_MEMORY_LIMIT_MB`, or 40% of the machine's memory), and never more than a quarter of memory. The budget shrinks as the rest of the node's memory grows. While transcripts are over that budget, each session keeps an equal share of it (at least 10 events), so the largest transcripts lose their oldest events first. A client whose cursor was trimmed gets **409** on reconnect. `GET /health` reports `transcript_mb`, `transcript_budget_mb` and the current `session_event_limit` under `websocket`. Mnesia uses the same `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
 
 | Environment variable | Default |
 |---|---:|
 | `EZTHROTTLE_WS_ENABLED` | `true` |
 | `EZTHROTTLE_WS_STREAM_MAX_EVENTS` | `10000` |
 | `EZTHROTTLE_WS_STREAM_TTL_SECONDS` | `86400` |
-| `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` | a quarter of memory |
+| `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` | derived from memory |
 | `EZTHROTTLE_WS_READ_BATCH` | `100` |
 | `EZTHROTTLE_WS_CLIENT_BUFFER` | `256` |
 | `EZTHROTTLE_WS_MAX_MESSAGE_BYTES` | `1048576` |

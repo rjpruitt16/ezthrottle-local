@@ -8,9 +8,14 @@ defmodule EzthrottleLocal.WebSocketBudget do
   sessions could hold 5M events, more than a 2 GB machine has. In the Fly
   lab that looked like a leak of about 4 MB/s (#24).
 
-  The budget is `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` when set, otherwise a
-  quarter of `EZTHROTTLE_MEMORY_LIMIT_MB`, otherwise a quarter of the
-  machine's (or container's) memory. While transcripts are over budget,
+  The budget is `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` when set. Otherwise it
+  is whatever room the rest of the node leaves under a memory target, and
+  never more than a quarter of memory. The target is 90% of
+  `EZTHROTTLE_MEMORY_LIMIT_MB` when set, otherwise 40% of the machine's
+  (or container's) memory: the process's resident size runs about 1.4x
+  what the VM reports, and a fixed quarter of a 2 GB machine (492 MB) got
+  the node OOM-killed in the Fly lab once overload grew the rest of its
+  memory to ~550 MB. While transcripts are over budget,
   every session is limited to an equal share of it, so the largest
   transcripts lose their oldest events first. A client whose cursor falls
   out of the retained range gets 409 on reconnect, as with any other
@@ -19,8 +24,11 @@ defmodule EzthrottleLocal.WebSocketBudget do
 
   import Bitwise, only: [<<<: 2]
 
-  @share_of_memory 0.25
-  @fallback_budget_mb 256
+  @max_share_of_memory 0.25
+  @target_share_of_memory 0.4
+  @target_share_of_limit 0.9
+  @min_budget_mb 16
+  @fallback_budget_mb 128
   # Sessions keep at least this many events however many there are. With
   # enough sessions that floor alone exceeds the budget; refusing new
   # sessions at that point is EZTHROTTLE_MEMORY_LIMIT_MB admission's job.
@@ -38,7 +46,7 @@ defmodule EzthrottleLocal.WebSocketBudget do
   Measures transcript memory and sets the per-session limit. Returns the
   limit (nil when under budget).
   """
-  def refresh(used_bytes, events, streams, budget_bytes \\ budget_bytes()) do
+  def refresh(used_bytes, events, streams, budget_bytes \\ budget_bytes(nil)) do
     limit = limit_for(used_bytes, events, streams, budget_bytes)
     :atomics.put(ref(), 1, limit || 0)
     limit
@@ -54,27 +62,40 @@ defmodule EzthrottleLocal.WebSocketBudget do
     max(trunc(events_in_budget / max(streams, 1)), @min_events_per_session)
   end
 
-  def budget_bytes do
-    mb =
-      case env_int("EZTHROTTLE_WS_TRANSCRIPT_MAX_MB") do
-        mb when is_integer(mb) and mb > 0 -> mb
-        _ -> derived_budget_mb()
-      end
+  @doc """
+  The transcript budget in bytes. `transcript_bytes` is what transcripts
+  use now (nil: count all VM memory as other use), so the rest of the
+  node's memory can be measured.
+  """
+  def budget_bytes(transcript_bytes) do
+    case env_int("EZTHROTTLE_WS_TRANSCRIPT_MAX_MB") do
+      mb when is_integer(mb) and mb > 0 ->
+        mb * 1_048_576
 
-    mb * 1_048_576
+      _ ->
+        other = :erlang.memory(:total) - (transcript_bytes || 0)
+
+        derive_budget_bytes(
+          system_memory_mb(),
+          env_int("EZTHROTTLE_MEMORY_LIMIT_MB"),
+          other
+        )
+    end
   end
 
-  defp derived_budget_mb do
-    memory_mb =
-      case env_int("EZTHROTTLE_MEMORY_LIMIT_MB") do
-        mb when is_integer(mb) and mb > 0 -> mb
-        _ -> system_memory_mb()
-      end
+  @doc false
+  def derive_budget_bytes(nil, limit_mb, other) when not is_integer(limit_mb) or limit_mb <= 0,
+    do: derive_budget_bytes(@fallback_budget_mb * 4, nil, other)
 
-    case memory_mb do
-      nil -> @fallback_budget_mb
-      mb -> max(trunc(mb * @share_of_memory), 1)
-    end
+  def derive_budget_bytes(system_mb, limit_mb, other_bytes) do
+    {memory_mb, target_mb} =
+      if is_integer(limit_mb) and limit_mb > 0,
+        do: {limit_mb, limit_mb * @target_share_of_limit},
+        else: {system_mb, system_mb * @target_share_of_memory}
+
+    headroom = trunc(target_mb * 1_048_576) - other_bytes
+    ceiling = trunc(memory_mb * @max_share_of_memory * 1_048_576)
+    headroom |> min(ceiling) |> max(@min_budget_mb * 1_048_576)
   end
 
   @doc """

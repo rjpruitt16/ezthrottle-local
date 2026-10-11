@@ -155,11 +155,9 @@ defmodule EzthrottleLocal.WebSocketStore do
   every stream to the per-session limit. Active streams are also trimmed on
   each append; this pass catches idle ones.
   """
-  def enforce_budget(
-        budget_bytes \\ WebSocketBudget.budget_bytes(),
-        idle_ms \\ @idle_before_trim_ms
-      ) do
+  def enforce_budget(budget_bytes \\ nil, idle_ms \\ @idle_before_trim_ms) do
     {used, events, streams} = usage()
+    budget_bytes = budget_bytes || WebSocketBudget.budget_bytes(used)
 
     case WebSocketBudget.refresh(used, events, streams, budget_bytes) do
       nil -> :ok
@@ -173,7 +171,7 @@ defmodule EzthrottleLocal.WebSocketStore do
 
     %{
       transcript_mb: div(used, 1_048_576),
-      transcript_budget_mb: div(WebSocketBudget.budget_bytes(), 1_048_576),
+      transcript_budget_mb: div(WebSocketBudget.budget_bytes(used), 1_048_576),
       transcript_events: events,
       transcript_sessions: streams,
       session_event_limit: WebSocketBudget.session_limit()
