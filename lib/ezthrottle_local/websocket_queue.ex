@@ -5,43 +5,75 @@ defmodule EzthrottleLocal.WebSocketQueue do
   Connection openings are jittered and slow-started independently from HTTP
   request pacing. Backend capacity signals may lower, but never raise, the
   operator-configured connection and rate ceilings.
+
+  Grants come from a token bucket refilled at the effective rate, so each
+  timer tick admits every waiter the elapsed time allows. Granting one
+  waiter per tick, spaced by a whole-millisecond interval plus at least
+  1 ms of jitter, capped admission near 500/s whatever the configured rate,
+  and the Fly lab measured about 240/s. Jitter now applies to when the next
+  tick fires.
+
+  Waiters hold a place in a `:queue`. Positions are recomputed and sent at
+  most once a second (only to waiters whose position changed), not
+  on every grant: renumbering every waiter on every grant sent each of
+  10,000 waiting sessions a status frame per admission, about 50M messages
+  to drain the line.
   """
 
   use GenServer
 
   alias EzthrottleLocal.{Jitter, WebSocketConfig}
 
-  def start_link(config) do
-    GenServer.start_link(__MODULE__, config, name: __MODULE__)
+  @position_interval_ms 1_000
+  # The bucket holds at most this much time's worth of grants, so an idle
+  # queue can't save up a burst larger than ~100 ms of the rate.
+  @burst_ms 100
+
+  def start_link(config, opts \\ []) do
+    GenServer.start_link(__MODULE__, config, name: Keyword.get(opts, :name, __MODULE__))
   end
 
-  def reserve_client, do: GenServer.call(__MODULE__, :reserve_client)
-  def release_client(token), do: GenServer.cast(__MODULE__, {:release_client, token})
-  def enqueue(pid), do: GenServer.call(__MODULE__, {:enqueue, pid})
-  def cancel(ref), do: GenServer.cast(__MODULE__, {:cancel, ref})
-  def release(token), do: GenServer.cast(__MODULE__, {:release, token})
-  def report_success, do: GenServer.cast(__MODULE__, :report_success)
-  def report_failure, do: GenServer.cast(__MODULE__, :report_failure)
+  def reserve_client(server \\ __MODULE__), do: GenServer.call(server, :reserve_client)
 
-  def update_capacity(max_connections, connect_rps),
-    do: GenServer.cast(__MODULE__, {:update_capacity, max_connections, connect_rps})
+  def release_client(token, server \\ __MODULE__),
+    do: GenServer.cast(server, {:release_client, token})
 
-  def next_generation, do: GenServer.call(__MODULE__, :next_generation)
-  def snapshot, do: GenServer.call(__MODULE__, :snapshot)
+  def enqueue(pid, server \\ __MODULE__), do: GenServer.call(server, {:enqueue, pid})
+  def cancel(ref, server \\ __MODULE__), do: GenServer.cast(server, {:cancel, ref})
+  def release(token, server \\ __MODULE__), do: GenServer.cast(server, {:release, token})
+  def report_success(server \\ __MODULE__), do: GenServer.cast(server, :report_success)
+  def report_failure(server \\ __MODULE__), do: GenServer.cast(server, :report_failure)
+
+  def update_capacity(max_connections, connect_rps, server \\ __MODULE__),
+    do: GenServer.cast(server, {:update_capacity, max_connections, connect_rps})
+
+  def next_generation(server \\ __MODULE__), do: GenServer.call(server, :next_generation)
+  def snapshot(server \\ __MODULE__), do: GenServer.call(server, :snapshot)
 
   @impl true
   def init(%WebSocketConfig{} = config) do
+    now = monotonic_ms()
+
     {:ok,
      %{
        config: config,
        client_tokens: MapSet.new(),
-       waiters: [],
+       # FIFO of waiter refs; a cancelled waiter's ref stays until it
+       # reaches the front and is skipped.
+       order: :queue.new(),
+       waiting: %{},
        active: %{},
+       # monitor ref -> {:waiting, ref} | {:active, token}
+       monitors: %{},
        advertised_max: nil,
        advertised_rps: nil,
        ramp_rps: config.slow_start_rps,
-       next_grant_ms: monotonic_ms(),
+       allowance: 1.0,
+       refilled_at: now,
+       # No grants before this (set by a failed handshake's backoff).
+       next_grant_ms: now,
        timer: nil,
+       position_timer: nil,
        generation: 0
      }}
   end
@@ -57,15 +89,25 @@ defmodule EzthrottleLocal.WebSocketQueue do
   end
 
   def handle_call({:enqueue, pid}, _from, state) do
-    if length(state.waiters) >= state.config.max_waiting do
+    if map_size(state.waiting) >= state.config.max_waiting do
       {:reply, {:error, :waiting_limit}, state}
     else
       ref = make_ref()
+      position = map_size(state.waiting) + 1
       monitor = Process.monitor(pid)
-      position = length(state.waiters) + 1
-      waiter = %{ref: ref, pid: pid, monitor: monitor, position: position}
+      waiter = %{pid: pid, monitor: monitor, position: position}
       send(pid, {:websocket_waiting, ref, position})
-      state = %{state | waiters: state.waiters ++ [waiter]} |> schedule()
+
+      state =
+        %{
+          state
+          | order: :queue.in(ref, state.order),
+            waiting: Map.put(state.waiting, ref, waiter),
+            monitors: Map.put(state.monitors, monitor, {:waiting, ref})
+        }
+        |> schedule()
+        |> schedule_positions()
+
       {:reply, {:ok, ref, position}, state}
     end
   end
@@ -80,7 +122,7 @@ defmodule EzthrottleLocal.WebSocketQueue do
       enabled: state.config.enabled,
       clients: MapSet.size(state.client_tokens),
       active_upstreams: map_size(state.active),
-      waiting: length(state.waiters),
+      waiting: map_size(state.waiting),
       max_client_connections: state.config.max_clients,
       max_upstream_connections: state.config.max_upstreams,
       effective_max_upstreams: effective_max(state),
@@ -99,16 +141,13 @@ defmodule EzthrottleLocal.WebSocketQueue do
   end
 
   def handle_cast({:cancel, ref}, state) do
-    {removed, waiters} = pop_waiter(state.waiters, ref)
-    if removed, do: Process.demonitor(removed.monitor, [:flush])
-    state = %{state | waiters: publish_positions(waiters)} |> schedule()
-    {:noreply, state}
+    {waiter, waiting} = Map.pop(state.waiting, ref)
+    {:noreply, %{state | waiting: waiting} |> forget(waiter) |> schedule()}
   end
 
   def handle_cast({:release, token}, state) do
     {waiter, active} = Map.pop(state.active, token)
-    if waiter, do: Process.demonitor(waiter.monitor, [:flush])
-    {:noreply, %{state | active: active} |> schedule()}
+    {:noreply, %{state | active: active} |> forget(waiter) |> schedule()}
   end
 
   def handle_cast(:report_success, state) do
@@ -117,13 +156,13 @@ defmodule EzthrottleLocal.WebSocketQueue do
   end
 
   def handle_cast(:report_failure, state) do
-    interval = interval_ms(%{state | ramp_rps: state.config.slow_start_rps})
-    earliest = monotonic_ms() + Jitter.add_ms(interval)
+    state = refill(%{state | ramp_rps: state.config.slow_start_rps})
+    backoff = Jitter.add_ms(max(round(1_000 / effective_rps(state)), 1))
 
     state = %{
       state
-      | ramp_rps: state.config.slow_start_rps,
-        next_grant_ms: max(state.next_grant_ms, earliest)
+      | allowance: 0.0,
+        next_grant_ms: max(state.next_grant_ms, monotonic_ms() + backoff)
     }
 
     {:noreply, schedule(state)}
@@ -144,43 +183,92 @@ defmodule EzthrottleLocal.WebSocketQueue do
     {:noreply, schedule(%{state | timer: nil})}
   end
 
-  def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
-    waiters = Enum.reject(state.waiters, &(&1.monitor == monitor))
-
-    active =
-      state.active
-      |> Enum.reject(fn {_token, waiter} -> waiter.monitor == monitor end)
-      |> Map.new()
-
-    {:noreply, %{state | waiters: publish_positions(waiters), active: active} |> schedule()}
+  def handle_info(:publish_positions, state) do
+    {:noreply, %{state | position_timer: nil} |> publish_positions() |> schedule_positions()}
   end
+
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
+    {entry, monitors} = Map.pop(state.monitors, monitor)
+    state = %{state | monitors: monitors}
+
+    state =
+      case entry do
+        {:waiting, ref} -> %{state | waiting: Map.delete(state.waiting, ref)}
+        {:active, token} -> %{state | active: Map.delete(state.active, token)}
+        nil -> state
+      end
+
+    {:noreply, schedule(state)}
+  end
+
+  defp forget(state, nil), do: state
+
+  defp forget(state, waiter) do
+    Process.demonitor(waiter.monitor, [:flush])
+    %{state | monitors: Map.delete(state.monitors, waiter.monitor)}
+  end
+
+  # ---- granting ----
 
   defp schedule(state) do
-    state = cancel_timer(state)
+    state = state |> cancel_timer() |> refill()
+    now = monotonic_ms()
 
     cond do
-      state.waiters == [] or map_size(state.active) >= effective_max(state) ->
+      map_size(state.waiting) == 0 or map_size(state.active) >= effective_max(state) ->
         state
 
-      state.next_grant_ms <= monotonic_ms() ->
-        [waiter | rest] = state.waiters
-        token = make_ref()
-        send(waiter.pid, {:websocket_admitted, waiter.ref, token})
+      now < state.next_grant_ms ->
+        timer(state, state.next_grant_ms - now)
 
-        state = %{
-          state
-          | waiters: publish_positions(rest),
-            active: Map.put(state.active, token, waiter),
-            next_grant_ms: monotonic_ms() + Jitter.add_ms(interval_ms(state))
-        }
-
-        schedule(state)
+      state.allowance >= 1.0 ->
+        state |> grant() |> schedule()
 
       true ->
-        delay = max(state.next_grant_ms - monotonic_ms(), 1)
-        %{state | timer: Process.send_after(self(), :grant, delay)}
+        # Time until the bucket holds one grant; jitter spreads ticks so
+        # nodes started together don't open connections in lockstep.
+        wait = ceil((1.0 - state.allowance) * 1_000 / effective_rps(state))
+        timer(state, Jitter.add_ms(max(wait, 1)))
     end
   end
+
+  defp grant(state) do
+    case :queue.out(state.order) do
+      {{:value, ref}, order} ->
+        case Map.pop(state.waiting, ref) do
+          {nil, _waiting} ->
+            # Cancelled while waiting.
+            %{state | order: order}
+
+          {waiter, waiting} ->
+            token = make_ref()
+            send(waiter.pid, {:websocket_admitted, ref, token})
+
+            %{
+              state
+              | order: order,
+                waiting: waiting,
+                active: Map.put(state.active, token, waiter),
+                monitors: Map.put(state.monitors, waiter.monitor, {:active, token}),
+                allowance: state.allowance - 1.0
+            }
+        end
+
+      {:empty, _order} ->
+        %{state | waiting: %{}}
+    end
+  end
+
+  defp refill(state) do
+    now = monotonic_ms()
+    rate = effective_rps(state)
+    elapsed = max(now - max(state.refilled_at, state.next_grant_ms), 0)
+    cap = max(rate * @burst_ms / 1_000, 1.0)
+    allowance = min(state.allowance + elapsed * rate / 1_000, cap)
+    %{state | allowance: allowance, refilled_at: max(now, state.refilled_at)}
+  end
+
+  defp timer(state, delay), do: %{state | timer: Process.send_after(self(), :grant, delay)}
 
   defp cancel_timer(%{timer: nil} = state), do: state
 
@@ -196,6 +284,46 @@ defmodule EzthrottleLocal.WebSocketQueue do
     %{state | timer: nil}
   end
 
+  # ---- positions ----
+
+  defp schedule_positions(%{position_timer: nil} = state) when map_size(state.waiting) > 0 do
+    %{
+      state
+      | position_timer: Process.send_after(self(), :publish_positions, @position_interval_ms)
+    }
+  end
+
+  defp schedule_positions(state), do: state
+
+  # Walks the line once, dropping cancelled refs, and tells each waiter its
+  # position only if it changed since the last update.
+  defp publish_positions(state) do
+    {order, waiting, _position} =
+      state.order
+      |> :queue.to_list()
+      |> Enum.reduce({:queue.new(), state.waiting, 1}, fn ref, {order, waiting, position} ->
+        case Map.fetch(waiting, ref) do
+          {:ok, waiter} ->
+            waiter =
+              if waiter.position != position do
+                send(waiter.pid, {:websocket_waiting, ref, position})
+                %{waiter | position: position}
+              else
+                waiter
+              end
+
+            {:queue.in(ref, order), Map.put(waiting, ref, waiter), position + 1}
+
+          :error ->
+            {order, waiting, position}
+        end
+      end)
+
+    %{state | order: order, waiting: waiting}
+  end
+
+  # ---- limits ----
+
   defp effective_max(state) do
     case state.advertised_max do
       value when is_integer(value) and value > 0 -> min(value, state.config.max_upstreams)
@@ -207,26 +335,6 @@ defmodule EzthrottleLocal.WebSocketQueue do
     [state.config.connect_rps, state.ramp_rps, state.advertised_rps]
     |> Enum.filter(&(is_number(&1) and &1 > 0))
     |> Enum.min()
-  end
-
-  defp interval_ms(state), do: max(round(1_000 / effective_rps(state)), 1)
-
-  defp publish_positions(waiters) do
-    Enum.with_index(waiters, 1)
-    |> Enum.map(fn {waiter, position} ->
-      if waiter.position != position do
-        send(waiter.pid, {:websocket_waiting, waiter.ref, position})
-      end
-
-      %{waiter | position: position}
-    end)
-  end
-
-  defp pop_waiter(waiters, ref) do
-    case Enum.split_while(waiters, &(&1.ref != ref)) do
-      {before, [waiter | after_waiter]} -> {waiter, before ++ after_waiter}
-      {_before, []} -> {nil, waiters}
-    end
   end
 
   defp positive_or_existing(value, _existing) when is_number(value) and value > 0, do: value
