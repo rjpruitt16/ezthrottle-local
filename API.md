@@ -184,6 +184,16 @@ X-Aqueduct-WS-Connect-Rps: 20
 
 It may update either limit on an established connection using `{"type":"aqueduct.capacity","max_connections":250,"connect_rps":20}`. Dynamic signals can only lower operator ceilings. Successful handshakes double the slow-start ramp toward its configured maximum; a failed handshake resets it. Opening and reconnect delays include jitter.
 
+### Backpressure
+
+Neither direction buffers without bound:
+
+- **Client to backend.** EZThrottle reads a client's next message only after recording the previous one, so a client that sends faster than messages can be recorded is slowed down by TCP.
+- **Backend to client.** EZThrottle reads the backend socket one chunk at a time and reads the next chunk only after the current one's events are recorded. A backend that sends faster than events can be recorded is slowed down by TCP instead of filling memory.
+- **Slow clients.** Each client has at most `EZTHROTTLE_WS_CLIENT_BUFFER` events queued for it and not yet written to its socket. A client at that limit stops receiving live events and later reads what it missed from the transcript, as a reconnecting client would. If it falls further behind than the transcript retains, it is closed with code 1011 and gets **409** when it reconnects.
+
+New handshakes are refused with **429** when `EZTHROTTLE_MEMORY_LIMIT_MB` or the database size limit is exceeded, with the same body and `Retry-After` as job admission.
+
 Transcripts retain the newest configured events and expire after an idle TTL. Mnesia uses the same `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
 
 | Environment variable | Default |
@@ -192,6 +202,7 @@ Transcripts retain the newest configured events and expire after an idle TTL. Mn
 | `EZTHROTTLE_WS_STREAM_MAX_EVENTS` | `10000` |
 | `EZTHROTTLE_WS_STREAM_TTL_SECONDS` | `86400` |
 | `EZTHROTTLE_WS_READ_BATCH` | `100` |
+| `EZTHROTTLE_WS_CLIENT_BUFFER` | `256` |
 | `EZTHROTTLE_WS_MAX_MESSAGE_BYTES` | `1048576` |
 | `EZTHROTTLE_WS_HANDSHAKE_TIMEOUT_SECONDS` | `10` |
 | `EZTHROTTLE_WS_RECONNECT_MAX_SECONDS` | `30` |
@@ -202,7 +213,7 @@ Transcripts retain the newest configured events and expire after an idle TTL. Mn
 | `EZTHROTTLE_WS_CONNECT_RPS` | `20` |
 | `EZTHROTTLE_WS_SLOW_START_RPS` | `1` |
 
-Handshake errors match Aquifer: **400** for invalid protocol/session/upstream input, **409** for a replay gap, and **429** for the local client ceiling. `GET /health` exposes the local client, waiting, active-upstream, configured, ramp, and effective limits under `websocket`.
+Handshake errors match Aquifer: **400** for invalid protocol/session/upstream input, **409** for a replay gap, and **429** for the local client ceiling or admission limits. `GET /health` exposes the local client, waiting, active-upstream, configured, ramp, and effective limits under `websocket`.
 
 ## Stream job events (SSE)
 

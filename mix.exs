@@ -50,7 +50,7 @@ defmodule EzthrottleLocal.MixProject do
       {:libcluster, "~> 3.5"},
       {:syn, "~> 3.3"},
       {:bandit, "~> 1.5"},
-      {:websockex, "~> 0.5.1"},
+      {:mint_web_socket, "~> 1.0"},
       {:jsv, "~> 0.26.0"},
       {:finch, "~> 0.19"}
     ]

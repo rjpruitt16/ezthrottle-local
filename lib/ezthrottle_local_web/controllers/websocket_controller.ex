@@ -6,6 +6,7 @@ defmodule EzthrottleLocalWeb.WebSocketController do
   plug EzthrottleLocalWeb.NodeDraining
 
   alias EzthrottleLocal.{
+    Admission,
     WebSocketConfig,
     WebSocketProtocol,
     WebSocketQueue,
@@ -25,6 +26,7 @@ defmodule EzthrottleLocalWeb.WebSocketController do
          :ok <- validate_cursor(cursor),
          :ok <- validate_upstream(upstream_url),
          :ok <- WebSocketStore.check_cursor(session_id, cursor),
+         :ok <- admit(),
          {:ok, client_token} <- WebSocketQueue.reserve_client() do
       state = %{
         config: config,
@@ -68,6 +70,18 @@ defmodule EzthrottleLocalWeb.WebSocketController do
       {:error, :client_limit} ->
         retry_error(conn, 429, "websocket client connection limit reached")
 
+      {:error, {:admission, reason, limit, current}} ->
+        conn
+        |> put_resp_header("retry-after", Integer.to_string(Admission.retry_after_seconds()))
+        |> put_status(429)
+        |> json(%{
+          error: "admission rejected: #{reason} (current #{current}, limit #{limit})",
+          limit_reason: reason,
+          limit: limit,
+          current: current
+        })
+        |> halt()
+
       {:error, reason} ->
         retry_error(conn, 503, "websocket event store unavailable: #{inspect(reason)}")
     end
@@ -85,6 +99,15 @@ defmodule EzthrottleLocalWeb.WebSocketController do
     error in WebSockAdapter.UpgradeError ->
       WebSocketQueue.release_client(state.client_token)
       json_error(conn, 426, Exception.message(error))
+  end
+
+  # The same memory and database-size ceilings as new jobs: a session holds
+  # memory for as long as it's open, and its transcript lives in Mnesia.
+  defp admit do
+    case Admission.check() do
+      :ok -> :ok
+      {:rejected, reason, limit, current} -> {:error, {:admission, reason, limit, current}}
+    end
   end
 
   defp require_enabled(%{enabled: true}), do: :ok

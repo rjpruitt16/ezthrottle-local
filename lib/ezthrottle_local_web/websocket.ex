@@ -51,6 +51,14 @@ defmodule EzthrottleLocalWeb.WebSocket do
   @impl true
   def handle_info({:websocket_push, message}, state), do: {:push, text_frame(message), state}
 
+  # Counted against this client's buffer in the session. Bandit writes the
+  # frame before handling the next message, so acknowledging here bounds
+  # this process's mailbox to the buffer size.
+  def handle_info({:websocket_event, message}, state) do
+    WebSocketSession.delivered(state.session, self())
+    {:push, text_frame(message), state}
+  end
+
   def handle_info({:websocket_close, code, reason}, state),
     do: {:stop, reason, {code, reason}, state}
 

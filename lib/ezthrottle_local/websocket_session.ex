@@ -25,6 +25,9 @@ defmodule EzthrottleLocal.WebSocketSession do
   def detach(pid, client), do: GenServer.cast(pid, {:detach, client})
   def command(pid, client, message), do: GenServer.call(pid, {:command, client, message}, 30_000)
 
+  @doc "A client finished writing one event pushed with `{:websocket_event, message}`."
+  def delivered(pid, client), do: GenServer.cast(pid, {:delivered, client})
+
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
@@ -56,7 +59,9 @@ defmodule EzthrottleLocal.WebSocketSession do
     case replay(cursor, state) do
       {:ok, messages, final_cursor} ->
         monitor = Process.monitor(client)
-        clients = Map.put(state.clients, client, %{monitor: monitor, cursor: final_cursor})
+
+        info = %{monitor: monitor, cursor: final_cursor, in_flight: 0, lagging: false}
+        clients = Map.put(state.clients, client, info)
         state = %{state | clients: clients}
         send(self(), :ensure_upstream)
         {:reply, {:ok, messages}, state}
@@ -70,7 +75,7 @@ defmodule EzthrottleLocal.WebSocketSession do
     if Map.has_key?(state.clients, client) do
       case WebSocketStore.append(state.session_id, "client", message) do
         {:ok, event} ->
-          clients = advance_all_clients(state.clients, event.stream_id)
+          clients = advance_live_clients(state.clients, event.stream_id)
           pending = :queue.in(message, state.pending_commands)
           state = %{state | clients: clients, pending_commands: pending} |> flush_commands()
 
@@ -90,9 +95,52 @@ defmodule EzthrottleLocal.WebSocketSession do
     end
   end
 
+  # The upstream process waits on this call before reading more from the
+  # backend's socket, so a session that can't record events as fast as the
+  # backend sends them slows the backend down instead of queueing frames.
+  def handle_call({:websocket_upstream_frame, pid, raw}, _from, %{upstream_pid: pid} = state) do
+    case WebSocketProtocol.decode_backend(raw) do
+      {:ok, %{"type" => "aqueduct.capacity"} = message} ->
+        WebSocketQueue.update_capacity(message["max_connections"], message["connect_rps"])
+        {:reply, :ok, state}
+
+      {:ok, message} ->
+        message = Map.put(message, "generation", state.generation)
+
+        case WebSocketStore.append(state.session_id, "backend", message) do
+          {:ok, event} ->
+            {:reply, :ok, deliver_event(state, event)}
+
+          {:error, reason} ->
+            {:stop, reason, :ok,
+             close_clients(state, 1011, "event store unavailable: #{inspect(reason)}")}
+        end
+
+      {:error, reason} ->
+        WebSocketUpstream.close(pid)
+        {:reply, :ok, notify_error(state, reason)}
+    end
+  end
+
+  def handle_call({:websocket_upstream_frame, _pid, _raw}, _from, state), do: {:reply, :ok, state}
+
   @impl true
   def handle_cast({:detach, client}, state) do
     {:noreply, remove_client(state, client)}
+  end
+
+  def handle_cast({:delivered, client}, state) do
+    case Map.fetch(state.clients, client) do
+      {:ok, info} ->
+        info = %{info | in_flight: max(info.in_flight - 1, 0)}
+
+        if info.lagging and info.in_flight <= div(state.config.client_buffer, 2),
+          do: catch_up(state, client, info),
+          else: {:noreply, put_in(state.clients[client], info)}
+
+      :error ->
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -172,31 +220,6 @@ defmodule EzthrottleLocal.WebSocketSession do
   end
 
   def handle_info({:websocket_upstream_connected, _pid, _headers}, state), do: {:noreply, state}
-
-  def handle_info({:websocket_upstream_frame, pid, raw}, %{upstream_pid: pid} = state) do
-    case WebSocketProtocol.decode_backend(raw) do
-      {:ok, %{"type" => "aqueduct.capacity"} = message} ->
-        WebSocketQueue.update_capacity(message["max_connections"], message["connect_rps"])
-        {:noreply, state}
-
-      {:ok, message} ->
-        message = Map.put(message, "generation", state.generation)
-
-        case WebSocketStore.append(state.session_id, "backend", message) do
-          {:ok, event} ->
-            {:noreply, deliver_event(state, event)}
-
-          {:error, reason} ->
-            stop_clients(state, 1011, "event store unavailable: #{inspect(reason)}")
-        end
-
-      {:error, reason} ->
-        WebSocketUpstream.close(pid)
-        {:noreply, state |> notify_error(reason)}
-    end
-  end
-
-  def handle_info({:websocket_upstream_frame, _pid, _raw}, state), do: {:noreply, state}
 
   def handle_info({:websocket_upstream_error, pid, reason}, %{upstream_pid: pid} = state) do
     WebSocketUpstream.close(pid)
@@ -280,24 +303,87 @@ defmodule EzthrottleLocal.WebSocketSession do
     end
   end
 
+  # Each client may have at most config.client_buffer events pushed and not
+  # yet written to its socket. A client at its limit is marked lagging and
+  # stops receiving live events; once it has written half its buffer it
+  # reads what it missed from the store, the way a reconnecting client
+  # does. Without the limit a slow client's handler mailbox grew without
+  # bound (#24).
   defp deliver_event(state, event) do
     message = Map.put(event.envelope, "stream_id", event.stream_id)
+    limit = state.config.client_buffer
 
     clients =
       Map.new(state.clients, fn {client, info} ->
-        if cursor_before?(info.cursor, event.stream_id) do
-          send(client, {:websocket_push, message})
-          {client, %{info | cursor: event.stream_id}}
-        else
-          {client, info}
+        cond do
+          not cursor_before?(info.cursor, event.stream_id) ->
+            {client, info}
+
+          info.lagging or info.in_flight >= limit ->
+            {client, %{info | lagging: true}}
+
+          true ->
+            send(client, {:websocket_event, message})
+            {client, %{info | cursor: event.stream_id, in_flight: info.in_flight + 1}}
         end
       end)
 
     %{state | clients: clients}
   end
 
-  defp advance_all_clients(clients, cursor) do
-    Map.new(clients, fn {client, info} -> {client, %{info | cursor: cursor}} end)
+  defp catch_up(state, client, info) do
+    room = state.config.client_buffer - info.in_flight
+    limit = min(room, state.config.read_batch)
+
+    case WebSocketStore.read_after(state.session_id, info.cursor, limit) do
+      {:ok, events} ->
+        Enum.each(events, fn event ->
+          if event.direction == "backend" do
+            send(
+              client,
+              {:websocket_event, Map.put(event.envelope, "stream_id", event.stream_id)}
+            )
+          end
+        end)
+
+        sent = Enum.count(events, &(&1.direction == "backend"))
+        cursor = if events == [], do: info.cursor, else: List.last(events).stream_id
+
+        # Fewer than asked for means the client has reached the end of the
+        # transcript and can take live events again.
+        info = %{
+          info
+          | cursor: cursor,
+            in_flight: info.in_flight + sent,
+            lagging: length(events) == limit
+        }
+
+        state = put_in(state.clients[client], info)
+
+        # Only client-direction events were read: nothing will be written,
+        # so no delivery will trigger the next read.
+        if info.lagging and sent == 0,
+          do: catch_up(state, client, info),
+          else: {:noreply, state}
+
+      {:error, :replay_gap} ->
+        send(client, {:websocket_close, 1011, "client fell behind retained history; reconnect"})
+        {:noreply, state}
+
+      {:error, reason} ->
+        send(client, {:websocket_close, 1011, "event store unavailable: #{inspect(reason)}"})
+        {:noreply, state}
+    end
+  end
+
+  # A client's own command advances the cursor of every client that is
+  # receiving live events. A lagging client keeps its cursor: it still has
+  # to read the events before this one.
+  defp advance_live_clients(clients, cursor) do
+    Map.new(clients, fn
+      {client, %{lagging: false} = info} -> {client, %{info | cursor: cursor}}
+      entry -> entry
+    end)
   end
 
   defp cursor_before?(left, right) do
@@ -461,7 +547,11 @@ defmodule EzthrottleLocal.WebSocketSession do
   end
 
   defp stop_clients(state, code, reason) do
+    {:stop, reason, close_clients(state, code, reason)}
+  end
+
+  defp close_clients(state, code, reason) do
     Enum.each(Map.keys(state.clients), &send(&1, {:websocket_close, code, reason}))
-    {:stop, reason, state}
+    state
   end
 end
