@@ -230,11 +230,18 @@ defmodule SpillwayWeb.JobController do
   # *upstream's response* headers or static config, with no way for the
   # client submitting the job to ask for isolation up front.
   # X-Aqueduct-Max-Retries (or X-EZThrottle-Max-Retries) overrides the body's
-  # max_retries; Job.new/1 validates it.
+  # max_retries, and X-Aqueduct-Webhook-Max-Retries the body's
+  # webhook_max_retries; Job.new/1 validates both.
   defp with_max_retries_header(conn, params) do
-    case Plug.Conn.get_req_header(conn, "x-aqueduct-max-retries") ++
-           Plug.Conn.get_req_header(conn, "x-ezthrottle-max-retries") do
-      [value | _] -> Map.put(params, "max_retries", value)
+    params
+    |> put_header_param(conn, "max-retries", "max_retries")
+    |> put_header_param(conn, "webhook-max-retries", "webhook_max_retries")
+  end
+
+  defp put_header_param(params, conn, header, param) do
+    case Plug.Conn.get_req_header(conn, "x-aqueduct-" <> header) ++
+           Plug.Conn.get_req_header(conn, "x-ezthrottle-" <> header) do
+      [value | _] -> Map.put(params, param, value)
       [] -> params
     end
   end

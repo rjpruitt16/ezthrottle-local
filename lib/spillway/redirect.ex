@@ -292,6 +292,7 @@ defmodule Spillway.Redirect do
         idempotent_key: hop_job.idempotent_key,
         idempotency_scope: hop_job.idempotency_scope,
         max_retries: Spillway.Job.max_retries(hop_job),
+        webhook_max_retries: hop_job.webhook_max_retries,
         url: hop_job.url,
         pool_id: hop_job.pool_id,
         method: hop_job.method,

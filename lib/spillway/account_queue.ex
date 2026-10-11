@@ -310,8 +310,9 @@ defmodule Spillway.AccountQueue do
     end
   end
 
-  # A retryable failure: free the slot, halve the pace (unless the upstream
-  # set one explicitly), and send the job back to ourselves after its backoff.
+  # A retryable failure: free the slot, halve the pace (or lower it to a rate
+  # the failed response advertised, if that's lower), and send the job back
+  # to ourselves after its backoff.
   @impl true
   def handle_call({:job_retry, %Job{} = job, delay_ms, rps_header}, _from, state) do
     Process.send_after(self(), {:requeue, job}, delay_ms)
@@ -974,8 +975,13 @@ defmodule Spillway.AccountQueue do
     end
   end
 
+  # A rate advertised on a failed response can lower the pace further but
+  # never raise it: a proxy or framework that stamps a fixed X-Aqueduct-Rps
+  # on every response, 503s included, would otherwise keep the queue at full
+  # speed against a receiver that is down, and every job would use up its
+  # retries within seconds.
   defp penalize_rps(state, nil), do: %{state | rps: max(state.rps / 2, @min_rps)}
-  defp penalize_rps(state, rps), do: %{state | rps: max(rps, @min_rps)}
+  defp penalize_rps(state, rps), do: %{state | rps: max(min(state.rps / 2, rps), @min_rps)}
 
   defp maybe_put_response(payload, nil), do: payload
 
@@ -995,7 +1001,13 @@ defmodule Spillway.AccountQueue do
   defp maybe_deliver_webhook(:stream, _job, _payload), do: :ok
 
   defp maybe_deliver_webhook(_mode, job, payload) do
-    AccountQueueRegistry.enqueue_webhook(job.id, job.user_id, job.webhook_url, payload)
+    AccountQueueRegistry.enqueue_webhook(
+      job.id,
+      job.user_id,
+      job.webhook_url,
+      payload,
+      Job.webhook_max_retries(job)
+    )
   end
 
   @doc "Maximum queued plus in-flight jobs accepted for one user; 0 disables the ceiling."

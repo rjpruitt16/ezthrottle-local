@@ -10,6 +10,8 @@ defmodule Spillway.AccountQueueRegistry do
 
   use GenServer
 
+  require Logger
+
   alias Spillway.UrlActor
   alias Spillway.Job
   alias Spillway.PoolRegistry
@@ -175,19 +177,39 @@ defmodule Spillway.AccountQueueRegistry do
 
   original_job_id scopes the idempotent key (see Job.new_webhook_delivery/4)
   so a given job's webhook is enqueued at most once even if this were
-  somehow called twice for it.
+  somehow called twice for it. max_retries is the original job's
+  Job.webhook_max_retries/1.
+
+  Delivery skips admission control (submit_internal/2): the job it reports
+  on was already admitted and its upstream call already made, so refusing
+  the delivery would throw away finished work rather than shed new load.
+  The one way it can still fail to queue is no live queue being found; that
+  is logged, and the result stays readable at GET /jobs/:id.
   """
-  def enqueue_webhook(_original_job_id, _user_id, webhook_url, _payload)
+  def enqueue_webhook(original_job_id, user_id, webhook_url, payload, max_retries \\ 4)
+
+  def enqueue_webhook(_original_job_id, _user_id, webhook_url, _payload, _max_retries)
       when webhook_url in [nil, ""],
       do: :ok
 
-  def enqueue_webhook(original_job_id, user_id, webhook_url, payload) do
-    job = Job.new_webhook_delivery(original_job_id, user_id, webhook_url, payload)
+  def enqueue_webhook(original_job_id, user_id, webhook_url, payload, max_retries) do
+    job =
+      Job.new_webhook_delivery(original_job_id, user_id, webhook_url, payload, max_retries)
 
     case submit_internal(job) do
-      {:accepted, _job} -> :ok
-      {:duplicate, _existing_job_id} -> :ok
-      {:rejected, _reason, _limit, _current} -> :ok
+      {:accepted, _job} ->
+        :ok
+
+      {:duplicate, _existing_job_id} ->
+        :ok
+
+      {:rejected, reason, _limit, _current} ->
+        Logger.error(
+          "[Webhook] could not queue the webhook for job #{original_job_id}: #{reason}; " <>
+            "the result is still stored"
+        )
+
+        :ok
     end
   end
 
