@@ -6,8 +6,12 @@ defmodule EzthrottleLocal.WebSocketQueue do
   request pacing. Backend capacity signals may lower, but never raise, the
   operator-configured connection and rate ceilings.
 
-  Grants come from a token bucket refilled at the effective rate, so each
-  timer tick admits every waiter the elapsed time allows. Granting one
+  Grants are paced by GCRA (a virtual-time token bucket), so each timer
+  tick admits every waiter the elapsed time allows. Each grant pushes the
+  next allowed time out by one interval at the rate in force when it is
+  granted, so a rate rise (the slow-start ramp doubling after a successful
+  handshake) shortens later gaps, never the one already started: with
+  slow start at 1/s the second connection still waits a full second. Granting one
   waiter per tick, spaced by a whole-millisecond interval plus at least
   1 ms of jitter, capped admission near 500/s whatever the configured rate,
   and the Fly lab measured about 240/s. Jitter now applies to when the next
@@ -68,10 +72,9 @@ defmodule EzthrottleLocal.WebSocketQueue do
        advertised_max: nil,
        advertised_rps: nil,
        ramp_rps: config.slow_start_rps,
-       allowance: 1.0,
-       refilled_at: now,
-       # No grants before this (set by a failed handshake's backoff).
-       next_grant_ms: now,
+       # Theoretical arrival time: grants may run ahead of it by at most
+       # the burst tolerance. A failed handshake's backoff pushes it out.
+       tat: now,
        timer: nil,
        position_timer: nil,
        generation: 0
@@ -156,16 +159,11 @@ defmodule EzthrottleLocal.WebSocketQueue do
   end
 
   def handle_cast(:report_failure, state) do
-    state = refill(%{state | ramp_rps: state.config.slow_start_rps})
+    state = %{state | ramp_rps: state.config.slow_start_rps}
     backoff = Jitter.add_ms(max(round(1_000 / effective_rps(state)), 1))
-
-    state = %{
-      state
-      | allowance: 0.0,
-        next_grant_ms: max(state.next_grant_ms, monotonic_ms() + backoff)
-    }
-
-    {:noreply, schedule(state)}
+    # Past the burst tolerance too, so nothing is granted before the backoff ends.
+    tat = monotonic_ms() + backoff + tolerance_ms(state)
+    {:noreply, schedule(%{state | tat: max(state.tat, tat)})}
   end
 
   def handle_cast({:update_capacity, max_connections, connect_rps}, state) do
@@ -211,28 +209,25 @@ defmodule EzthrottleLocal.WebSocketQueue do
   # ---- granting ----
 
   defp schedule(state) do
-    state = state |> cancel_timer() |> refill()
+    state = cancel_timer(state)
     now = monotonic_ms()
+    earliest = state.tat - tolerance_ms(state)
 
     cond do
       map_size(state.waiting) == 0 or map_size(state.active) >= effective_max(state) ->
         state
 
-      now < state.next_grant_ms ->
-        timer(state, state.next_grant_ms - now)
-
-      state.allowance >= 1.0 ->
-        state |> grant() |> schedule()
+      now >= earliest ->
+        state |> grant(now) |> schedule()
 
       true ->
-        # Time until the bucket holds one grant; jitter spreads ticks so
-        # nodes started together don't open connections in lockstep.
-        wait = ceil((1.0 - state.allowance) * 1_000 / effective_rps(state))
-        timer(state, Jitter.add_ms(max(wait, 1)))
+        # Jitter spreads ticks so nodes started together don't open
+        # connections in lockstep.
+        timer(state, Jitter.add_ms(max(ceil(earliest - now), 1)))
     end
   end
 
-  defp grant(state) do
+  defp grant(state, now) do
     case :queue.out(state.order) do
       {{:value, ref}, order} ->
         case Map.pop(state.waiting, ref) do
@@ -250,7 +245,7 @@ defmodule EzthrottleLocal.WebSocketQueue do
                 waiting: waiting,
                 active: Map.put(state.active, token, waiter),
                 monitors: Map.put(state.monitors, waiter.monitor, {:active, token}),
-                allowance: state.allowance - 1.0
+                tat: max(state.tat, now) + interval_ms(state)
             }
         end
 
@@ -259,14 +254,12 @@ defmodule EzthrottleLocal.WebSocketQueue do
     end
   end
 
-  defp refill(state) do
-    now = monotonic_ms()
-    rate = effective_rps(state)
-    elapsed = max(now - max(state.refilled_at, state.next_grant_ms), 0)
-    cap = max(rate * @burst_ms / 1_000, 1.0)
-    allowance = min(state.allowance + elapsed * rate / 1_000, cap)
-    %{state | allowance: allowance, refilled_at: max(now, state.refilled_at)}
-  end
+  defp interval_ms(state), do: 1_000 / effective_rps(state)
+
+  # How far grants may run ahead of the paced schedule: @burst_ms worth of
+  # the rate, less the one grant every schedule allows anyway. Zero at
+  # rates of 10/s or less, so slow start is strictly one per interval.
+  defp tolerance_ms(state), do: max(@burst_ms - interval_ms(state), 0)
 
   defp timer(state, delay), do: %{state | timer: Process.send_after(self(), :grant, delay)}
 
