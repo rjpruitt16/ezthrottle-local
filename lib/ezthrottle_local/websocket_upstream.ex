@@ -2,11 +2,18 @@ defmodule EzthrottleLocal.WebSocketUpstream do
   @moduledoc """
   One WebSocket connection to a session's backend.
 
-  The socket is read one chunk at a time: a chunk's frames are handed to
-  the session with a call, which returns once the session has recorded
-  them, and only then is the socket armed for the next chunk. While the
-  session is busy nothing more is read, the kernel buffers fill, and TCP
-  slows the backend down. WebSockex, used before, kept its socket in
+  The socket is read one chunk at a time. Its frames are handed to the
+  session one at a time, each acknowledged once the session has recorded
+  it, and only when the chunk's last frame is acknowledged is the socket
+  armed for the next chunk. While the session is behind nothing more is
+  read, the kernel buffers fill, and TCP slows the backend down.
+
+  Writes go through a separate linked writer process, each command
+  confirmed to the session once written so it can bound how many are
+  outstanding. A blocking write must not stall this process: a backend
+  that stops reading because its own sends to us are blocked would
+  otherwise wait on us while we wait on it, and neither side would read
+  again. WebSockex, used before, kept its socket in
   `active: true`, so the VM read everything the backend sent into the
   session's mailbox; under overload that mailbox grew by 5-10 MB/s until
   the node ran out of memory (#24).
@@ -62,12 +69,19 @@ defmodule EzthrottleLocal.WebSocketUpstream do
       {:ok, conn, ref, websocket, resp_headers, leftover} ->
         send(owner, {:websocket_upstream_connected, self(), resp_headers})
 
+        upstream = self()
+        socket = Mint.HTTP.get_socket(conn)
+        writer = spawn_link(fn -> write_loop(socket, owner, upstream) end)
+
         state = %{
           conn: conn,
           ref: ref,
           websocket: websocket,
+          writer: writer,
           owner: owner,
-          owner_monitor: Process.monitor(owner)
+          owner_monitor: Process.monitor(owner),
+          frames: [],
+          awaiting: nil
         }
 
         # The upgrade response can carry the first frames in the same
@@ -81,15 +95,12 @@ defmodule EzthrottleLocal.WebSocketUpstream do
 
   @impl true
   def handle_continue({:data, chunks}, state) do
-    case handle_data(state, chunks) do
-      {:ok, state} -> {:noreply, arm(state)}
-      {:stop, reason, state} -> disconnect(state, reason)
-    end
+    state |> handle_data(chunks) |> continue()
   end
 
   @impl true
   def handle_cast({:send, raw}, state) do
-    case send_frame(state, {:text, raw}) do
+    case send_frame(state, {:text, raw}, true) do
       {:ok, state} -> {:noreply, state}
       {:error, state, reason} -> disconnect(state, reason)
     end
@@ -105,15 +116,20 @@ defmodule EzthrottleLocal.WebSocketUpstream do
     {:stop, :normal, state}
   end
 
+  def handle_info({:websocket_upstream_write_failed, reason}, state),
+    do: disconnect(state, reason)
+
+  def handle_info({:websocket_upstream_frame_recorded, ref}, %{awaiting: ref} = state) do
+    %{state | awaiting: nil} |> next_frame() |> continue()
+  end
+
+  def handle_info({:websocket_upstream_frame_recorded, _ref}, state), do: {:noreply, state}
+
   def handle_info(message, state) do
     case Mint.WebSocket.stream(state.conn, message) do
       {:ok, conn, responses} ->
         data = for {:data, ref, chunk} <- responses, ref == state.ref, do: chunk
-
-        case handle_data(%{state | conn: conn}, data) do
-          {:ok, state} -> {:noreply, arm(state)}
-          {:stop, reason, state} -> disconnect(state, reason)
-        end
+        %{state | conn: conn} |> handle_data(data) |> continue()
 
       {:error, conn, reason, _responses} ->
         disconnect(%{state | conn: conn}, reason)
@@ -145,7 +161,10 @@ defmodule EzthrottleLocal.WebSocketUpstream do
            ),
          {:ok, conn, ref} <- Mint.WebSocket.upgrade(ws_scheme, conn, path, headers),
          {:ok, conn, status, resp_headers, leftover} <- await_upgrade(conn, ref, deadline),
-         {:ok, conn, websocket} <- Mint.WebSocket.new(conn, ref, status, resp_headers),
+         # Mint.WebSocket re-arms the socket itself in its default :active
+         # mode, which would read the backend as fast as it sends.
+         {:ok, conn, websocket} <-
+           Mint.WebSocket.new(conn, ref, status, resp_headers, mode: :passive),
          {:ok, conn} <- Mint.HTTP.set_mode(conn, :passive) do
       {:ok, conn, ref, websocket, resp_headers, leftover}
     else
@@ -199,9 +218,11 @@ defmodule EzthrottleLocal.WebSocketUpstream do
 
   # ---- reading ----
 
-  # Passive mode plus one `active: :once` per handled chunk: the next chunk
-  # is pulled off the socket only after the previous one's frames were
-  # recorded by the session.
+  defp continue({:ok, state}), do: {:noreply, state}
+  defp continue({:stop, reason, state}), do: disconnect(state, reason)
+
+  # Passive mode plus one `active: :once` once a chunk's frames have all
+  # been recorded: the next chunk is pulled off the socket only then.
   defp arm(state) do
     case Mint.HTTP.get_socket(state.conn) do
       socket when is_port(socket) -> :inet.setopts(socket, active: :once)
@@ -211,12 +232,12 @@ defmodule EzthrottleLocal.WebSocketUpstream do
     state
   end
 
-  defp handle_data(state, []), do: {:ok, state}
+  defp handle_data(state, []), do: next_frame(state)
 
   defp handle_data(state, chunks) do
     case Mint.WebSocket.decode(state.websocket, IO.iodata_to_binary(chunks)) do
       {:ok, websocket, frames} ->
-        handle_frames(%{state | websocket: websocket}, frames)
+        next_frame(%{state | websocket: websocket, frames: state.frames ++ frames})
 
       {:error, websocket, reason} ->
         send(state.owner, {:websocket_upstream_error, self(), reason})
@@ -224,52 +245,68 @@ defmodule EzthrottleLocal.WebSocketUpstream do
     end
   end
 
-  defp handle_frames(state, []), do: {:ok, state}
+  # One text frame with the session at a time; the socket is armed again
+  # only when none is outstanding and none is left from the chunk.
+  defp next_frame(%{awaiting: ref} = state) when ref != nil, do: {:ok, state}
+  defp next_frame(%{frames: []} = state), do: {:ok, arm(state)}
 
-  defp handle_frames(state, [{:text, raw} | rest]) do
-    if hand_off(state, raw), do: handle_frames(state, rest), else: {:stop, :normal, state}
-  end
+  defp next_frame(%{frames: [frame | rest]} = state) do
+    state = %{state | frames: rest}
 
-  defp handle_frames(state, [{:ping, data} | rest]) do
-    case send_frame(state, {:pong, data}) do
-      {:ok, state} -> handle_frames(state, rest)
-      {:error, state, reason} -> {:stop, reason, state}
+    case frame do
+      {:text, raw} ->
+        ref = make_ref()
+        send(state.owner, {:websocket_upstream_frame, self(), ref, raw})
+        {:ok, %{state | awaiting: ref}}
+
+      {:ping, data} ->
+        case send_frame(state, {:pong, data}) do
+          {:ok, state} -> next_frame(state)
+          {:error, state, reason} -> {:stop, reason, state}
+        end
+
+      {:close, code, reason} ->
+        {:stop, {:remote, code, reason}, send_frame_quietly(state, {:close, code, ""})}
+
+      {:binary, _raw} ->
+        send(state.owner, {:websocket_upstream_error, self(), :binary_frames_not_supported})
+        close = {:close, 1003, "aqueduct.v1 requires JSON text messages"}
+        {:stop, :binary_frames_not_supported, send_frame_quietly(state, close)}
+
+      _other ->
+        next_frame(state)
     end
-  end
-
-  defp handle_frames(state, [{:close, code, reason} | _rest]) do
-    {:stop, {:remote, code, reason}, send_frame_quietly(state, {:close, code, ""})}
-  end
-
-  defp handle_frames(state, [{:binary, _raw} | _rest]) do
-    send(state.owner, {:websocket_upstream_error, self(), :binary_frames_not_supported})
-    close = {:close, 1003, "aqueduct.v1 requires JSON text messages"}
-    {:stop, :binary_frames_not_supported, send_frame_quietly(state, close)}
-  end
-
-  defp handle_frames(state, [_other | rest]), do: handle_frames(state, rest)
-
-  # Returns once the session has recorded the frame; false if the session
-  # is gone.
-  defp hand_off(state, raw) do
-    GenServer.call(state.owner, {:websocket_upstream_frame, self(), raw}, :infinity)
-    true
-  catch
-    :exit, _reason -> false
   end
 
   # ---- writing / closing ----
 
-  defp send_frame(state, frame) do
+  # Encoding stays here (it carries the WebSocket state); the bytes go to
+  # the writer, in order. confirm? marks commands the session counts.
+  defp send_frame(state, frame, confirm? \\ false) do
     case Mint.WebSocket.encode(state.websocket, frame) do
       {:ok, websocket, data} ->
-        case Mint.WebSocket.stream_request_body(state.conn, state.ref, data) do
-          {:ok, conn} -> {:ok, %{state | websocket: websocket, conn: conn}}
-          {:error, conn, reason} -> {:error, %{state | websocket: websocket, conn: conn}, reason}
-        end
+        send(state.writer, {:write, data, confirm?})
+        {:ok, %{state | websocket: websocket}}
 
       {:error, websocket, reason} ->
         {:error, %{state | websocket: websocket}, reason}
+    end
+  end
+
+  defp write_loop(socket, owner, upstream) do
+    receive do
+      {:write, data, confirm?} ->
+        result =
+          if is_port(socket), do: :gen_tcp.send(socket, data), else: :ssl.send(socket, data)
+
+        case result do
+          :ok ->
+            if confirm?, do: send(owner, {:websocket_upstream_written, upstream})
+            write_loop(socket, owner, upstream)
+
+          {:error, reason} ->
+            send(upstream, {:websocket_upstream_write_failed, reason})
+        end
     end
   end
 

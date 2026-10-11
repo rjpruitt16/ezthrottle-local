@@ -9,7 +9,11 @@ defmodule EzthrottleLocalWeb.HealthController do
       admission: EzthrottleLocal.Admission.snapshot(),
       queues: EzthrottleLocal.AccountQueueRegistry.node_queue_snapshot(),
       pools: EzthrottleLocal.PoolRegistry.snapshot(),
-      websocket: EzthrottleLocal.WebSocketQueue.snapshot()
+      websocket:
+        Map.merge(
+          EzthrottleLocal.WebSocketQueue.snapshot(),
+          EzthrottleLocal.WebSocketStore.budget_snapshot()
+        )
     }
 
     # Only present when drain mode is enabled -- an instance that never
