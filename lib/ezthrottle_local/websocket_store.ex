@@ -5,7 +5,7 @@ defmodule EzthrottleLocal.WebSocketStore do
 
   require Logger
 
-  alias EzthrottleLocal.WebSocketConfig
+  alias EzthrottleLocal.{WebSocketBudget, WebSocketConfig}
 
   @streams :websocket_streams
   @events :websocket_events
@@ -121,6 +121,7 @@ defmodule EzthrottleLocal.WebSocketStore do
   @impl true
   def init(config) do
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+    schedule_budget()
     {:ok, config}
   end
 
@@ -129,6 +130,74 @@ defmodule EzthrottleLocal.WebSocketStore do
     cleanup_expired()
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
     {:noreply, config}
+  end
+
+  def handle_info(:budget, config) do
+    enforce_budget()
+    schedule_budget()
+    {:noreply, config}
+  end
+
+  # 0 turns the periodic check off (tests call enforce_budget/1 directly).
+  defp schedule_budget do
+    case Application.get_env(:ezthrottle_local, :websocket_budget_interval_ms, 2_000) do
+      0 -> :ok
+      interval -> Process.send_after(self(), :budget, interval)
+    end
+  end
+
+  @doc """
+  Measures transcript memory against WebSocketBudget and, when over, trims
+  every stream to the per-session limit. Active streams are also trimmed on
+  each append; this pass catches idle ones.
+  """
+  def enforce_budget(budget_bytes \\ WebSocketBudget.budget_bytes()) do
+    {used, events, streams} = usage()
+
+    case WebSocketBudget.refresh(used, events, streams, budget_bytes) do
+      nil -> :ok
+      limit -> trim_streams_over(limit)
+    end
+  end
+
+  @doc "Transcript memory for GET /health."
+  def budget_snapshot do
+    {used, events, streams} = usage()
+
+    %{
+      transcript_mb: div(used, 1_048_576),
+      transcript_budget_mb: div(WebSocketBudget.budget_bytes(), 1_048_576),
+      transcript_events: events,
+      transcript_sessions: streams,
+      session_event_limit: WebSocketBudget.session_limit()
+    }
+  end
+
+  defp usage do
+    words = :mnesia.table_info(@events, :memory) + :mnesia.table_info(@streams, :memory)
+    used = words * :erlang.system_info(:wordsize)
+    {used, :mnesia.table_info(@events, :size), :mnesia.table_info(@streams, :size)}
+  end
+
+  defp trim_streams_over(limit) do
+    over =
+      :mnesia.dirty_select(@streams, [
+        {{@streams, :"$1", :_, :_, :"$2", :"$3", :_}, [{:>, {:-, :"$3", :"$2"}, limit - 1}],
+         [:"$1"]}
+      ])
+
+    Enum.each(over, fn session_hash ->
+      :mnesia.transaction(fn ->
+        case :mnesia.read(@streams, session_hash, :write) do
+          [{@streams, ^session_hash, epoch, next, oldest, newest, expires_at}] ->
+            new_oldest = trim_to(session_hash, epoch, oldest, newest, limit)
+            :mnesia.write({@streams, session_hash, epoch, next, new_oldest, newest, expires_at})
+
+          [] ->
+            :ok
+        end
+      end)
+    end)
   end
 
   defp current_stream(session_hash, now) do
@@ -147,12 +216,20 @@ defmodule EzthrottleLocal.WebSocketStore do
   end
 
   defp prune_for_limit(session_hash, epoch, oldest, newest, config) do
-    retained = newest - oldest + 1
+    limit =
+      case WebSocketBudget.session_limit() do
+        nil -> config.stream_max_events
+        budget_limit -> min(config.stream_max_events, budget_limit)
+      end
 
-    if retained <= config.stream_max_events do
+    trim_to(session_hash, epoch, oldest, newest, limit)
+  end
+
+  defp trim_to(session_hash, epoch, oldest, newest, limit) do
+    if newest - oldest + 1 <= limit do
       oldest
     else
-      new_oldest = newest - config.stream_max_events + 1
+      new_oldest = newest - limit + 1
       delete_event_range(session_hash, epoch, oldest, new_oldest - 1)
       new_oldest
     end

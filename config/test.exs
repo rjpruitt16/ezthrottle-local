@@ -19,3 +19,6 @@ config :logger, level: :warning
 
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
+
+# WebSocket transcript budget: tests run the check themselves.
+config :ezthrottle_local, :websocket_budget_interval_ms, 0
