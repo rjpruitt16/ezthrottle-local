@@ -30,10 +30,25 @@ jobs:
         with:
           path: spillway
 
+      - name: Pick the aqueduct-runner branch
+        id: runner
+        env:
+          BRANCH: ${{ github.head_ref }}
+        # A runner branch with the same name as this PR's branch carries the
+        # matching contract change; test against it. Otherwise use main.
+        run: |
+          ref=main
+          if [ -n "$BRANCH" ] && git ls-remote --exit-code --heads https://github.com/rjpruitt16/aqueduct-runner "$BRANCH" >/dev/null; then
+            ref="$BRANCH"
+          fi
+          echo "Testing with aqueduct-runner@$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout aqueduct-runner
         uses: actions/checkout@v4
         with:
           repository: rjpruitt16/aqueduct-runner
+          ref: ${{ steps.runner.outputs.ref }}
           path: aqueduct-runner
 
       - name: Contract test -- shared suite (health, lifecycle, idempotency, proxy, L8)
@@ -42,7 +57,7 @@ jobs:
           version: "0.21.8"
           module: ./aqueduct-runner
           call: >-
-            test-ezthrottle
+            test-spillway
             --source=./spillway
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder
@@ -53,7 +68,18 @@ jobs:
           version: "0.21.8"
           module: ./aqueduct-runner
           call: >-
-            test-ezthrottle-admission
+            test-spillway-admission
+            --source=./spillway
+            --hurl-dir=./aqueduct-runner/hurl
+            --recorder-dir=./aqueduct-runner/recorder
+
+      - name: Contract test -- L8 request schemas (422 on mismatch)
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-spillway-request-schemas
             --source=./spillway
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder
@@ -64,7 +90,7 @@ jobs:
           version: "0.21.8"
           module: ./aqueduct-runner
           call: >-
-            test-ezthrottle-websocket
+            test-spillway-websocket
             --source=./spillway
             --websocket-dir=./aqueduct-runner/websocket
 
@@ -78,10 +104,25 @@ jobs:
         with:
           path: spillway
 
+      - name: Pick the aqueduct-runner branch
+        id: runner
+        env:
+          BRANCH: ${{ github.head_ref }}
+        # A runner branch with the same name as this PR's branch carries the
+        # matching contract change; test against it. Otherwise use main.
+        run: |
+          ref=main
+          if [ -n "$BRANCH" ] && git ls-remote --exit-code --heads https://github.com/rjpruitt16/aqueduct-runner "$BRANCH" >/dev/null; then
+            ref="$BRANCH"
+          fi
+          echo "Testing with aqueduct-runner@$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout aqueduct-runner
         uses: actions/checkout@v4
         with:
           repository: rjpruitt16/aqueduct-runner
+          ref: ${{ steps.runner.outputs.ref }}
           path: aqueduct-runner
 
       # Genuinely takes ~10 minutes -- roughly double aquifer's ~5, a
@@ -93,7 +134,7 @@ jobs:
           version: "0.21.8"
           module: ./aqueduct-runner
           call: >-
-            test-ezthrottle-drain
+            test-spillway-drain
             --source=./spillway
             --hurl-dir=./aqueduct-runner/hurl
             --recorder-dir=./aqueduct-runner/recorder
