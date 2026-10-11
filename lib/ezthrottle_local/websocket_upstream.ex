@@ -48,6 +48,12 @@ defmodule EzthrottleLocal.WebSocketUpstream do
 
   def socket_family_options(_host), do: []
 
+  # Remembered per host for a few minutes: answering it takes two DNS
+  # lookups, which on top of the connect's own lookup cost each new session
+  # three, and in the Fly lab the lookups alone added ~30% to connect times
+  # during a 500/s burst.
+  @family_cache_ms 300_000
+
   defp ipv6_only?(host) do
     charlist = String.to_charlist(host)
 
@@ -56,8 +62,21 @@ defmodule EzthrottleLocal.WebSocketUpstream do
         tuple_size(address) == 8
 
       {:error, _} ->
-        not match?({:ok, _}, :inet.getaddr(charlist, :inet)) and
-          match?({:ok, _}, :inet.getaddr(charlist, :inet6))
+        key = {__MODULE__, :ipv6_only, host}
+        now = System.monotonic_time(:millisecond)
+
+        case :persistent_term.get(key, nil) do
+          {answer, expires} when expires > now ->
+            answer
+
+          _ ->
+            answer =
+              not match?({:ok, _}, :inet.getaddr(charlist, :inet)) and
+                match?({:ok, _}, :inet.getaddr(charlist, :inet6))
+
+            :persistent_term.put(key, {answer, now + @family_cache_ms})
+            answer
+        end
     end
   end
 
