@@ -144,7 +144,7 @@ Authorization: Bearer gateway-authenticated-identity
 X-Aqueduct-Upstream-URL: wss://backend.internal/socket
 ```
 
-`session_id` identifies the durable transcript. `after` is the last stream ID the client processed and defaults to `0-0`. EZThrottle replays backend messages after that cursor before following live events. A cursor older than retained history returns **409** instead of silently skipping data.
+`session_id` identifies the session's transcript. `after` is the last stream ID the client processed and defaults to `0-0`. EZThrottle replays backend messages after that cursor before following live events. A cursor older than retained history returns **409** instead of silently skipping data.
 
 The trusted upstream URL must be absolute `ws://` or `wss://`. When `EZTHROTTLE_ALLOWED_URL_DOMAINS` is set, its comma-separated hosts are enforced as an allowlist. Gateway headers such as `Authorization` are forwarded; hop-by-hop and internal Aqueduct/Aquifer headers are stripped, and `X-Aqueduct-Session-ID` is injected upstream.
 
@@ -195,6 +195,16 @@ Neither direction buffers without bound:
 New handshakes are refused with **429** when `EZTHROTTLE_MEMORY_LIMIT_MB` or the database size limit is exceeded, with the same body and `Retry-After` as job admission.
 
 Transcripts retain the newest configured events and expire after an idle TTL. They are held in memory, so the node also caps their total size: `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` when set; otherwise whatever room the rest of the node leaves under a memory target (90% of `EZTHROTTLE_MEMORY_LIMIT_MB`, or 40% of the machine's memory), and never more than a quarter of memory. The budget shrinks as the rest of the node's memory grows. While transcripts are over that budget, each session keeps an equal share of it (at least 10 events), so the largest transcripts lose their oldest events first. A client whose cursor was trimmed gets **409** on reconnect. `GET /health` reports `transcript_mb`, `transcript_budget_mb` and the current `session_event_limit` under `websocket`. Mnesia uses the same `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
+
+#### What the transcript guarantees
+
+The transcript is a **replay window**, not a durable log. It is built for reconnects: a client that drops and comes back within the window gets everything it missed, in order.
+
+- **Guaranteed:** every message is recorded before it is forwarded or delivered, and a client that reconnects with a cursor still inside the window receives every backend event after it, in order, at least once.
+- **Not guaranteed:** history older than the window. The window shrinks under load: per-session retention, the TTL, and the node's transcript budget all trim the oldest events. A client whose cursor points before them is closed or gets **409** and must resynchronize from your application's own state. EZThrottle never skips events silently, but it does not keep them forever.
+- **Storage is this node's Mnesia,** in memory with a disk copy. It survives a restart of the node, not the loss of its disk, and it is not replicated across nodes.
+
+If you need every message kept beyond the window (audit, analytics, replay from the beginning), record it in your own durable store from the backend, or follow the durable-transcript extension in the issue tracker.
 
 | Environment variable | Default |
 |---|---:|
