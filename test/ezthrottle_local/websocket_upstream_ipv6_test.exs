@@ -5,10 +5,10 @@ defmodule EzthrottleLocal.WebSocketUpstreamIPv6Test do
 
   test "IPv6 literals connect over IPv6" do
     assert WebSocketUpstream.socket_family_options("::1") ==
-             [socket_options: [tcp_module: :inet6_tcp]]
+             [tcp_module: :inet6_tcp]
 
     assert WebSocketUpstream.socket_family_options("[fdaa::2]") ==
-             [socket_options: [tcp_module: :inet6_tcp]]
+             [tcp_module: :inet6_tcp]
   end
 
   test "IPv4 literals and names with an IPv4 address keep the default" do
@@ -21,7 +21,7 @@ defmodule EzthrottleLocal.WebSocketUpstreamIPv6Test do
       :gen_tcp.listen(0, [:binary, :inet6, ip: {0, 0, 0, 0, 0, 0, 0, 1}, active: false])
 
     {:ok, port} = :inet.port(listener)
-    opts = Keyword.fetch!(WebSocketUpstream.socket_family_options("::1"), :socket_options)
+    opts = WebSocketUpstream.socket_family_options("::1")
 
     {:ok, client} = :gen_tcp.connect(~c"::1", port, [:binary | opts], 1_000)
     {:ok, _server} = :gen_tcp.accept(listener, 1_000)
