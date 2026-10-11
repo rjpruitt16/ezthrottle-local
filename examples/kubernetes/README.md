@@ -1,9 +1,9 @@
-# EZThrottle Local behind a Gateway API proxy (Envoy Gateway)
+# Spillway behind a Gateway API proxy (Envoy Gateway)
 
 Ported from [Aquifer's identical example](https://github.com/rjpruitt16/aquifer/tree/main/examples/kubernetes) --
-EZThrottle Local as a normal Deployment, reached through a [Gateway API](https://gateway.k8s.io/)
+Spillway as a normal Deployment, reached through a [Gateway API](https://gateway.k8s.io/)
 proxy instead of a sidecar. The Gateway owns routing, TLS termination, and the cluster's single
-ingress point; EZThrottle Local owns the queue behind it -- not a way to horizontally scale it itself.
+ingress point; Spillway owns the queue behind it -- not a way to horizontally scale it itself.
 
 Tested against **Gateway API v1.6.0** and **Envoy Gateway v1.9.0** (current stable as of writing,
 same versions Aquifer's example was verified against). Pin your own cluster to a specific release
@@ -11,7 +11,7 @@ rather than "latest" -- both projects ship frequently.
 
 ## Why `replicas: 1`
 
-This is not a simplification to loosen later. EZThrottle Local's durable queue is Mnesia
+This is not a simplification to loosen later. Spillway's durable queue is Mnesia
 `disc_copies` backed by a local `MNESIA_DIR` per instance, and pool membership plus the SSE/PubSub
 subscriber state are in-process (BEAM) only in this deployment shape. Scaling is by
 **partitioning** -- running one instance per upstream domain or tenant -- not by adding replicas
@@ -36,7 +36,7 @@ fixed in `deployment.yaml` as shipped:
    boot attempt, despite the same image using ~136MiB under plain `docker run -m 512m`. A CPU limit
    alone is unaffected. This looked like a BEAM/cgroup memory-detection mismatch specific to that
    environment, not a real memory requirement -- test carefully in your own cluster before adding a
-   memory limit back, and use the app's own `EZTHROTTLE_MEMORY_LIMIT_MB` admission-control setting
+   memory limit back, and use the app's own `SPILLWAY_MEMORY_LIMIT_MB` admission-control setting
    for a safety net instead.
 
 ## Prerequisites
@@ -62,17 +62,17 @@ fixed in `deployment.yaml` as shipped:
   from. Unlike Aquifer, this repo doesn't currently publish one to a registry (deploys are via
   `fly deploy`'s local build, not a pushed image) -- build and push your own:
   ```bash
-  docker build -t your-registry/ezthrottle-local:latest .
-  docker push your-registry/ezthrottle-local:latest
+  docker build -t your-registry/spillway:latest .
+  docker push your-registry/spillway:latest
   ```
   then update `image:` in `deployment.yaml` to match.
 - A `SECRET_KEY_BASE`, generated locally and created as a cluster Secret -- `runtime.exs` raises on
   boot in prod without one, same as a bare `mix phx.gen.release` deploy would:
   ```bash
-  kubectl create namespace ezthrottle-local --dry-run=client -o yaml | kubectl apply -f -
-  kubectl create secret generic ezthrottle-local-secret \
+  kubectl create namespace spillway --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create secret generic spillway-secret \
     --from-literal=secret-key-base="$(mix phx.gen.secret)" \
-    -n ezthrottle-local
+    -n spillway
   ```
   (Not committed to `kustomization.yaml` on purpose -- generate and apply this yourself rather than
   reusing a value out of a Git repo.)
@@ -83,20 +83,20 @@ fixed in `deployment.yaml` as shipped:
 kubectl apply -k .
 ```
 
-This creates the `ezthrottle-local` namespace (if the Secret step above didn't already), a 1Gi PVC,
+This creates the `spillway` namespace (if the Secret step above didn't already), a 1Gi PVC,
 a single-replica Deployment, a `ClusterIP` Service, and the Gateway API resources (`GatewayClass`,
 `Gateway`, `HTTPRoute`) routing all traffic to it.
 
 ## Verify
 
 ```bash
-kubectl get pods -n ezthrottle-local
-kubectl get httproute -n ezthrottle-local ezthrottle-local -o jsonpath='{.status.parents[0].conditions}'
+kubectl get pods -n spillway
+kubectl get httproute -n spillway spillway -o jsonpath='{.status.parents[0].conditions}'
 ```
 
 The `HTTPRoute` status conditions should show `Accepted` and `ResolvedRefs` once Envoy Gateway has
 picked it up. Find the Envoy proxy Service Envoy Gateway provisions for this Gateway
-(`kubectl get svc -n envoy-gateway-system | grep ezthrottle-local-gateway`) and confirm `GET /health`
+(`kubectl get svc -n envoy-gateway-system | grep spillway-gateway`) and confirm `GET /health`
 responds through it, then submit a real job through `POST /jobs` on the same address and confirm it
 reaches `"status": "completed"`.
 

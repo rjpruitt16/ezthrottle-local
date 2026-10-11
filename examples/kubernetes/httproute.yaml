@@ -1,20 +1,20 @@
 # This is the actual "extension to a proxy" wiring: the Gateway (Envoy)
 # owns routing, TLS termination, and the cluster's single ingress point;
-# EZThrottle Local owns the queue behind it. Not a sidecar -- it's a normal
+# Spillway owns the queue behind it. Not a sidecar -- it's a normal
 # ClusterIP-backed Deployment that the Gateway happens to route to.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
-  name: ezthrottle-local
-  namespace: ezthrottle-local
+  name: spillway
+  namespace: spillway
 spec:
   parentRefs:
-    - name: ezthrottle-local-gateway
+    - name: spillway-gateway
   rules:
     - matches:
         - path:
             type: PathPrefix
             value: /
       backendRefs:
-        - name: ezthrottle-local
+        - name: spillway
           port: 4000

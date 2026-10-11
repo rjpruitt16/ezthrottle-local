@@ -25,7 +25,7 @@ RUN apk add --no-cache libstdc++ openssl ncurses-libs
 
 WORKDIR /app
 
-COPY --from=build /app/_build/prod/rel/ezthrottle_local ./
+COPY --from=build /app/_build/prod/rel/spillway ./
 
 ENV PHX_HOST=localhost
 ENV PORT=4000
@@ -33,4 +33,4 @@ ENV PHX_SERVER=true
 
 EXPOSE 4000
 
-CMD ["bin/ezthrottle_local", "start"]
+CMD ["bin/spillway", "start"]

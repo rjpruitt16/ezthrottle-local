@@ -9,7 +9,7 @@ server:
 test:
 	mix test
 
-# EZThrottle's own overhead per job (accept, queue, dispatch) and end-to-end
+# Spillway's own overhead per job (accept, queue, dispatch) and end-to-end
 # throughput. Mirrors Aquifer's make perf. Compare runs on the same machine only.
 perf:
 	mix test --only perf --seed 0 test/perf
@@ -21,7 +21,7 @@ integration-test: start-server start-webhook
 	@echo "Webhook server on http://localhost:9090"
 	@echo ""
 	@hurl --test \
-		--variable EZTHROTTLE_URL=http://localhost:4000 \
+		--variable SPILLWAY_URL=http://localhost:4000 \
 		--variable WEBHOOK_URL=http://localhost:9090 \
 		--variable WEBHOOK_CALLBACK_URL=http://localhost:9090/webhook \
 		--variable timestamp=$$(date +%s) \
@@ -29,7 +29,7 @@ integration-test: start-server start-webhook
 		(make stop-webhook stop-server; exit 1)
 	@echo ""
 	@echo "Running SSE streaming tests..."
-	@EZTHROTTLE_URL=http://localhost:4000 \
+	@SPILLWAY_URL=http://localhost:4000 \
 		WEBHOOK_URL=http://localhost:9090 \
 		WEBHOOK_CALLBACK_URL=http://localhost:9090/webhook \
 		python3 test/integration/test_stream.py || \
@@ -40,11 +40,11 @@ integration-test: start-server start-webhook
 
 l8-test: start-server start-webhook start-l8-receiver
 	@echo "Running L8 protocol tests..."
-	@echo "  ezthrottle: http://localhost:4000"
+	@echo "  spillway: http://localhost:4000"
 	@echo "  target:     http://localhost:9090/health"
 	@echo "  receiver:   http://localhost:9001"
 	@echo ""
-	@EZTHROTTLE_URL=http://localhost:4000 \
+	@SPILLWAY_URL=http://localhost:4000 \
 		TARGET_URL=http://localhost:9090/health \
 		RECEIVER_URL=http://localhost:9001 \
 		python3 test/integration/test_l8.py || \
@@ -54,8 +54,8 @@ l8-test: start-server start-webhook start-l8-receiver
 # ---- Server lifecycle (kill by port — no pid files) ----
 
 start-server:
-	@echo "Starting ezthrottle-local on port 4000..."
-	@PORT=4000 mix run --no-halt > /tmp/ezthrottle_local.log 2>&1 &
+	@echo "Starting spillway on port 4000..."
+	@PORT=4000 mix run --no-halt > /tmp/spillway.log 2>&1 &
 	@until curl -s http://localhost:4000/health > /dev/null 2>&1; do sleep 0.5; done
 	@echo "Server ready"
 

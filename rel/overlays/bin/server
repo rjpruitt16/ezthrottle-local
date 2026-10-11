@@ -2,4 +2,4 @@
 set -eu
 
 cd -P -- "$(dirname -- "$0")"
-PHX_SERVER=true exec ./ezthrottle_local start
+PHX_SERVER=true exec ./spillway start

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Multi-tenant fairness: one "noisy" tenant floods the same upstream while a
-# "quiet" tenant sends light steady traffic. EZThrottle isolates dispatch
+# "quiet" tenant sends light steady traffic. Spillway isolates dispatch
 # pacing per (user_id, upstream) pair via AccountQueue, so the quiet tenant's
 # jobs should complete on their own schedule regardless of the flood. Uses
 # the shared X-Aqueduct-Account-Queue protocol header (not the
@@ -8,7 +8,7 @@
 # would send — proving actual cross-implementation protocol compatibility.
 set -euo pipefail
 STAMP=$(date +%s)
-TARGET_URL="${1:-https://ezthrottle-local.fly.dev}"
+TARGET_URL="${1:-https://spillway.fly.dev}"
 NOISY_COUNT="${2:-100}"
 
 enqueue() {

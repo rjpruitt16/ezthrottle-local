@@ -7,25 +7,25 @@
 # General application configuration
 import Config
 
-config :ezthrottle_local,
+config :spillway,
   generators: [timestamp_type: :utc_datetime],
-  metrics_adapter: EzthrottleLocal.Metrics.Noop
+  metrics_adapter: Spillway.Metrics.Noop
 
 config :syn,
   scopes: [:ezthrottle_account_queues, :ezthrottle_job_stores],
   # Keeps both processes alive on a registry conflict (netsplit heal) so an
   # account queue that loses its name still finishes the jobs it holds.
-  event_handler: EzthrottleLocal.SynEventHandler
+  event_handler: Spillway.SynEventHandler
 
 # Configures the endpoint
-config :ezthrottle_local, EzthrottleLocalWeb.Endpoint,
+config :spillway, SpillwayWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,
   render_errors: [
-    formats: [json: EzthrottleLocalWeb.ErrorJSON],
+    formats: [json: SpillwayWeb.ErrorJSON],
     layout: false
   ],
-  pubsub_server: EzthrottleLocal.PubSub,
+  pubsub_server: Spillway.PubSub,
   live_view: [signing_salt: "spScA2A9"]
 
 # Configures Elixir's Logger

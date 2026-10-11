@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The GPU retry tax benchmark: does pacing through EZThrottle Local (via
+# The GPU retry tax benchmark: does pacing through Spillway (via
 # the ORCA fallback signal from vLLM's own kv_cache_usage_perc) keep a GPU
 # serving cleanly under a burst that would otherwise overload it directly?
 #
@@ -11,11 +11,11 @@
 #   1. direct     -- vegeta fires straight at vLLM, unpaced. This is the
 #      naive baseline: whatever vLLM's own admission/queueing does under
 #      raw load.
-#   2. ezthrottle -- vegeta fires the same burst at EZThrottle's POST
-#      /jobs instead. EZThrottle durably queues every job immediately
+#   2. spillway -- vegeta fires the same burst at Spillway's POST
+#      /jobs instead. Spillway durably queues every job immediately
 #      (ingest should stay ~100% regardless of burst size -- that's the
 #      "absorb the burst" claim) and paces actual dispatch to vLLM using
-#      the ORCA endpoint-load-metrics fallback (lib/ezthrottle_local/orca.ex).
+#      the ORCA endpoint-load-metrics fallback (lib/spillway/orca.ex).
 #
 # Compare: vLLM's own success rate/latency in each run, and vLLM's
 # Prometheus counters (request counts, KV-cache usage) snapshotted before
@@ -23,8 +23,8 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-VLLM_URL="${1:?usage: gpu_retry_tax.sh <vllm-url> <ezthrottle-url> [baseline-rate] [burst-rate] [max-tokens]}"
-EZTHROTTLE_URL="${2:?usage: gpu_retry_tax.sh <vllm-url> <ezthrottle-url> [baseline-rate] [burst-rate] [max-tokens]}"
+VLLM_URL="${1:?usage: gpu_retry_tax.sh <vllm-url> <spillway-url> [baseline-rate] [burst-rate] [max-tokens]}"
+SPILLWAY_URL="${2:?usage: gpu_retry_tax.sh <vllm-url> <spillway-url> [baseline-rate] [burst-rate] [max-tokens]}"
 BASELINE_RATE="${3:-2}"
 BURST_RATE="${4:-20}"
 MAX_TOKENS="${5:-32}"
@@ -69,7 +69,7 @@ run_phase() {
   if [ "$mode" = "direct" ]; then
     python3 "$DIR/gen_vllm_targets.py" direct "$n" "gputax-${label}-${STAMP}" "$VLLM_URL" "" "" "$MAX_TOKENS" > "$targets"
   else
-    python3 "$DIR/gen_vllm_targets.py" ezthrottle "$n" "gputax-${label}-${STAMP}" "$VLLM_URL" "$EZTHROTTLE_URL" "$VLLM_URL" "$MAX_TOKENS" > "$targets"
+    python3 "$DIR/gen_vllm_targets.py" spillway "$n" "gputax-${label}-${STAMP}" "$VLLM_URL" "$SPILLWAY_URL" "$VLLM_URL" "$MAX_TOKENS" > "$targets"
   fi
 
   local peakfile="/tmp/vllm_peak_${mode}_${label}.log"
@@ -101,14 +101,14 @@ run_scenario() {
 }
 
 echo "# GPU retry tax benchmark"
-echo "# vllm=${VLLM_URL} ezthrottle=${EZTHROTTLE_URL} baseline=${BASELINE_RATE}/s burst=${BURST_RATE}/s"
+echo "# vllm=${VLLM_URL} spillway=${SPILLWAY_URL} baseline=${BASELINE_RATE}/s burst=${BURST_RATE}/s"
 
 run_scenario "direct"
-run_scenario "ezthrottle"
+run_scenario "spillway"
 
 echo ""
 echo "=========================================="
 echo "Compare the two 'burst' phase reports above: direct hits vLLM's"
-echo "concurrency ceiling immediately; ezthrottle should show ~100% ingest"
+echo "concurrency ceiling immediately; spillway should show ~100% ingest"
 echo "success with dispatch to vLLM paced down once kv_cache_usage_perc"
-echo "crosses the ORCA thresholds in lib/ezthrottle_local/orca.ex."
+echo "crosses the ORCA thresholds in lib/spillway/orca.ex."

@@ -1,4 +1,6 @@
-# EZThrottle Local — Load balancer for agentic workloads
+# Spillway — Load balancer for agentic workloads
+
+Formerly **EZThrottle Local**. See [Upgrading from EZThrottle Local](#upgrading-from-ezthrottle-local).
 
 ![How engineers respond to congestion: pacing and backpressure everywhere else in infrastructure, versus retrying everything immediately at the API layer](docs/images/how-engineers-respond-to-congestion.jpg)
 
@@ -6,11 +8,13 @@
 
 Envoy circuit breaking protects an overloaded service by rejecting excess work outright. That keeps the backend alive, but a rejected request is just gone. Nothing durable survives it, and the client is left to retry independently, creating uncoordinated competition for whatever capacity opens up next and wasting cycles on repeated attempts.
 
-EZThrottle Local takes a different approach: persist the excess work, then pace its release.
+Spillway takes a different approach: persist the excess work, then pace its release.
 
-The backend is also closer to the truth about its own capacity than a static proxy limit ever is. If the fleet loses half its usable capacity, the admission rate should fall; if capacity expands, the release rate should rise. Instead of leaning on static limits like max connections or concurrent requests, EZThrottle Local can ask the backend directly, continuously: *how fast should we send work right now?* (See [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) for how that ceiling, backoff, and recovery actually work.)
+The backend is also closer to the truth about its own capacity than a static proxy limit ever is. If the fleet loses half its usable capacity, the admission rate should fall; if capacity expands, the release rate should rise. Instead of leaning on static limits like max connections or concurrent requests, Spillway can ask the backend directly, continuously: *how fast should we send work right now?* (See [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) for how that ceiling, backoff, and recovery actually work.)
 
-Circuit breaking protects the service by saying "stop." EZThrottle Local coordinates demand by saying "wait here, and I'll tell you when to go."
+Circuit breaking protects the service by saying "stop." Spillway coordinates demand by saying "wait here, and I'll tell you when to go."
+
+The name: a spillway is how a dam releases water it can't hold, at a rate the river below can take, so the dam doesn't fail. This one works in both directions. Inbound, it holds the burst agents and clients send your API. Outbound, it holds the calls your app makes to rate-limited APIs. Either way, the excess waits and is released at a pace the other side can handle.
 
 **Increase your rate limit without DDoSing your backend.**
 
@@ -20,9 +24,9 @@ The usual fix for that is more hardware: double the fleet, triple the GPU budget
 
 ![How teams handle traffic spikes: overprovisioning the fleet versus queueing the burst and pacing the flow while capacity catches up](docs/images/how-teams-handle-traffic-spikes.png)
 
-EZThrottle Local is what I built to actually fix it: a self-hosted load balancer that absorbs bursts into a durable queue, dispatches at a controlled rate, and spreads traffic across a pool of backend instances. Your API sheds load by talking back, not by getting hammered until it falls over.
+Spillway is what I built to actually fix it: a self-hosted load balancer that absorbs bursts into a durable queue, dispatches at a controlled rate, and spreads traffic across a pool of backend instances. Your API sheds load by talking back, not by getting hammered until it falls over.
 
-What's usually behind that API can't scale instantly either: a GPU, a database, a CI runner. EZThrottle Local buys time for more of it to come online; it's overkill if that ceiling is fixed for good.
+What's usually behind that API can't scale instantly either: a GPU, a database, a CI runner. Spillway buys time for more of it to come online; it's overkill if that ceiling is fixed for good.
 
 Real numbers (durability, throughput ceiling, admission shedding, multi-tenant fairness, a real GPU under load) are in [benchmark.md](benchmark.md), including a head-to-head against [Aquifer](https://github.com/rjpruitt16/aquifer), the Go/SQLite sibling this project mirrors.
 
@@ -34,21 +38,21 @@ Real numbers (durability, throughput ceiling, admission shedding, multi-tenant f
 
 **Protect your API**
 ```
-agents / clients  →  POST /jobs to EZThrottle  →  your backend (at controlled RPS)
+agents / clients  →  POST /jobs to Spillway  →  your backend (at controlled RPS)
 ```
-Agents or clients hammering your API over HTTP? EZThrottle queues their requests and drains them to your backend at a pace it can handle. Your backend returns `X-Aqueduct-Rps` headers to signal how fast it wants traffic in real time.
+Agents or clients hammering your API over HTTP? Spillway queues their requests and drains them to your backend at a pace it can handle. Your backend returns `X-Aqueduct-Rps` headers to signal how fast it wants traffic in real time.
 
 **A durable checkpoint in front of a rate-limited resource**
 ```
-your app  →  POST /jobs to EZThrottle  →  database / CI runner / OpenAI / Stripe / any rate-limited API
+your app  →  POST /jobs to Spillway  →  database / CI runner / OpenAI / Stripe / any rate-limited API
 ```
-Calling something with its own capacity limit (a database read replica, a CI runner, a third-party API)? EZThrottle queues the calls durably and dispatches them at your configured rate, so a burst from your own side never becomes the thing that takes the downstream down. Works especially well closed-loop: if the downstream already speaks `X-Aqueduct-*` headers, it can tell EZThrottle to back off in real time instead of you guessing a static rate.
+Calling something with its own capacity limit (a database read replica, a CI runner, a third-party API)? Spillway queues the calls durably and dispatches them at your configured rate, so a burst from your own side never becomes the thing that takes the downstream down. Works especially well closed-loop: if the downstream already speaks `X-Aqueduct-*` headers, it can tell Spillway to back off in real time instead of you guessing a static rate.
 
 **Edge load balancer → gateway — pace and route at the edge**
 ```
-your users  →  POST /proxy to EZThrottle  →  your resources (paced, routed, at the speed you can handle)
+your users  →  POST /proxy to Spillway  →  your resources (paced, routed, at the speed you can handle)
 ```
-Point EZThrottle at your resources like a normal reverse proxy, close to the caller. It tries the request directly first (a healthy resource sees no queue at all) and only falls back to durable queuing when something's actually overloaded, on the same connection, staying in queue mode until that domain's backlog is genuinely drained (not just until a cooldown timer expires). See [`POST /proxy`](API.md#post-proxy) for the details, including the header an upstream can use to request queuing proactively. For low-latency cross-region failover on top of that: Fly.io's own [`fly-replay`](https://fly.io/docs/networking/dynamic-request-routing/) is a response header *your* app returns to tell Fly's edge "redeliver this request in a different region." Your own logic in front of EZThrottle can watch for the same overload signal the circuit breaker already uses (429, 5xx, an ORCA threshold) and respond with `fly-replay` instead of just falling back locally, rerouting at Fly's edge rather than adding a round trip through your own infrastructure. Not something EZThrottle implements itself; the same overload classification just composes naturally with it.
+Point Spillway at your resources like a normal reverse proxy, close to the caller. It tries the request directly first (a healthy resource sees no queue at all) and only falls back to durable queuing when something's actually overloaded, on the same connection, staying in queue mode until that domain's backlog is genuinely drained (not just until a cooldown timer expires). See [`POST /proxy`](API.md#post-proxy) for the details, including the header an upstream can use to request queuing proactively. For low-latency cross-region failover on top of that: Fly.io's own [`fly-replay`](https://fly.io/docs/networking/dynamic-request-routing/) is a response header *your* app returns to tell Fly's edge "redeliver this request in a different region." Your own logic in front of Spillway can watch for the same overload signal the circuit breaker already uses (429, 5xx, an ORCA threshold) and respond with `fly-replay` instead of just falling back locally, rerouting at Fly's edge rather than adding a round trip through your own infrastructure. Not something Spillway implements itself; the same overload classification just composes naturally with it.
 
 In all three, the upstream can lower the dispatch pace via response headers. See [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) for how the ceiling, backoff, and recovery actually work.
 
@@ -63,7 +67,7 @@ The same `aqueduct.v1` protocol as Aquifer, backed locally by Mnesia: durable or
 ## How it works
 
 ```
-Client → POST /jobs → EZThrottle Local → paced outbound requests → Your API
+Client → POST /jobs → Spillway → paced outbound requests → Your API
               ↓                                                          ↓
      GET /jobs/:id/stream                                        response body
               ↓                                                          ↓
@@ -73,8 +77,8 @@ Client → POST /jobs → EZThrottle Local → paced outbound requests → Your 
 ```
 
 1. **Submit a job**: POST the request you want forwarded, with a `webhook_url` for the response.
-2. **EZThrottle queues it**: jobs are held in memory and dispatched at the configured RPS.
-3. **Your API responds**: EZThrottle reads pacing headers from the response and adjusts automatically, falling back to the real [ORCA](https://github.com/cncf/xds/blob/main/xds/data/orca/v3/orca_load_report.proto) standard for backends that report load a different way (vLLM and Triton/TensorRT-LLM both work today). See [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) below for the full header reference.
+2. **Spillway queues it**: jobs are held in memory and dispatched at the configured RPS.
+3. **Your API responds**: Spillway reads pacing headers from the response and adjusts automatically, falling back to the real [ORCA](https://github.com/cncf/xds/blob/main/xds/data/orca/v3/orca_load_report.proto) standard for backends that report load a different way (vLLM and Triton/TensorRT-LLM both work today). See [Per-tenant fairness](#per-tenant-fairness-accountqueue-mode) below for the full header reference.
 4. **Stay on the line or hang up**: open `GET /jobs/:id/stream` to receive live events as the job moves through the queue, or disconnect and the result is delivered to your `webhook_url` when ready.
 
 ---
@@ -102,7 +106,7 @@ X-Aqueduct-Account-Queue: enabled
 X-Aqueduct-Account-Queue: enabled
 ```
 
-Either way, EZThrottle switches to per-user isolation: each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else.
+Either way, Spillway switches to per-user isolation: each `user_id` + API key gets its own queue. A heavy user no longer blocks everyone else.
 
 Above 70% of the shared upstream backlog budget, queues holding more than their current fair share receive progressively more `429` responses while smaller queues continue entering. One active queue can still use the entire budget. See [API.md](API.md#fair-queue-admission) for the formula and observability headers.
 
@@ -114,11 +118,11 @@ Each tenant's own pace is still capped by the upstream's actual budget, though: 
 
 `X-Aqueduct-*` is read first if both namespaces are present: the shared protocol namespace also spoken by [Aquifer](https://github.com/rjpruitt16/aquifer), so a backend already emitting Aqueduct headers works against either implementation unchanged.
 
-**ORCA fallback**, for backends that speak neither namespace but already report load some other way: EZThrottle sends `endpoint-load-metrics-format: text` on every dispatch, and a response carrying an `endpoint-load-metrics` header is used to pace down (full rate below 70% utilization, 2 RPS at 70-90%, 0.5 RPS at 90-97%, 0.25 RPS above that) only when no explicit Aqueduct/EZThrottle header is present. Two backends verified directly against their own source: **vLLM** (metric name `kv_cache_usage_perc`, case-insensitive opt-in) and **Triton/TensorRT-LLM** (metric name `kv_cache_utilization`, case-sensitive lowercase-only opt-in; EZThrottle sends lowercase specifically so both work).
+**ORCA fallback**, for backends that speak neither namespace but already report load some other way: Spillway sends `endpoint-load-metrics-format: text` on every dispatch, and a response carrying an `endpoint-load-metrics` header is used to pace down (full rate below 70% utilization, 2 RPS at 70-90%, 0.5 RPS at 90-97%, 0.25 RPS above that) only when no explicit Aqueduct/Spillway header is present. Two backends verified directly against their own source: **vLLM** (metric name `kv_cache_usage_perc`, case-insensitive opt-in) and **Triton/TensorRT-LLM** (metric name `kv_cache_utilization`, case-sensitive lowercase-only opt-in; Spillway sends lowercase specifically so both work).
 
-Long-term protocol goal: if more services emit `X-Aqueduct-*`, agents can respond to capacity signals instead of independently guessing retry and concurrency behavior. EZThrottle works today without ecosystem adoption; broader protocol adoption is the longer-term goal.
+Long-term protocol goal: if more services emit `X-Aqueduct-*`, agents can respond to capacity signals instead of independently guessing retry and concurrency behavior. Spillway works today without ecosystem adoption; broader protocol adoption is the longer-term goal.
 
-**Webhook delivery uses this same pacing, not a separate fire-and-forget path.** A webhook POST is enqueued as its own job, keyed by the receiver's domain, and dispatched through the identical AccountQueue machinery described above, so a webhook receiver can slow EZThrottle down with `X-Aqueduct-Rps`/`X-Aqueduct-Max-Concurrent` response headers exactly the way a real upstream can, instead of just getting hammered on a fixed retry schedule. It's also crash-durable: a webhook still pending when the node restarts is recovered and retried the same way a queued job is. Retries trigger on `5xx` responses, up to 4 attempts with exponential backoff (1s · 2s · 4s · 8s). Drain mode's own ledger-flush webhook is unaffected: it stays synchronous, confirming delivery before clearing the local idempotency ledger.
+**Webhook delivery uses this same pacing, not a separate fire-and-forget path.** A webhook POST is enqueued as its own job, keyed by the receiver's domain, and dispatched through the identical AccountQueue machinery described above, so a webhook receiver can slow Spillway down with `X-Aqueduct-Rps`/`X-Aqueduct-Max-Concurrent` response headers exactly the way a real upstream can, instead of just getting hammered on a fixed retry schedule. It's also crash-durable: a webhook still pending when the node restarts is recovered and retried the same way a queued job is. Retries trigger on `5xx` responses, up to 4 attempts with exponential backoff (1s · 2s · 4s · 8s). Drain mode's own ledger-flush webhook is unaffected: it stays synchronous, confirming delivery before clearing the local idempotency ledger.
 
 </details>
 
@@ -126,7 +130,7 @@ Long-term protocol goal: if more services emit `X-Aqueduct-*`, agents can respon
 
 ## Agent-native load balancing
 
-Instead of dispatching to a fixed `url`, a job can target a named **pool**: a group of registered service instances EZThrottle picks from at dispatch time, weighted by declared capacity and live reputation. Ported from [Aquifer](https://github.com/rjpruitt16/aquifer)'s Go implementation, built and proven out there first.
+Instead of dispatching to a fixed `url`, a job can target a named **pool**: a group of registered service instances Spillway picks from at dispatch time, weighted by declared capacity and live reputation. Ported from [Aquifer](https://github.com/rjpruitt16/aquifer)'s Go implementation, built and proven out there first.
 
 <details>
 <summary>Full pool reference — registration, dispatch, reputation model</summary>
@@ -134,7 +138,7 @@ Instead of dispatching to a fixed `url`, a job can target a named **pool**: a gr
 **Registering a member:**
 
 ```bash
-curl -X POST https://your-ezthrottle/pools/writers/members \
+curl -X POST https://your-spillway/pools/writers/members \
   -d '{"member_id": "writer-1", "address": "http://10.0.1.5:8080", "capacity_rps": 20, "heartbeat_interval_seconds": 30}'
 ```
 
@@ -148,19 +152,19 @@ The same call is both initial registration and heartbeat: call it again periodic
   "idempotent_key": "job-1",
   "pool_id": "writers",
   "method": "POST",
-  "webhook_url": "https://yourapp.com/webhooks/ezthrottle"
+  "webhook_url": "https://yourapp.com/webhooks/spillway"
 }
 ```
 
 `pool_id` and `url` are mutually exclusive: a job sets exactly one.
 
-**How a member gets picked:** proportional to `capacity_rps × reputation`, not equal-split round robin: a member declaring 100 RPS gets roughly 4x the dispatches of one declaring 25. The pool's aggregate ceiling is the live sum of every member's current effective rate, so it grows and shrinks automatically as members register, degrade, or drop out, with no need to reconfigure EZThrottle as your fleet autoscales.
+**How a member gets picked:** proportional to `capacity_rps × reputation`, not equal-split round robin: a member declaring 100 RPS gets roughly 4x the dispatches of one declaring 25. The pool's aggregate ceiling is the live sum of every member's current effective rate, so it grows and shrinks automatically as members register, degrade, or drop out, with no need to reconfigure Spillway as your fleet autoscales.
 
 **Reputation**: a dispatch failure halves a member's effective share; a success nudges it back up. A member isn't evicted on one bad response, only once its reputation has stayed at the floor continuously, with no interrupting success, for a sustained window. This avoids flapping a member in and out of the pool over a single transient error.
 
-**Set `capacity_rps` conservatively, not at your true theoretical max.** EZThrottle only learns a member died via a failed dispatch or a missed heartbeat, both of which lag the actual failure, so leaving headroom in what you declare gives real slack for that detection delay. Reputation decay is a second line of defense on top of this.
+**Set `capacity_rps` conservatively, not at your true theoretical max.** Spillway only learns a member died via a failed dispatch or a missed heartbeat, both of which lag the actual failure, so leaving headroom in what you declare gives real slack for that detection delay. Reputation decay is a second line of defense on top of this.
 
-**A given `pool_id` should belong to exactly one EZThrottle instance**: pool membership is not distributed by Syn. If the same member registers the same `pool_id` with two different instances, each one independently believes it owns that member's full declared capacity. If a member genuinely needs to register with more than one instance, divide its declared `capacity_rps` across however many it's registered with.
+**A given `pool_id` should belong to exactly one Spillway instance**: pool membership is not distributed by Syn. If the same member registers the same `pool_id` with two different instances, each one independently believes it owns that member's full declared capacity. If a member genuinely needs to register with more than one instance, divide its declared `capacity_rps` across however many it's registered with.
 
 `GET /health` reports every pool's current members, their declared capacity, and current reputation.
 
@@ -170,7 +174,7 @@ The same call is both initial registration and heartbeat: call it again periodic
 
 ## Streaming — stay on the line or get a voicemail
 
-Most queue systems force you to choose: poll for status or hope the webhook lands. EZThrottle gives you a third option: an open SSE stream that tells you exactly what's happening in real time, or a `webhook_url` fallback if you disconnect. Coordination built into the infrastructure, the same way TCP handled it at Layer 4. At Layer 7, for API workflows, the queue is the protocol.
+Most queue systems force you to choose: poll for status or hope the webhook lands. Spillway gives you a third option: an open SSE stream that tells you exactly what's happening in real time, or a `webhook_url` fallback if you disconnect. Coordination built into the infrastructure, the same way TCP handled it at Layer 4. At Layer 7, for API workflows, the queue is the protocol.
 
 <details>
 <summary>Full streaming reference — event shapes, queue position for agent fleets</summary>
@@ -244,9 +248,9 @@ Content-Type: application/json
 
 Every job requires an `idempotent_key`. Submitting the same key twice **for the same `user_id`** returns the original job ID without re-executing the request; different users can safely use the same `idempotent_key` without colliding with each other. Keys expire after 24 hours (configurable).
 
-**Shared scope.** With `EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED=true`, a job can set `"idempotency_scope": "shared"` to dedup on `idempotent_key` alone, across every `user_id`. Many agents asking for the same resource then coalesce onto one upstream call: later callers get `200 + "duplicate": true` with the first job's ID and can poll or stream it; they don't get their own webhook. Anyone who knows a shared key can read its result, so use keys that name a public resource (`weather:sf:2026-10-05`), never a user's private data. Backed by Mnesia (`disc_copies`), not ETS: durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
+**Shared scope.** With `SPILLWAY_SHARED_IDEMPOTENCY_ENABLED=true`, a job can set `"idempotency_scope": "shared"` to dedup on `idempotent_key` alone, across every `user_id`. Many agents asking for the same resource then coalesce onto one upstream call: later callers get `200 + "duplicate": true` with the first job's ID and can poll or stream it; they don't get their own webhook. Anyone who knows a shared key can read its result, so use keys that name a public resource (`weather:sf:2026-10-05`), never a user's private data. Backed by Mnesia (`disc_copies`), not ETS: durable across a crash, not just a graceful restart. See [benchmark.md](benchmark.md) for what that guarantee actually costs and how it's tuned.
 
-**Delivery semantics:** EZThrottle provides at-least-once dispatch and webhook delivery, not exactly-once execution. If the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches to the upstream again on restart, so it's not just the webhook that can repeat, the upstream call itself can. Make both your upstream endpoint and your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
+**Delivery semantics:** Spillway provides at-least-once dispatch and webhook delivery, not exactly-once execution. If the node crashes after a dispatch succeeds but before it records that completion, the recovered job dispatches to the upstream again on restart, so it's not just the webhook that can repeat, the upstream call itself can. Make both your upstream endpoint and your webhook handler idempotent on `job_id` (or `idempotent_key`) anywhere duplicate execution isn't safe, the same contract Stripe and GitHub webhooks already ask of you.
 
 ---
 
@@ -260,7 +264,7 @@ Jobs are written to Mnesia disc-backed tables, not kept purely in memory.
 Two things matter for what "durable" actually means here:
 
 - `MNESIA_DIR`: where the on-disk tables live. **Must point at a persistent volume in production** (defaults to `/data/mnesia` in `fly.toml`, mirroring Aquifer's `DB_PATH`). Without a real volume mount, this data lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
-- `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` (default `100`): Mnesia's `disc_copies` tables live in RAM by default, with the disk copy caught up via a periodic flush, not on every write. `0` flushes synchronously on every write (zero loss, real per-request latency cost); a positive value batches the flush on a timer instead, bounding the loss window on a true crash to roughly that many milliseconds of writes. 100ms was found empirically to be a good default; see [benchmark.md](benchmark.md) for why going higher made things *worse*, not better.
+- `SPILLWAY_MNESIA_FLUSH_INTERVAL_MS` (default `100`): Mnesia's `disc_copies` tables live in RAM by default, with the disk copy caught up via a periodic flush, not on every write. `0` flushes synchronously on every write (zero loss, real per-request latency cost); a positive value batches the flush on a timer instead, bounding the loss window on a true crash to roughly that many milliseconds of writes. 100ms was found empirically to be a good default; see [benchmark.md](benchmark.md) for why going higher made things *worse*, not better.
 
 </details>
 
@@ -272,13 +276,13 @@ Running one node for everything works fine until you have multiple tenants or mu
 
 **Static partitioning**: decided once, at deploy time. Dedicate one standalone node, or one connected cluster, to a protected resource (a CI runner, a database, a GPU, or a rate-limited external API) so that resource only sees traffic paced through one coordinated queue owner. Multiple tenants can safely share it: turn on [AccountQueue mode](#per-tenant-fairness-accountqueue-mode) and each tenant gets an independently paced queue. Unconnected nodes still multiply the configured rate, and pools remain local to one instance because pool membership is not distributed by Syn.
 
-**Dynamic partitioning (drain mode)**: off by default, for a more specific shape. Instead of deciding every assignment up front, a node gets handed to one tenant at a time, absorbs and drains whatever burst that tenant sends, then frees itself up to be handed to a *different* tenant next, useful when you want dedicated capacity per user without hand-assigning it at deploy time. A normal single-node or statically-partitioned deployment is completely unaffected unless you turn this on. When idle for `EZTHROTTLE_DRAIN_TIMER_SECONDS`, the node flushes its deduped idempotency ledger to a webhook and clears local state, moving through an `active` → `draining` → `unassigned` state machine visible via `GET /health`; optional batch streaming can send acknowledged terminal-job chunks before that final idle handoff. See **[DRAIN_MODE.md](DRAIN_MODE.md)** for the full state machine, env vars, and webhook payload shape.
+**Dynamic partitioning (drain mode)**: off by default, for a more specific shape. Instead of deciding every assignment up front, a node gets handed to one tenant at a time, absorbs and drains whatever burst that tenant sends, then frees itself up to be handed to a *different* tenant next, useful when you want dedicated capacity per user without hand-assigning it at deploy time. A normal single-node or statically-partitioned deployment is completely unaffected unless you turn this on. When idle for `SPILLWAY_DRAIN_TIMER_SECONDS`, the node flushes its deduped idempotency ledger to a webhook and clears local state, moving through an `active` → `draining` → `unassigned` state machine visible via `GET /health`; optional batch streaming can send acknowledged terminal-job chunks before that final idle handoff. See **[DRAIN_MODE.md](DRAIN_MODE.md)** for the full state machine, env vars, and webhook payload shape.
 
 The two combine: a fleet can partition statically by upstream domain, while individual nodes within a partition cycle through tenants dynamically via drain mode. This mirrors [Aquifer's](https://github.com/rjpruitt16/aquifer) identical guidance.
 
-**External registration**: off by default, and orthogonal to the above. `EZTHROTTLE_REGISTRY_URL` makes a node periodically report its own listening port to an external control plane (deciding tenant assignment, scaling, etc. is entirely that service's job, not this node's). See **[REGISTRATION.md](REGISTRATION.md)** for the env vars and ping payload shape.
+**External registration**: off by default, and orthogonal to the above. `SPILLWAY_REGISTRY_URL` makes a node periodically report its own listening port to an external control plane (deciding tenant assignment, scaling, etc. is entirely that service's job, not this node's). See **[REGISTRATION.md](REGISTRATION.md)** for the env vars and ping payload shape.
 
-**Region-local clustering is optional.** With `DNS_CLUSTER_QUERY` set, libcluster discovers sibling BEAM nodes and Syn gives each upstream/account queue one live owner across the connected cluster, so any node can accept a user's request without creating a second queue. Unset, EZThrottle remains standalone. Mnesia durability is still node-local unless you configure replication separately; see [API.md](API.md#region-local-queue-ownership) for the exact boundary and settings.
+**Region-local clustering is optional.** With `DNS_CLUSTER_QUERY` set, libcluster discovers sibling BEAM nodes and Syn gives each upstream/account queue one live owner across the connected cluster, so any node can accept a user's request without creating a second queue. Unset, Spillway remains standalone. Mnesia durability is still node-local unless you configure replication separately; see [API.md](API.md#region-local-queue-ownership) for the exact boundary and settings.
 
 ---
 
@@ -291,18 +295,18 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 
 | Env var | Default | Description |
 |---|---|---|
-| `EZTHROTTLE_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once BEAM's total memory exceeds this many MB |
-| `EZTHROTTLE_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
-| `EZTHROTTLE_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |
-| `EZTHROTTLE_MAX_PENDING_PER_USER` | `10000` | Reject new client work for one user once its queued plus in-flight jobs reach this ceiling; `0` disables it |
-| `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
-| `EZTHROTTLE_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429`: doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |
+| `SPILLWAY_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once BEAM's total memory exceeds this many MB |
+| `SPILLWAY_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
+| `SPILLWAY_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |
+| `SPILLWAY_MAX_PENDING_PER_USER` | `10000` | Reject new client work for one user once its queued plus in-flight jobs reach this ceiling; `0` disables it |
+| `SPILLWAY_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
+| `SPILLWAY_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429`: doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |
 
 Body-size and DB-size admission are **on by default**, sized off the infrastructure this project is
 actually benchmarked against (a single 512MB Fly.io instance with a 1GB volume; see
 [benchmark.md](benchmark.md)); set an explicit `0` to disable a check, or raise it for a bigger
 deployment. Memory is the exception: there's no safe one-size-fits-all default since it depends on
-your own deployment's memory budget, so it stays disabled until set explicitly; EZThrottle logs a
+your own deployment's memory budget, so it stays disabled until set explicitly; Spillway logs a
 warning on startup if it isn't (benchmarked safe at 400MB on a 512MB instance, as a starting point).
 `GET /health` reports a live `admission` snapshot.
 
@@ -319,7 +323,7 @@ Runtime config lives in `config/runtime.exs`: default RPS, account-queue mode, i
 
 ```elixir
 # config/runtime.exs
-config :ezthrottle_local,
+config :spillway,
   default_rps: 2.0,
   account_queue_enabled: false,   # opt-in per-tenant isolation
   idempotent_ttl: 86_400,         # seconds
@@ -328,12 +332,12 @@ config :ezthrottle_local,
 
 ### Metrics adapter
 
-EZThrottle Local emits lifecycle events through a configurable metrics adapter.
-Adapters implement the `EzthrottleLocal.Metrics` behaviour:
+Spillway emits lifecycle events through a configurable metrics adapter.
+Adapters implement the `Spillway.Metrics` behaviour:
 
 ```elixir
 defmodule MyApp.Metrics do
-  @behaviour EzthrottleLocal.Metrics
+  @behaviour Spillway.Metrics
 
   def job_queued(user_id, upstream), do: :ok
   def job_dispatched(user_id, upstream), do: :ok
@@ -346,20 +350,20 @@ defmodule MyApp.Metrics do
 end
 ```
 
-The default adapter is `EzthrottleLocal.Metrics.Noop`, so existing deployments do not change.
+The default adapter is `Spillway.Metrics.Noop`, so existing deployments do not change.
 
 ### Region adapter (cross-region /proxy redirect)
 
-Off by default. Set `EZTHROTTLE_FLY_REGIONS` (comma-separated Fly region codes this app is deployed to) to enable `/proxy`'s cross-region redirect on Fly. See [API.md's "Cross-region redirect" section](API.md#cross-region-redirect-flyio) for the full behavior. Direct port of Aquifer's `RegionAdapter`/`FlyRegionAdapter`.
+Off by default. Set `SPILLWAY_FLY_REGIONS` (comma-separated Fly region codes this app is deployed to) to enable `/proxy`'s cross-region redirect on Fly. See [API.md's "Cross-region redirect" section](API.md#cross-region-redirect-flyio) for the full behavior. Direct port of Aquifer's `RegionAdapter`/`FlyRegionAdapter`.
 
 | Env var | Default | Description |
 |---|---|---|
-| `EZTHROTTLE_FLY_REGIONS` | _(none, feature off)_ | Comma-separated Fly region codes this app is deployed to |
-| `EZTHROTTLE_FLY_POLL_INTERVAL_SECONDS` | `30` | How often to poll sibling regions over Fly's private network for liveness |
-| `EZTHROTTLE_REDIRECT_GATE_COOLDOWN_SECONDS` | `500` | How long to stop attempting cross-region redirect after a tour finds no reachable region at all: internal probe throttling, not what's told to the caller |
-| `EZTHROTTLE_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` | `900` (15min) | `Retry-After` sent to the caller when cross-region redirect is configured but exhausted: request is rejected (429), not queued locally |
+| `SPILLWAY_FLY_REGIONS` | _(none, feature off)_ | Comma-separated Fly region codes this app is deployed to |
+| `SPILLWAY_FLY_POLL_INTERVAL_SECONDS` | `30` | How often to poll sibling regions over Fly's private network for liveness |
+| `SPILLWAY_REDIRECT_GATE_COOLDOWN_SECONDS` | `500` | How long to stop attempting cross-region redirect after a tour finds no reachable region at all: internal probe throttling, not what's told to the caller |
+| `SPILLWAY_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` | `900` (15min) | `Retry-After` sent to the caller when cross-region redirect is configured but exhausted: request is rejected (429), not queued locally |
 
-Custom implementations plug in via `:region_adapter`, implementing the `EzthrottleLocal.RegionAdapter` behaviour (`live_regions/0`, `self_region/0`), same pattern as the metrics adapter above.
+Custom implementations plug in via `:region_adapter`, implementing the `Spillway.RegionAdapter` behaviour (`live_regions/0`, `self_region/0`), same pattern as the metrics adapter above.
 
 </details>
 
@@ -367,11 +371,11 @@ Custom implementations plug in via `:region_adapter`, implementing the `Ezthrott
 
 ## L8 Protocol — trustless webhook delivery
 
-Traditional webhook security shares an HMAC secret between sender and receiver, stored in a database on both sides: something that can be stolen, logged accidentally, or forgotten during rotation, letting anyone forge deliveries forever once it leaks. EZThrottle Local implements **L8 v0.2**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography: the receiver publishes a public key, a one-time handshake proves both sides own their private keys, and every delivery afterward carries a signature verified locally in microseconds, with no database lookup and no round-trip to any authority.
+Traditional webhook security shares an HMAC secret between sender and receiver, stored in a database on both sides: something that can be stolen, logged accidentally, or forgotten during rotation, letting anyone forge deliveries forever once it leaks. Spillway implements **L8 v0.2**, a lightweight challenge-response protocol that replaces the shared secret with Ed25519 public key cryptography: the receiver publishes a public key, a one-time handshake proves both sides own their private keys, and every delivery afterward carries a signature verified locally in microseconds, with no database lookup and no round-trip to any authority.
 
-The full protocol rationale, wire format, and a reference receiver implementation live at the **[L8 spec](https://rjpruitt16.github.io/l8-protocol/)** (the same canonical spec [Aquifer](https://github.com/rjpruitt16/aquifer) follows), also served locally at `GET /l8-spec` for an agent/script with only network access to this instance. Set `L8_PRIVATE_KEY` for a stable identity across restarts, or let EZThrottle auto-generate one on first start.
+The full protocol rationale, wire format, and a reference receiver implementation live at the **[L8 spec](https://rjpruitt16.github.io/l8-protocol/)** (the same canonical spec [Aquifer](https://github.com/rjpruitt16/aquifer) follows), also served locally at `GET /l8-spec` for an agent/script with only network access to this instance. Set `L8_PRIVATE_KEY` for a stable identity across restarts, or let Spillway auto-generate one on first start.
 
-Two additions in 0.2. A receiver that publishes an X25519 `encryption_public_key` gets its webhook bodies encrypted to that key, then signed, so a proxy or log in the middle sees only ciphertext. An upstream that publishes `request_schemas` (JSON Schema per route) gets job bodies checked before dispatch: a mismatch is rejected with `422` instead of burning an upstream call. Schema checks are off unless `EZTHROTTLE_L8_SCHEMA_VALIDATION=true`; external `$ref`s are never fetched, and a new `X-Aqueduct-Schema-Hash` on an upstream response drops the cached schemas and the L8 trust so the handshake re-runs.
+Two additions in 0.2. A receiver that publishes an X25519 `encryption_public_key` gets its webhook bodies encrypted to that key, then signed, so a proxy or log in the middle sees only ciphertext. An upstream that publishes `request_schemas` (JSON Schema per route) gets job bodies checked before dispatch: a mismatch is rejected with `422` instead of burning an upstream call. Schema checks are off unless `SPILLWAY_L8_SCHEMA_VALIDATION=true`; external `$ref`s are never fetched, and a new `X-Aqueduct-Schema-Hash` on an upstream response drops the cached schemas and the L8 trust so the handshake re-runs.
 
 ---
 
@@ -399,15 +403,15 @@ make l8-test
 ## Docker
 
 ```bash
-docker build -t ezthrottle-local .
-docker run -p 4000:4000 ezthrottle-local
+docker build -t spillway .
+docker run -p 4000:4000 spillway
 ```
 
 ---
 
 ## Do not expose this directly to untrusted callers
 
-`POST /jobs` takes a `url` field and dispatches a real HTTP request to it. If an arbitrary or untrusted party can set that field, EZThrottle becomes an open relay/SSRF vector: it can be pointed at your internal network, cloud metadata endpoints (`169.254.169.254`), or anything else the machine it runs on can reach, using its own network position and identity. The intended caller is **your own trusted backend or gateway code**, dispatching to a specific microservice or third-party API it already knows about, not an agent, end user, or any other untrusted party choosing the destination itself. Run it on a private network or internal service mesh, not bound to a public address, and if agents need to reach it, put your own authorization and destination allow-listing in front rather than letting them call this API directly.
+`POST /jobs` takes a `url` field and dispatches a real HTTP request to it. If an arbitrary or untrusted party can set that field, Spillway becomes an open relay/SSRF vector: it can be pointed at your internal network, cloud metadata endpoints (`169.254.169.254`), or anything else the machine it runs on can reach, using its own network position and identity. The intended caller is **your own trusted backend or gateway code**, dispatching to a specific microservice or third-party API it already knows about, not an agent, end user, or any other untrusted party choosing the destination itself. Run it on a private network or internal service mesh, not bound to a public address, and if agents need to reach it, put your own authorization and destination allow-listing in front rather than letting them call this API directly.
 
 ---
 
@@ -439,7 +443,7 @@ For maximum queue capacity, use the largest available machine. A 32GB RAM machin
 
 ### Deploy to Kubernetes
 
-A fourth deployment shape alongside sidecar, standalone, and embedded library: EZThrottle Local as a normal Deployment, reached through a Gateway API proxy (Envoy Gateway) instead of a sidecar. See [`examples/kubernetes/`](examples/kubernetes/), verified end-to-end against a real `kind` cluster, including a real pod restart proving Mnesia durability survives it (requires a stable `RELEASE_NODE`, documented there).
+A fourth deployment shape alongside sidecar, standalone, and embedded library: Spillway as a normal Deployment, reached through a Gateway API proxy (Envoy Gateway) instead of a sidecar. See [`examples/kubernetes/`](examples/kubernetes/), verified end-to-end against a real `kind` cluster, including a real pod restart proving Mnesia durability survives it (requires a stable `RELEASE_NODE`, documented there).
 
 ### Scaling by partitioning
 
@@ -447,7 +451,7 @@ See [Partitioning strategies](#partitioning-strategies) above for how to assign 
 
 ### Zero-downtime updates
 
-EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloading. Updates to rate limiting logic, routing behavior, or configuration can be deployed to a running node without restarting the process, and the in-memory queue is preserved across deploys, with no jobs lost.
+Spillway is built on the BEAM (Erlang VM), which supports hot code reloading. Updates to rate limiting logic, routing behavior, or configuration can be deployed to a running node without restarting the process, and the in-memory queue is preserved across deploys, with no jobs lost.
 
 </details>
 
@@ -456,7 +460,17 @@ EZThrottle Local is built on the BEAM (Erlang VM), which supports hot code reloa
 ## Writing
 
 - [Eliminate GPU Waste by Cutting the Retry Tax](https://rahmipruitt.me/content/gpu-retry-tax/): the thesis behind [drain mode](#partitioning-strategies) and the ORCA fallback pacing [GPU benchmark](benchmark.md#6-gpu-inference-and-the-retry-tax-runpodvllm) above.
-- [GitHub Outages Show the Limits of Reactive Scaling](https://rahmipruitt.me/content/github-outage-reactive-scaling/): why reactive scaling and retry storms don't mix, the problem EZThrottle Local absorbs instead.
+- [GitHub Outages Show the Limits of Reactive Scaling](https://rahmipruitt.me/content/github-outage-reactive-scaling/): why reactive scaling and retry storms don't mix, the problem Spillway absorbs instead.
+
+## Upgrading from EZThrottle Local
+
+The project was renamed; behavior is unchanged.
+
+- **Environment variables** are now `SPILLWAY_*`. The old `EZTHROTTLE_*` names still work: at boot each is copied to its new name unless that is already set, and a line on stderr lists the ones still in use.
+- **Release and modules:** the release is `bin/spillway` and the OTP app is `:spillway`.
+- **Saved jobs** carry over. Mnesia stores each job tagged with its module name, and jobs saved under the old name are retagged at boot.
+- **Node name:** Mnesia's data on disk belongs to one node name. On Fly the name comes from the app name and doesn't change. Elsewhere it defaulted to `ezthrottle_local@<hostname>`; to keep data saved under that name, set `RELEASE_NODE=ezthrottle_local@<hostname>`.
+- **Wire headers are unchanged.** `X-EZTHROTTLE-*` request and response headers are shared with the managed EZThrottle service and its SDKs, and `X-Aqueduct-*` is the protocol both implementations speak.
 
 ## License
 

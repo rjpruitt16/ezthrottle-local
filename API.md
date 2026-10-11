@@ -18,7 +18,7 @@ Content-Type: application/json
 }
 ```
 
-`execute_before` is optional Unix time in milliseconds. EZThrottle checks it immediately before dispatch and before every retry. Work that has not started its next attempt by that time is never sent upstream; it becomes `failed` with reason `execution_deadline_exceeded`, remains pollable through the normal failed-result retention window, and emits the normal failed SSE/webhook event.
+`execute_before` is optional Unix time in milliseconds. Spillway checks it immediately before dispatch and before every retry. Work that has not started its next attempt by that time is never sent upstream; it becomes `failed` with reason `execution_deadline_exceeded`, remains pollable through the normal failed-result retention window, and emits the normal failed SSE/webhook event.
 
 **Response headers your API can return to control pacing:**
 
@@ -34,7 +34,7 @@ With `X-EZTHROTTLE-SLOW-START: true` (or `X-Aqueduct-Slow-Start`), a new queue s
 
 ### Fair queue admission
 
-Each upstream has a shared backlog budget `B`, defaulting to `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM=10000`. The upstream may update it with `X-Aqueduct-Max-Backlog` (or `X-EZThrottle-Max-Backlog`); `0` disables this count-based limit. For a prospective request in AccountQueue mode, let `q` be its queue's projected backlog, `Q` the projected upstream backlog, and `N` the projected number of active account queues:
+Each upstream has a shared backlog budget `B`, defaulting to `SPILLWAY_MAX_PENDING_PER_UPSTREAM=10000`. The upstream may update it with `X-Aqueduct-Max-Backlog` (or `X-EZThrottle-Max-Backlog`); `0` disables this count-based limit. For a prospective request in AccountQueue mode, let `q` be its queue's projected backlog, `Q` the projected upstream backlog, and `N` the projected number of active account queues:
 
 ```text
 F        = B / N
@@ -49,25 +49,25 @@ Accepted and fairness-rejected responses expose `X-Aqueduct-Active-Queues`, `X-A
 
 ### Region-local queue ownership
 
-EZThrottle Local uses libcluster for optional BEAM discovery and Syn for queue ownership. When `DNS_CLUSTER_QUERY` is set, connected nodes agree on one `AccountQueue` owner for each upstream and queue key; a request received by any node is routed to that owner before idempotency admission, persistence, and enqueueing. Pacing state and circuit-breaker changes are propagated between the upstream's URL actors. Without `DNS_CLUSTER_QUERY`, the same code path runs as a standalone one-node cluster.
+Spillway uses libcluster for optional BEAM discovery and Syn for queue ownership. When `DNS_CLUSTER_QUERY` is set, connected nodes agree on one `AccountQueue` owner for each upstream and queue key; a request received by any node is routed to that owner before idempotency admission, persistence, and enqueueing. Pacing state and circuit-breaker changes are propagated between the upstream's URL actors. Without `DNS_CLUSTER_QUERY`, the same code path runs as a standalone one-node cluster.
 
 This coordinates live processes; it does not turn each node's Mnesia directory into a replicated database. While the owning node is connected, job status and result calls route back to its local store. If that node is unavailable, its persisted jobs become available when it returns and performs normal recovery. Configure Mnesia replication separately if the deployment requires another node to serve that data during the owner's outage. Mnesia also binds its on-disk schema to the Erlang node name, so every clustered machine must retain the same node name when reusing its volume.
 
 | Environment variable | Default | Effect |
 |---|---:|---|
 | `DNS_CLUSTER_QUERY` | unset | Enables libcluster DNS polling; all nodes must share their distribution cookie and node-name basename. Fly deployments remain stable singletons unless this is explicitly set |
-| `EZTHROTTLE_CLUSTER_NODE_BASENAME` | release node basename | Overrides the basename libcluster uses for discovered node names |
-| `EZTHROTTLE_CLUSTER_POLL_INTERVAL_MS` | `5000` | DNS discovery interval |
-| `EZTHROTTLE_MAX_PENDING_PER_USER` | `10000` | Maximum queued plus in-flight jobs for one user in an account queue; `0` disables the ceiling |
-| `EZTHROTTLE_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
+| `SPILLWAY_CLUSTER_NODE_BASENAME` | release node basename | Overrides the basename libcluster uses for discovered node names |
+| `SPILLWAY_CLUSTER_POLL_INTERVAL_MS` | `5000` | DNS discovery interval |
+| `SPILLWAY_MAX_PENDING_PER_USER` | `10000` | Maximum queued plus in-flight jobs for one user in an account queue; `0` disables the ceiling |
+| `SPILLWAY_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
 
 The per-user ceiling rejects only new client work with `429` and `limit_reason: "user_queue"`; duplicates are still returned normally. Internal webhook deliveries and startup recovery bypass it so admission pressure cannot discard already-accepted work.
 
 ### Shared idempotency scope and request schemas
 
-`"idempotency_scope": "shared"` (requires `EZTHROTTLE_SHARED_IDEMPOTENCY_ENABLED=true`, otherwise `400`) dedups on `idempotent_key` across every `user_id`, so concurrent callers coalesce onto one job. Followers receive `200 + "duplicate": true` with the existing `job_id`; on `/proxy` they are streamed that job.
+`"idempotency_scope": "shared"` (requires `SPILLWAY_SHARED_IDEMPOTENCY_ENABLED=true`, otherwise `400`) dedups on `idempotent_key` across every `user_id`, so concurrent callers coalesce onto one job. Followers receive `200 + "duplicate": true` with the existing `job_id`; on `/proxy` they are streamed that job.
 
-With `EZTHROTTLE_L8_SCHEMA_VALIDATION=true`, a `url`-routed job whose upstream publishes L8 0.2 `request_schemas` for its method and path is validated before it is queued. A mismatch returns **422**:
+With `SPILLWAY_L8_SCHEMA_VALIDATION=true`, a `url`-routed job whose upstream publishes L8 0.2 `request_schemas` for its method and path is validated before it is queued. A mismatch returns **422**:
 
 ```json
 {
@@ -115,7 +115,7 @@ Content-Type: application/json
 
 ### Cross-region redirect (Fly.io)
 
-If `EZTHROTTLE_FLY_REGIONS` is set, an `upstream_unreachable` fallback, or an `upstream_overloaded`/`domain_degraded` fallback specifically classified as reroute-eligible (see `X-Aqueduct-Reroute-Codes` above — `503` by default, not every overload), tries other regions this app is deployed to — live, over Fly's private network — before falling back to this instance's own local queue. Off by default; unset, `/proxy` behaves exactly as described above with zero change. Direct port of Aquifer's own cross-region redirect (see [Aquifer's API.md](https://github.com/rjpruitt16/aquifer/blob/main/API.md#post-proxy)), kept in sync feature-for-feature.
+If `SPILLWAY_FLY_REGIONS` is set, an `upstream_unreachable` fallback, or an `upstream_overloaded`/`domain_degraded` fallback specifically classified as reroute-eligible (see `X-Aqueduct-Reroute-Codes` above — `503` by default, not every overload), tries other regions this app is deployed to — live, over Fly's private network — before falling back to this instance's own local queue. Off by default; unset, `/proxy` behaves exactly as described above with zero change. Direct port of Aquifer's own cross-region redirect (see [Aquifer's API.md](https://github.com/rjpruitt16/aquifer/blob/main/API.md#post-proxy)), kept in sync feature-for-feature.
 
 When it triggers: every known-live region is tried for a fast direct success first, nearest (lowest measured round-trip time from the same health check that determines a region is live — Fly doesn't publish a region distance/latency table, so this doubles as the only real proximity signal available) first, except that two callers racing the same job always try one particular region first regardless of latency, so they tend to converge on the same region rather than each racing off after their own nearest option. If none can serve it directly, that same region is the one chosen to accept it into its own durable queue, and its live event stream is relayed back onto your original connection, so you see one continuous stream regardless of which region actually ends up handling the job.
 
@@ -123,15 +123,15 @@ A reroute is never silent to the caller — same principle as `proxy_fallback` a
 - **Direct success via redirect:** the response carries an `X-Aquifer-Served-By-Region` header naming which region actually served it, alongside the relayed status/headers/body.
 - **Queued on another region:** before relaying that region's own stream, origin fires `event: rerouted`, `data: {"region"}` — arriving *before* that region's own `proxy_fallback`/`queued`/`dispatching` sequence, the same ordering `proxy_fallback` itself already uses relative to `queued`.
 
-If literally no known-live region can help either — none live at all, or every one tried and failed — the request is **rejected**, not queued locally: **429**, `Retry-After` set to `EZTHROTTLE_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` (default 900 — a real regional outage, not a transient blip), `limit_reason: "redirect_exhausted"`, same response shape as an admission-control rejection. Queueing locally instead was never actually decided, so the default is to fail loudly rather than have the request land unnoticed on one struggling instance's queue. Separate from `EZTHROTTLE_REDIRECT_GATE_COOLDOWN_SECONDS` (default 500) — that one is purely internal probe-retry throttling, not what's told to the caller.
+If literally no known-live region can help either — none live at all, or every one tried and failed — the request is **rejected**, not queued locally: **429**, `Retry-After` set to `SPILLWAY_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` (default 900 — a real regional outage, not a transient blip), `limit_reason: "redirect_exhausted"`, same response shape as an admission-control rejection. Queueing locally instead was never actually decided, so the default is to fail loudly rather than have the request land unnoticed on one struggling instance's queue. Separate from `SPILLWAY_REDIRECT_GATE_COOLDOWN_SECONDS` (default 500) — that one is purely internal probe-retry throttling, not what's told to the caller.
 
 **Honest limitation, not silently glossed over:** this instance's idempotency check remains per-instance (Mnesia), unchanged by this feature. If the exact same `idempotent_key` is independently submitted to two different regions at nearly the same moment (a real scenario — a caller's own client retrying after a timeout can land on a different region via Fly's anycast), each region may independently begin its own redirect tour, and in rare cases the job could end up durably queued in two places. The deterministic region selection above narrows this window but does not close it. During cross-region redirect specifically, treat delivery as at-least-once, not exactly-once.
 
 ## GET /websocket
 
-WebSocket proxying with an ordered Mnesia transcript, cursor replay, paced upstream connection admission, and automatic reconnect. This is the same `aqueduct.v1` wire contract Aquifer exposes. EZThrottle Local does **not** authenticate callers or choose their destination; put it behind a trusted gateway that authenticates the request and injects the upstream URL.
+WebSocket proxying with an ordered Mnesia transcript, cursor replay, paced upstream connection admission, and automatic reconnect. This is the same `aqueduct.v1` wire contract Aquifer exposes. Spillway does **not** authenticate callers or choose their destination; put it behind a trusted gateway that authenticates the request and injects the upstream URL.
 
-WebSockets are enabled by default because Mnesia is already part of EZThrottle Local. `EZTHROTTLE_WS_ENABLED=false` is an operational kill switch.
+WebSockets are enabled by default because Mnesia is already part of Spillway. `SPILLWAY_WS_ENABLED=false` is an operational kill switch.
 
 ### Handshake
 
@@ -144,9 +144,9 @@ Authorization: Bearer gateway-authenticated-identity
 X-Aqueduct-Upstream-URL: wss://backend.internal/socket
 ```
 
-`session_id` identifies the session's transcript. `after` is the last stream ID the client processed and defaults to `0-0`. EZThrottle replays backend messages after that cursor before following live events. A cursor older than retained history returns **409** instead of silently skipping data.
+`session_id` identifies the session's transcript. `after` is the last stream ID the client processed and defaults to `0-0`. Spillway replays backend messages after that cursor before following live events. A cursor older than retained history returns **409** instead of silently skipping data.
 
-The trusted upstream URL must be absolute `ws://` or `wss://`. When `EZTHROTTLE_ALLOWED_URL_DOMAINS` is set, its comma-separated hosts are enforced as an allowlist. Gateway headers such as `Authorization` are forwarded; hop-by-hop and internal Aqueduct/Aquifer headers are stripped, and `X-Aqueduct-Session-ID` is injected upstream.
+The trusted upstream URL must be absolute `ws://` or `wss://`. When `SPILLWAY_ALLOWED_URL_DOMAINS` is set, its comma-separated hosts are enforced as an allowlist. Gateway headers such as `Authorization` are forwarded; hop-by-hop and internal Aqueduct/Aquifer headers are stripped, and `X-Aqueduct-Session-ID` is injected upstream.
 
 ### Messages
 
@@ -156,7 +156,7 @@ Every application message is a JSON `aqueduct.v1` envelope. Raw frames are not s
 {"type":"command","message_id":"command-42","payload":{"action":"start"}}
 ```
 
-The client must keep `message_id` stable across retries. EZThrottle persists the command before forwarding it and confirms that write:
+The client must keep `message_id` stable across retries. Spillway persists the command before forwarding it and confirms that write:
 
 ```json
 {"type":"command_recorded","message_id":"command-42","stream_id":"1798053731000-1"}
@@ -169,13 +169,13 @@ Backend acknowledgements and events use the same shapes as Aquifer:
 {"type":"event","message_id":"event-43","caused_by":"command-42","payload":{"state":"running"}}
 ```
 
-Every backend `ack` or `event` is persisted before client delivery. `caused_by` permits one command to produce zero, one, or many events. Delivery after cursor reconnect is at least once. After an ambiguous upstream disconnect, persisted commands are not automatically replayed because EZThrottle cannot know whether the backend acted before the socket disappeared; backend actions must be idempotent by `message_id`.
+Every backend `ack` or `event` is persisted before client delivery. `caused_by` permits one command to produce zero, one, or many events. Delivery after cursor reconnect is at least once. After an ambiguous upstream disconnect, persisted commands are not automatically replayed because Spillway cannot know whether the backend acted before the socket disappeared; backend actions must be idempotent by `message_id`.
 
 Live, non-durable status envelopes report `replaying`, `replay_complete`, `waiting`, `connecting`, `connected`, and `reconnecting`. Waiting messages include the current FIFO `position`; reconnecting messages include `retry_after_ms`.
 
 ### Capacity and retention
 
-Connection ceilings and slow start are local to one EZThrottle process. A backend can lower this process's ceiling or opening rate through successful-handshake headers:
+Connection ceilings and slow start are local to one Spillway process. A backend can lower this process's ceiling or opening rate through successful-handshake headers:
 
 ```http
 X-Aqueduct-WS-Max-Connections: 250
@@ -188,41 +188,41 @@ It may update either limit on an established connection using `{"type":"aqueduct
 
 Neither direction buffers without bound:
 
-- **Client to backend.** EZThrottle reads a client's next message only after recording the previous one, so a client that sends faster than messages can be recorded is slowed down by TCP.
-- **Backend to client.** EZThrottle reads the backend socket one chunk at a time and reads the next chunk only after the current one's events are recorded. A backend that sends faster than events can be recorded is slowed down by TCP instead of filling memory.
-- **Slow clients.** Each client has at most `EZTHROTTLE_WS_CLIENT_BUFFER` events queued for it and not yet written to its socket. A client at that limit stops receiving live events and later reads what it missed from the transcript, as a reconnecting client would. If it falls further behind than the transcript retains, it is closed with code 1011 and gets **409** when it reconnects.
+- **Client to backend.** Spillway reads a client's next message only after recording the previous one, so a client that sends faster than messages can be recorded is slowed down by TCP.
+- **Backend to client.** Spillway reads the backend socket one chunk at a time and reads the next chunk only after the current one's events are recorded. A backend that sends faster than events can be recorded is slowed down by TCP instead of filling memory.
+- **Slow clients.** Each client has at most `SPILLWAY_WS_CLIENT_BUFFER` events queued for it and not yet written to its socket. A client at that limit stops receiving live events and later reads what it missed from the transcript, as a reconnecting client would. If it falls further behind than the transcript retains, it is closed with code 1011 and gets **409** when it reconnects.
 
-New handshakes are refused with **429** when `EZTHROTTLE_MEMORY_LIMIT_MB` or the database size limit is exceeded, with the same body and `Retry-After` as job admission.
+New handshakes are refused with **429** when `SPILLWAY_MEMORY_LIMIT_MB` or the database size limit is exceeded, with the same body and `Retry-After` as job admission.
 
-Transcripts retain the newest configured events and expire after an idle TTL. They are held in memory, so the node also caps their total size: `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` when set; otherwise whatever room the rest of the node leaves under a memory target (90% of `EZTHROTTLE_MEMORY_LIMIT_MB`, or 40% of the machine's memory), and never more than a quarter of memory. The budget shrinks as the rest of the node's memory grows. While transcripts are over that budget, each session keeps an equal share of it (at least 10 events), so the largest transcripts lose their oldest events first. A client whose cursor was trimmed gets **409** on reconnect. `GET /health` reports `transcript_mb`, `transcript_budget_mb` and the current `session_event_limit` under `websocket`. Mnesia uses the same `EZTHROTTLE_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
+Transcripts retain the newest configured events and expire after an idle TTL. They are held in memory, so the node also caps their total size: `SPILLWAY_WS_TRANSCRIPT_MAX_MB` when set; otherwise whatever room the rest of the node leaves under a memory target (90% of `SPILLWAY_MEMORY_LIMIT_MB`, or 40% of the machine's memory), and never more than a quarter of memory. The budget shrinks as the rest of the node's memory grows. While transcripts are over that budget, each session keeps an equal share of it (at least 10 events), so the largest transcripts lose their oldest events first. A client whose cursor was trimmed gets **409** on reconnect. `GET /health` reports `transcript_mb`, `transcript_budget_mb` and the current `session_event_limit` under `websocket`. Mnesia uses the same `SPILLWAY_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
 
 #### What the transcript guarantees
 
 The transcript is a **replay window**, not a durable log. It is built for reconnects: a client that drops and comes back within the window gets everything it missed, in order.
 
 - **Guaranteed:** every message is recorded before it is forwarded or delivered, and a client that reconnects with a cursor still inside the window receives every backend event after it, in order, at least once.
-- **Not guaranteed:** history older than the window. The window shrinks under load: per-session retention, the TTL, and the node's transcript budget all trim the oldest events. A client whose cursor points before them is closed or gets **409** and must resynchronize from your application's own state. EZThrottle never skips events silently, but it does not keep them forever.
+- **Not guaranteed:** history older than the window. The window shrinks under load: per-session retention, the TTL, and the node's transcript budget all trim the oldest events. A client whose cursor points before them is closed or gets **409** and must resynchronize from your application's own state. Spillway never skips events silently, but it does not keep them forever.
 - **Storage is this node's Mnesia,** in memory with a disk copy. It survives a restart of the node, not the loss of its disk, and it is not replicated across nodes.
 
 If you need every message kept beyond the window (audit, analytics, replay from the beginning), record it in your own durable store from the backend, or follow the durable-transcript extension in the issue tracker.
 
 | Environment variable | Default |
 |---|---:|
-| `EZTHROTTLE_WS_ENABLED` | `true` |
-| `EZTHROTTLE_WS_STREAM_MAX_EVENTS` | `10000` |
-| `EZTHROTTLE_WS_STREAM_TTL_SECONDS` | `86400` |
-| `EZTHROTTLE_WS_TRANSCRIPT_MAX_MB` | derived from memory |
-| `EZTHROTTLE_WS_READ_BATCH` | `100` |
-| `EZTHROTTLE_WS_CLIENT_BUFFER` | `256` |
-| `EZTHROTTLE_WS_MAX_MESSAGE_BYTES` | `1048576` |
-| `EZTHROTTLE_WS_HANDSHAKE_TIMEOUT_SECONDS` | `10` |
-| `EZTHROTTLE_WS_RECONNECT_MAX_SECONDS` | `30` |
-| `EZTHROTTLE_WS_IDLE_TIMEOUT_SECONDS` | `30` |
-| `EZTHROTTLE_WS_MAX_CLIENT_CONNECTIONS` | `1000` |
-| `EZTHROTTLE_WS_MAX_UPSTREAM_CONNECTIONS` | `1000` |
-| `EZTHROTTLE_WS_MAX_WAITING_CONNECTIONS` | `1000` |
-| `EZTHROTTLE_WS_CONNECT_RPS` | `20` |
-| `EZTHROTTLE_WS_SLOW_START_RPS` | `1` |
+| `SPILLWAY_WS_ENABLED` | `true` |
+| `SPILLWAY_WS_STREAM_MAX_EVENTS` | `10000` |
+| `SPILLWAY_WS_STREAM_TTL_SECONDS` | `86400` |
+| `SPILLWAY_WS_TRANSCRIPT_MAX_MB` | derived from memory |
+| `SPILLWAY_WS_READ_BATCH` | `100` |
+| `SPILLWAY_WS_CLIENT_BUFFER` | `256` |
+| `SPILLWAY_WS_MAX_MESSAGE_BYTES` | `1048576` |
+| `SPILLWAY_WS_HANDSHAKE_TIMEOUT_SECONDS` | `10` |
+| `SPILLWAY_WS_RECONNECT_MAX_SECONDS` | `30` |
+| `SPILLWAY_WS_IDLE_TIMEOUT_SECONDS` | `30` |
+| `SPILLWAY_WS_MAX_CLIENT_CONNECTIONS` | `1000` |
+| `SPILLWAY_WS_MAX_UPSTREAM_CONNECTIONS` | `1000` |
+| `SPILLWAY_WS_MAX_WAITING_CONNECTIONS` | `1000` |
+| `SPILLWAY_WS_CONNECT_RPS` | `20` |
+| `SPILLWAY_WS_SLOW_START_RPS` | `1` |
 
 Handshake errors match Aquifer: **400** for invalid protocol/session/upstream input, **409** for a replay gap, and **429** for the local client ceiling or admission limits. `GET /health` exposes the local client, waiting, active-upstream, configured, ramp, and effective limits under `websocket`.
 

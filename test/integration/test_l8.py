@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-L8 protocol integration tests for ezthrottle-local.
+L8 protocol integration tests for spillway.
 
 Requires the 'cryptography' package: pip install cryptography
 
 Three cases:
-  1. Handshake    — ezthrottle-local completes the challenge with the L8 receiver
+  1. Handshake    — spillway completes the challenge with the L8 receiver
   2. Signed delivery — webhook arrives with valid X-L8-Signature
-  3. Signature valid — verify sig against ezthrottle-local's public key from /.well-known/l8
+  3. Signature valid — verify sig against spillway's public key from /.well-known/l8
 """
 import base64
 import hashlib
@@ -26,7 +26,7 @@ except ImportError:
     print("ERROR: 'cryptography' package required. Run: pip install cryptography")
     sys.exit(1)
 
-EZTHROTTLE_URL = os.getenv("EZTHROTTLE_URL", "http://localhost:4000")
+SPILLWAY_URL = os.getenv("SPILLWAY_URL", "http://localhost:4000")
 TARGET_URL     = os.getenv("TARGET_URL",     "http://localhost:9090/health")
 RECEIVER_URL   = os.getenv("RECEIVER_URL",   "http://localhost:9001")
 
@@ -58,7 +58,7 @@ def submit_job():
         "headers":        {},
         "webhook_url":    f"{RECEIVER_URL}/webhook",
     }
-    r = requests.post(f"{EZTHROTTLE_URL}/jobs", json=payload, timeout=5)
+    r = requests.post(f"{SPILLWAY_URL}/jobs", json=payload, timeout=5)
     r.raise_for_status()
     return r.json()["job_id"]
 
@@ -75,8 +75,8 @@ def wait_for_delivery(job_id, timeout=20):
     return None
 
 
-def ezthrottle_public_key() -> str:
-    r = requests.get(f"{EZTHROTTLE_URL}/.well-known/l8", timeout=5)
+def spillway_public_key() -> str:
+    r = requests.get(f"{SPILLWAY_URL}/.well-known/l8", timeout=5)
     r.raise_for_status()
     return r.json()["public_key"]
 
@@ -100,9 +100,9 @@ def verify_l8_signature(pub_b64: str, body: bytes, headers: dict) -> bool:
 # ---- Test 1: /.well-known/l8 endpoint ----------------------------------------
 
 def test_well_known_l8():
-    print("\nTest 1: ezthrottle-local exposes /.well-known/l8")
+    print("\nTest 1: spillway exposes /.well-known/l8")
     try:
-        r = requests.get(f"{EZTHROTTLE_URL}/.well-known/l8", timeout=5)
+        r = requests.get(f"{SPILLWAY_URL}/.well-known/l8", timeout=5)
     except Exception as e:
         fail("/.well-known/l8 reachable", str(e))
         return
@@ -175,13 +175,13 @@ def test_signature_valid():
         fail("has signature to verify", "no X-L8-Signature header (run test 2 first to establish trust)")
         return
 
-    ezthrottle_pub = ezthrottle_public_key()
+    spillway_pub = spillway_public_key()
     raw_body = base64.b64decode(entry.get("raw_body", ""))
 
-    if verify_l8_signature(ezthrottle_pub, raw_body, l8_headers):
-        ok("signature verifies against ezthrottle-local's public key")
+    if verify_l8_signature(spillway_pub, raw_body, l8_headers):
+        ok("signature verifies against spillway's public key")
     else:
-        fail("signature verifies against ezthrottle-local's public key",
+        fail("signature verifies against spillway's public key",
              "verification failed — signature mismatch or wrong public key")
 
 
@@ -189,7 +189,7 @@ def test_signature_valid():
 
 def test_health_advertises_l8():
     print("\nTest 4: /health advertises L8 protocol version")
-    r = requests.get(f"{EZTHROTTLE_URL}/health", timeout=5)
+    r = requests.get(f"{SPILLWAY_URL}/health", timeout=5)
     data = r.json()
 
     if data.get("l8_protocol") == "0.2":
@@ -232,7 +232,7 @@ def test_encrypted_delivery():
     else:
         ok("body is ciphertext")
 
-    if verify_l8_signature(ezthrottle_public_key(), raw_body, l8_headers):
+    if verify_l8_signature(spillway_public_key(), raw_body, l8_headers):
         ok("signature covers the ciphertext")
     else:
         fail("signature covers the ciphertext", "verification failed")
@@ -246,8 +246,8 @@ def test_encrypted_delivery():
 # ---- Main --------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"L8 protocol tests — ezthrottle-local")
-    print(f"  ezthrottle: {EZTHROTTLE_URL}")
+    print(f"L8 protocol tests — spillway")
+    print(f"  spillway: {SPILLWAY_URL}")
     print(f"  Target:     {TARGET_URL}")
     print(f"  Receiver:   {RECEIVER_URL}")
 

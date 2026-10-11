@@ -18,7 +18,7 @@ import uuid
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 1000
     prefix = sys.argv[2] if len(sys.argv) > 2 else "bench"
-    base_url = sys.argv[3] if len(sys.argv) > 3 else "https://ezthrottle-local.fly.dev"
+    base_url = sys.argv[3] if len(sys.argv) > 3 else "https://spillway.fly.dev"
 
     for _ in range(n):
         body = {

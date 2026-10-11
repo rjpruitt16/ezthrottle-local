@@ -1,6 +1,6 @@
 # AGENTS.md
 
-ezthrottle-local is the Elixir/Phoenix sibling of Aquifer: the same job API, pacing headers, `POST /proxy`, drain mode, and L8, built on OTP (GenServers, Mnesia, Syn). Many modules say "mirrors Aquifer's X"; when porting, read the Aquifer file first.
+spillway is the Elixir/Phoenix sibling of Aquifer: the same job API, pacing headers, `POST /proxy`, drain mode, and L8, built on OTP (GenServers, Mnesia, Syn). Many modules say "mirrors Aquifer's X"; when porting, read the Aquifer file first.
 
 ## Related repos
 
@@ -9,12 +9,12 @@ These repos are developed together and are usually cloned as siblings under one 
 | Repo | Local path | GitHub | Role |
 |---|---|---|---|
 | aquifer | `../aquifer` | https://github.com/rjpruitt16/aquifer | Go load balancer for agentic workloads; reference implementation |
-| ezthrottle-local | `../ezthrottle-local` | https://github.com/rjpruitt16/ezthrottle-local | Elixir/Phoenix sibling of Aquifer; kept feature-for-feature in sync |
+| spillway | `../spillway` | https://github.com/rjpruitt16/spillway | Elixir/Phoenix sibling of Aquifer; kept feature-for-feature in sync |
 | l8-protocol | `../l8-protocol` | https://github.com/rjpruitt16/l8-protocol | L8 spec (`index.md`, `spec.json`): handshake, signing, encryption, request schemas |
-| aqueduct-runner | `../aqueduct-runner` | https://github.com/rjpruitt16/aqueduct-runner | Cross-repo contract tests (Dagger + Hurl) run against real Aquifer and ezthrottle-local containers |
-| canalis-rs | `../canalis-rs` | https://github.com/rjpruitt16/canalis-rs | Rust control plane for Aquifer/ezthrottle-local fleets |
+| aqueduct-runner | `../aqueduct-runner` | https://github.com/rjpruitt16/aqueduct-runner | Cross-repo contract tests (Dagger + Hurl) run against real Aquifer and spillway containers |
+| canalis-rs | `../canalis-rs` | https://github.com/rjpruitt16/canalis-rs | Rust control plane for Aquifer/spillway fleets |
 
-Shared contracts that must stay identical across Aquifer and ezthrottle-local: `X-Aqueduct-*` request/response headers, job JSON shape, idempotency hashing (`sha256(user_id + ":" + key)`, or `sha256("shared\0" + key)` for `idempotency_scope: "shared"`), drain ledger events, `POST /proxy` direct-then-fallback behavior, and L8. A change to any of these in one repo needs the matching change in the other, an update to `l8-protocol` if it touches L8, and ideally a contract test in `aqueduct-runner`.
+Shared contracts that must stay identical across Aquifer and spillway: `X-Aqueduct-*` request/response headers, job JSON shape, idempotency hashing (`sha256(user_id + ":" + key)`, or `sha256("shared\0" + key)` for `idempotency_scope: "shared"`), drain ledger events, `POST /proxy` direct-then-fallback behavior, and L8. A change to any of these in one repo needs the matching change in the other, an update to `l8-protocol` if it touches L8, and ideally a contract test in `aqueduct-runner`.
 
 ## Commands
 
@@ -25,9 +25,9 @@ Shared contracts that must stay identical across Aquifer and ezthrottle-local: `
 
 ## Where things live
 
-- `lib/ezthrottle_local/job.ex` (`Job.new/1`), `idempotent_store.ex` (`hash_key/1`, Mnesia tables), `account_queue.ex` (`make_request/6`, the upstream dispatch path), `proxy.ex`, `webhook.ex`.
-- `lib/ezthrottle_local/l8.ex` and `l8/schemas.ex`: L8 handshake, signing, encryption, request schemas.
-- `lib/ezthrottle_local_web/controllers/job_controller.ex`: HTTP glue for `/jobs` and `/proxy`.
+- `lib/spillway/job.ex` (`Job.new/1`), `idempotent_store.ex` (`hash_key/1`, Mnesia tables), `account_queue.ex` (`make_request/6`, the upstream dispatch path), `proxy.ex`, `webhook.ex`.
+- `lib/spillway/l8.ex` and `l8/schemas.ex`: L8 handshake, signing, encryption, request schemas.
+- `lib/spillway_web/controllers/job_controller.ex`: HTTP glue for `/jobs` and `/proxy`.
 - Cluster routing: a request goes to the Syn owner of its (upstream, account queue) before idempotency admission; the account queue key is derived from `user_id`.
 
 ## Conventions
