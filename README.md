@@ -474,6 +474,6 @@ The project was renamed; behavior is unchanged.
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE). Releases before this change were MIT.
 
 Built by [Rahmi Pruitt](https://rahmipruitt.me). Open to AI infra consulting, founding engineer, and contract work.
