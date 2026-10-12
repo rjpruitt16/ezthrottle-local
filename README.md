@@ -295,7 +295,7 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 
 | Env var | Default | Description |
 |---|---|---|
-| `SPILLWAY_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once BEAM's total memory exceeds this many MB |
+| `SPILLWAY_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once the process's resident memory exceeds this many MB. Past 70% of it (VM memory), the oldest finished jobs are evicted before their retention ends; queued jobs never are. Finished jobs live in RAM, so set this on any instance with a high job rate. |
 | `SPILLWAY_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
 | `SPILLWAY_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |
 | `SPILLWAY_MAX_PENDING_PER_USER` | `10000` | Reject new client work for one user once its queued plus in-flight jobs reach this ceiling; `0` disables it |

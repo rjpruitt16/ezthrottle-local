@@ -37,6 +37,21 @@ defmodule Spillway.IdempotentStore do
   @drain_sequence_table :drain_sequence
   @cleanup_interval_ms 60_000
 
+  # Finished jobs are kept for their retention (30 minutes completed, 2
+  # hours failed), and these tables live in RAM, so at a high enough job
+  # rate retention alone outgrows the machine. When the VM's memory passes
+  # @evict_at_pct of SPILLWAY_MEMORY_LIMIT_MB, each check evicts the oldest
+  # @evict_fraction of finished jobs, early. Queued and in-flight jobs are
+  # never evicted. The VM's own count is used here, not resident memory: it
+  # drops as soon as rows are deleted, so eviction stops once it has freed
+  # enough, while resident memory can stay high after the allocator frees.
+  # Resident memory runs up to ~1.4x the VM count, so 70% keeps it under
+  # the limit admission enforces.
+  @memory_check_interval_ms 5_000
+  @evict_at_pct 70
+  @evict_fraction 0.1
+  @evict_chunk 500
+
   # SPILLWAY_MNESIA_FLUSH_INTERVAL_MS controls the durability/throughput
   # trade-off directly: 0 means flush every single write synchronously
   # inline (zero data loss ever, but a real disk-flush cost on every
@@ -287,6 +302,7 @@ defmodule Spillway.IdempotentStore do
 
         :mnesia.delete({@jobs_table, job.id})
         :mnesia.delete({@results_table, job.id})
+        :mnesia.delete({@delivery_table, job.id})
         :mnesia.delete({@keys_table, hashed})
         old_status
       end)
@@ -648,7 +664,9 @@ defmodule Spillway.IdempotentStore do
     create_key_gate()
     seed_counts()
     register_existing_job_owners()
-    schedule_cleanup()
+    # Rows that expired while the node was down go now, not a minute in.
+    send(self(), :cleanup)
+    schedule_memory_check()
     schedule_flush()
     {:ok, %{}}
   end
@@ -701,16 +719,29 @@ defmodule Spillway.IdempotentStore do
       gate_release(hashed, job_id)
     end)
 
-    @jobs_table
-    |> delete_matching(key_and_job_spec)
-    |> Enum.each(fn {@jobs_table, job_id, _job, _expires_at, status} ->
+    expired_jobs = delete_matching(@jobs_table, key_and_job_spec)
+
+    Enum.each(expired_jobs, fn {@jobs_table, job_id, _job, _expires_at, status} ->
       count_delete(status)
       unregister_job_owner_local(job_id)
+    end)
+
+    # Delivery modes have no expiry of their own; they go with their job.
+    :mnesia.transaction(fn ->
+      Enum.each(expired_jobs, fn {@jobs_table, job_id, _, _, _} ->
+        :mnesia.delete({@delivery_table, job_id})
+      end)
     end)
 
     delete_matching(@results_table, result_spec)
 
     schedule_cleanup()
+    {:noreply, state}
+  end
+
+  def handle_info(:check_memory, state) do
+    enforce_memory_budget()
+    schedule_memory_check()
     {:noreply, state}
   end
 
@@ -910,5 +941,94 @@ defmodule Spillway.IdempotentStore do
 
   defp schedule_cleanup do
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+  end
+
+  defp schedule_memory_check do
+    Process.send_after(self(), :check_memory, @memory_check_interval_ms)
+  end
+
+  @doc false
+  # Evicts the oldest finished jobs when the VM's memory is past
+  # @evict_at_pct of SPILLWAY_MEMORY_LIMIT_MB. Off when the limit is unset.
+  # Returns how many jobs it evicted.
+  def enforce_memory_budget do
+    limit = Spillway.Admission.memory_limit_mb()
+
+    if limit > 0 and Spillway.MemoryUsage.vm_mb() * 100 > limit * @evict_at_pct do
+      finished = finished_job_count()
+      n = max(1, ceil(finished * @evict_fraction))
+      evicted = evict_finished(n)
+
+      if evicted > 0 do
+        Logger.warning(
+          "[IdempotentStore] memory past #{@evict_at_pct}% of SPILLWAY_MEMORY_LIMIT_MB: " <>
+            "evicted the #{evicted} oldest of #{finished} finished jobs before their retention ended"
+        )
+      end
+
+      evicted
+    else
+      0
+    end
+  end
+
+  @doc false
+  # Deletes the n finished (completed or failed) jobs whose retention ends
+  # soonest, with their results, delivery modes and idempotency keys.
+  def evict_finished(n) when n > 0 do
+    @jobs_table
+    |> :mnesia.dirty_select([
+      {{@jobs_table, :"$1", :_, :"$2", :"$3"},
+       [{:orelse, {:==, :"$3", :completed}, {:==, :"$3", :failed}}], [{{:"$2", :"$1"}}]}
+    ])
+    |> Enum.sort()
+    |> Enum.take(n)
+    |> Enum.chunk_every(@evict_chunk)
+    |> Enum.reduce(0, fn chunk, total -> total + evict_chunk(chunk) end)
+  end
+
+  def evict_finished(_n), do: 0
+
+  defp evict_chunk(chunk) do
+    {:atomic, evicted} =
+      :mnesia.transaction(fn ->
+        Enum.flat_map(chunk, fn {_expires_at, job_id} ->
+          case :mnesia.read(@jobs_table, job_id) do
+            [{@jobs_table, ^job_id, job, _expires_at, status}]
+            when status in [:completed, :failed] ->
+              hashed = hash_key(job)
+              :mnesia.delete({@jobs_table, job_id})
+              :mnesia.delete({@results_table, job_id})
+              :mnesia.delete({@delivery_table, job_id})
+
+              # A newer job may own the key by now; only drop it if it's ours.
+              case :mnesia.read(@keys_table, hashed) do
+                [{@keys_table, ^hashed, ^job_id, _, _}] -> :mnesia.delete({@keys_table, hashed})
+                _ -> :ok
+              end
+
+              [{job_id, hashed, status}]
+
+            _ ->
+              []
+          end
+        end)
+      end)
+
+    Enum.each(evicted, fn {job_id, hashed, status} ->
+      gate_release(hashed, job_id)
+      count_delete(status)
+      unregister_job_owner_local(job_id)
+    end)
+
+    length(evicted)
+  end
+
+  defp finished_job_count do
+    :mnesia.dirty_select(@jobs_table, [
+      {{@jobs_table, :_, :_, :_, :"$1"},
+       [{:orelse, {:==, :"$1", :completed}, {:==, :"$1", :failed}}], [true]}
+    ])
+    |> length()
   end
 end
