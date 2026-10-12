@@ -295,6 +295,7 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 
 | Env var | Default | Description |
 |---|---|---|
+| `SPILLWAY_STORAGE` | `ram` | `rocksdb` keeps jobs, results and idempotency keys in RocksDB (via `mnesia_rocksdb`) instead of RAM: memory stops growing with how many jobs are retained, and a restart doesn't reload them all. `ram` is faster for small stores. Switching converts existing tables at boot. |
 | `SPILLWAY_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once the process's resident memory exceeds this many MB. Past 70% of it (VM memory), the oldest finished jobs are evicted before their retention ends; queued jobs never are. Finished jobs live in RAM, so set this on any instance with a high job rate. |
 | `SPILLWAY_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
 | `SPILLWAY_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |

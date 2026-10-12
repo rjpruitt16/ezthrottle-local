@@ -81,9 +81,48 @@ defmodule Spillway.MemoryEvictionTest do
 
     # Any running VM is past 70% of 1 MB.
     System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "1")
-    assert IdempotentStore.enforce_memory_budget() == 1
-    assert IdempotentStore.get_job(done.id) == nil
+
+    if IdempotentStore.storage() == "rocksdb" do
+      # Finished jobs aren't in RAM, so nothing is evicted.
+      assert IdempotentStore.enforce_memory_budget() == 0
+      assert IdempotentStore.get_job(done.id)
+    else
+      assert IdempotentStore.enforce_memory_budget() == 1
+      assert IdempotentStore.get_job(done.id) == nil
+    end
+
     assert IdempotentStore.get_job(queued.id)
+  end
+
+  test "job tables use the configured storage" do
+    expected = if IdempotentStore.storage() == "rocksdb", do: :rocksdb_copies, else: :disc_copies
+
+    for table <- [:jobs, :job_results, :idempotent_keys, :job_expiry] do
+      assert IdempotentStore.storage_type(table) == expected
+    end
+  end
+
+  test "cleanup deletes expired jobs through the expiry index, in batches" do
+    jobs = for i <- 1..25, do: insert("expire-#{i}")
+    Enum.each(jobs, &complete/1)
+    queued = insert("expire-queued")
+
+    # 31 minutes from now: past completed retention, not queued retention.
+    later = System.system_time(:millisecond) + 31 * 60 * 1_000
+    assert IdempotentStore.expire_due(later, 10) == 10
+    assert IdempotentStore.expire_due(later, 10) == 10
+    # Each status change replaced the job's index entry, so only 25 are due.
+    assert IdempotentStore.expire_due(later, 10) == 5
+    assert IdempotentStore.expire_due(later, 10) == 0
+
+    for job <- jobs, do: assert(IdempotentStore.get_job(job.id) == nil)
+    assert IdempotentStore.get_job(queued.id)
+    assert IdempotentStore.counts() == %{total_jobs: 1, queue_depth: 1}
+
+    # Their keys are free again.
+    [first | _] = jobs
+    again = %{first | id: "expire-again-#{System.unique_integer([:positive])}"}
+    assert IdempotentStore.check_or_insert(again) == :ok
   end
 
   test "a job refused before it was queued is discarded and its key freed" do

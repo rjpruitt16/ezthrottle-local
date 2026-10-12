@@ -35,7 +35,26 @@ defmodule Spillway.IdempotentStore do
   @delivery_table :job_delivery_modes
   @drain_events_table :drain_events
   @drain_sequence_table :drain_sequence
-  @cleanup_interval_ms 60_000
+  # Expired jobs are found through @expiry_table, an index ordered by expiry,
+  # and deleted a batch at a time. The pass used to select every expired row
+  # of every table inside one transaction: on a busy node that was hundreds
+  # of thousands of locks, it fell behind under load and stopped freeing
+  # memory at all (soak run 3).
+  @expiry_table :job_expiry
+  @cleanup_interval_ms 10_000
+  @expire_batch 2_000
+
+  # SPILLWAY_STORAGE=rocksdb keeps these tables in RocksDB (mnesia_rocksdb)
+  # instead of RAM, so memory no longer grows with how many jobs are
+  # retained, and a restart doesn't reload them all into RAM.
+  @disk_tables [
+    :idempotent_keys,
+    :jobs,
+    :job_results,
+    :job_delivery_modes,
+    :drain_events,
+    :job_expiry
+  ]
 
   # Finished jobs are kept for their retention (30 minutes completed, 2
   # hours failed), and these tables live in RAM, so at a high enough job
@@ -49,6 +68,12 @@ defmodule Spillway.IdempotentStore do
   # the limit admission enforces.
   @memory_check_interval_ms 5_000
   @evict_at_pct 70
+  # Resident memory past this share of the limit also triggers eviction.
+  # Admission refuses at 100% of it, and eviction used to look only at the
+  # VM's count, which can sit under 70% while resident memory (about 1.5x it
+  # in soak run 3) is over the limit: admission then refused every job and
+  # eviction never ran.
+  @evict_rss_pct 90
   @evict_fraction 0.1
   @evict_chunk 500
 
@@ -87,6 +112,7 @@ defmodule Spillway.IdempotentStore do
     end
 
     :ok = :mnesia.start()
+    register_storage_backend()
 
     ensure_table(@keys_table, [:hashed_key, :job_id, :expires_at, :status], node_list)
     ensure_table(@jobs_table, [:job_id, :job, :expires_at, :status], node_list)
@@ -100,6 +126,7 @@ defmodule Spillway.IdempotentStore do
     )
 
     ensure_table(@drain_sequence_table, [:key, :value], node_list)
+    ensure_table(@expiry_table, [:key, :value], node_list, :ordered_set)
 
     :mnesia.wait_for_tables(
       [
@@ -108,13 +135,57 @@ defmodule Spillway.IdempotentStore do
         @results_table,
         @delivery_table,
         @drain_events_table,
-        @drain_sequence_table
+        @drain_sequence_table,
+        @expiry_table
       ],
       30_000
     )
 
     migrate_renamed_jobs()
+    backfill_expiry_index()
   end
+
+  @doc "\"rocksdb\" when SPILLWAY_STORAGE=rocksdb, otherwise \"ram\"."
+  def storage do
+    case System.get_env("SPILLWAY_STORAGE", "ram") |> String.trim() |> String.downcase() do
+      "rocksdb" -> "rocksdb"
+      _ -> "ram"
+    end
+  end
+
+  defp rocksdb?, do: storage() == "rocksdb"
+
+  defp register_storage_backend do
+    if rocksdb?() do
+      case :mnesia_rocksdb.register() do
+        {:ok, _alias} -> :ok
+        {:error, {:already_exists, _}} -> :ok
+        other -> Logger.info("[Mnesia] mnesia_rocksdb.register: #{inspect(other)}")
+      end
+    end
+  end
+
+  # A store created before the expiry index existed gets one pass that
+  # indexes every job.
+  defp backfill_expiry_index do
+    if :mnesia.dirty_first(@expiry_table) == :"$end_of_table" do
+      rows =
+        :mnesia.dirty_select(@jobs_table, [
+          {{@jobs_table, :"$1", :_, :"$2", :_}, [], [{{:"$2", :"$1"}}]}
+        ])
+
+      Enum.each(rows, fn {expires_at, job_id} -> index_put(expires_at, job_id) end)
+      if rows != [], do: Logger.info("[Mnesia] indexed the expiry of #{length(rows)} jobs")
+    end
+
+    :ok
+  end
+
+  defp index_put(expires_at, job_id),
+    do: :mnesia.dirty_write({@expiry_table, {expires_at, job_id}, nil})
+
+  defp index_delete(expires_at, job_id),
+    do: :mnesia.dirty_delete({@expiry_table, {expires_at, job_id}})
 
   # Spillway was EzthrottleLocal, and Mnesia stores each job as a struct
   # tagged with its module name. A job saved before the rename would load as
@@ -146,16 +217,42 @@ defmodule Spillway.IdempotentStore do
 
   def retag_job(job), do: job
 
-  defp ensure_table(name, attrs, node_list) do
-    case :mnesia.create_table(name, attributes: attrs, disc_copies: node_list, type: :set) do
+  defp ensure_table(name, attrs, node_list, type \\ :set) do
+    copies = if rocksdb?() and name in @disk_tables, do: :rocksdb_copies, else: :disc_copies
+
+    case :mnesia.create_table(name, [{:attributes, attrs}, {:type, type}, {copies, node_list}]) do
       {:atomic, :ok} ->
-        Logger.info("[Mnesia] created table #{name}")
+        Logger.info("[Mnesia] created table #{name} (#{copies})")
 
       {:aborted, {:already_exists, ^name}} ->
-        :ok
+        convert_table(name, copies)
 
       {:aborted, reason} ->
         Logger.error("[Mnesia] failed to create table #{name}: #{inspect(reason)}")
+    end
+  end
+
+  # A table created under the other storage setting is converted in place.
+  defp convert_table(name, copies) do
+    if storage_type(name) != copies do
+      case :mnesia.change_table_copy_type(name, node(), copies) do
+        {:atomic, :ok} ->
+          Logger.info("[Mnesia] moved table #{name} to #{copies}")
+
+        {:aborted, reason} ->
+          Logger.error("[Mnesia] could not move table #{name} to #{copies}: #{inspect(reason)}")
+      end
+    end
+
+    :ok
+  end
+
+  @doc false
+  # Plugin storage reports as {:ext, alias, module}.
+  def storage_type(table) do
+    case :mnesia.table_info(table, :storage_type) do
+      {:ext, alias, _module} -> alias
+      type -> type
     end
   end
 
@@ -169,18 +266,26 @@ defmodule Spillway.IdempotentStore do
     expires_at = System.system_time(:millisecond) + ttl_ms(:queued)
 
     result =
-      case gate_claim(hashed, job.id) do
-        :claimed ->
-          # The gate already made this the only insert for the key, so the
-          # rows are written without a transaction: no trip through
-          # Mnesia's lock manager per submission. Dirty writes are still
-          # logged and flushed on the same 100ms timer.
-          :mnesia.dirty_write({@keys_table, hashed, job.id, expires_at, :queued})
-          :mnesia.dirty_write({@jobs_table, job.id, job, expires_at, :queued})
-          :ok
+      case gate_lock(hashed, job.id) do
+        :locked ->
+          # Holding the key's lock makes this the only insert for the key
+          # until it's released, so the check and the writes run without a
+          # transaction: no trip through Mnesia's lock manager per
+          # submission. Dirty writes are still logged.
+          result =
+            case :mnesia.dirty_read(@keys_table, hashed) do
+              [{@keys_table, ^hashed, existing_id, _expires_at, _status}] ->
+                {:duplicate, existing_id}
 
-        {:taken, existing_id} ->
-          {:duplicate, existing_id}
+              [] ->
+                :mnesia.dirty_write({@keys_table, hashed, job.id, expires_at, :queued})
+                :mnesia.dirty_write({@jobs_table, job.id, job, expires_at, :queued})
+                index_put(expires_at, job.id)
+                :ok
+            end
+
+          gate_unlock(hashed, job.id)
+          result
 
         :no_gate ->
           check_or_insert_transaction(hashed, job, expires_at)
@@ -189,26 +294,27 @@ defmodule Spillway.IdempotentStore do
     finish_check_or_insert(job, result)
   end
 
-  # The key gate: :ets.insert_new is atomic, so of any concurrent inserts for
-  # one key exactly one claims it. It mirrors the keys table (seeded at boot,
-  # cleared wherever keys are deleted). Without the table (it's owned by this
-  # GenServer), fall back to the transaction.
+  # The key gate: a lock per idempotency key, held only while one insert
+  # checks the keys table and writes. :ets.insert_new is atomic, so of any
+  # concurrent inserts for one key exactly one holds it; the others wait,
+  # then find its row and report a duplicate. It used to mirror every key
+  # in the keys table, which kept all of them in RAM whatever the storage.
+  # Without the table (it's owned by this GenServer), fall back to the
+  # transaction.
   @key_gate :idempotent_key_gate
 
-  defp gate_claim(hashed, job_id) do
+  defp gate_lock(hashed, job_id) do
     if :ets.insert_new(@key_gate, {hashed, job_id}) do
-      :claimed
+      :locked
     else
-      case :ets.lookup(@key_gate, hashed) do
-        [{^hashed, existing_id}] -> {:taken, existing_id}
-        [] -> gate_claim(hashed, job_id)
-      end
+      :erlang.yield()
+      gate_lock(hashed, job_id)
     end
   rescue
     ArgumentError -> :no_gate
   end
 
-  defp gate_release(hashed, job_id) do
+  defp gate_unlock(hashed, job_id) do
     :ets.delete_object(@key_gate, {hashed, job_id})
   rescue
     ArgumentError -> :ok
@@ -225,12 +331,7 @@ defmodule Spillway.IdempotentStore do
       ])
     end
 
-    :ets.delete_all_objects(@key_gate)
-
-    :mnesia.dirty_select(@keys_table, [
-      {{@keys_table, :"$1", :"$2", :_, :_}, [], [{{:"$1", :"$2"}}]}
-    ])
-    |> Enum.each(&:ets.insert(@key_gate, &1))
+    :ok
   end
 
   defp check_or_insert_transaction(hashed, job, expires_at) do
@@ -243,6 +344,7 @@ defmodule Spillway.IdempotentStore do
           [] ->
             :mnesia.write({@keys_table, hashed, job.id, expires_at, :queued})
             :mnesia.write({@jobs_table, job.id, job, expires_at, :queued})
+            :mnesia.write({@expiry_table, {expires_at, job.id}, nil})
             :ok
         end
       end)
@@ -291,8 +393,8 @@ defmodule Spillway.IdempotentStore do
 
   @doc """
   Undoes check_or_insert/1 for a job admission refused before it was ever
-  queued. It mirrors the insert: no transaction, since the key gate still
-  makes this job the only one for its key until it's released at the end.
+  queued. It mirrors the insert: dirty operations, no transaction. The key
+  row is deleted only if it still points at this job.
   delete_job/1's synced transaction cost as much as accepting a job, so
   under overload every refusal added to the load that caused it (the soak
   test found refusals taking ~12% of a saturated node).
@@ -307,8 +409,12 @@ defmodule Spillway.IdempotentStore do
 
     old_status =
       case :mnesia.dirty_read(@jobs_table, job_id) do
-        [{@jobs_table, ^job_id, _, _, status}] -> status
-        [] -> nil
+        [{@jobs_table, ^job_id, _, expires_at, status}] ->
+          index_delete(expires_at, job_id)
+          status
+
+        [] ->
+          nil
       end
 
     :mnesia.dirty_delete({@jobs_table, job_id})
@@ -320,7 +426,6 @@ defmodule Spillway.IdempotentStore do
       _ -> :ok
     end
 
-    gate_release(hashed, job_id)
     if old_status, do: count_delete(old_status)
     unregister_job_owner(job_id)
     :ok
@@ -333,8 +438,12 @@ defmodule Spillway.IdempotentStore do
       :mnesia.sync_transaction(fn ->
         old_status =
           case :mnesia.read(@jobs_table, job.id) do
-            [{@jobs_table, _, _, _, status}] -> status
-            [] -> nil
+            [{@jobs_table, _, _, expires_at, status}] ->
+              :mnesia.delete({@expiry_table, {expires_at, job.id}})
+              status
+
+            [] ->
+              nil
           end
 
         :mnesia.delete({@jobs_table, job.id})
@@ -344,7 +453,6 @@ defmodule Spillway.IdempotentStore do
         old_status
       end)
 
-    gate_release(hashed, job.id)
     if old_status, do: count_delete(old_status)
 
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
@@ -364,9 +472,11 @@ defmodule Spillway.IdempotentStore do
 
   defp update_status_local(job_id, status) do
     case :mnesia.dirty_read(@jobs_table, job_id) do
-      [{@jobs_table, ^job_id, job, _expires_at, old_status}] ->
+      [{@jobs_table, ^job_id, job, old_expires, old_status}] ->
         new_expires = System.system_time(:millisecond) + ttl_ms(status)
         :mnesia.dirty_write({@jobs_table, job_id, job, new_expires, status})
+        index_put(new_expires, job_id)
+        index_delete(old_expires, job_id)
         count_move(old_status, status)
 
         hashed = hash_key(job)
@@ -399,7 +509,14 @@ defmodule Spillway.IdempotentStore do
 
   defp record_retry_local(%Job{} = job) do
     expires_at = System.system_time(:millisecond) + ttl_ms(:queued)
+
+    case :mnesia.dirty_read(@jobs_table, job.id) do
+      [{@jobs_table, _, _, old_expires, _}] -> index_delete(old_expires, job.id)
+      [] -> :ok
+    end
+
     :mnesia.dirty_write({@jobs_table, job.id, job, expires_at, :queued})
+    index_put(expires_at, job.id)
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
     :ok
   end
@@ -654,8 +771,8 @@ defmodule Spillway.IdempotentStore do
   def clear_ledger do
     job_ids = local_job_ids()
     :mnesia.clear_table(@keys_table)
-    create_key_gate()
     :mnesia.clear_table(@jobs_table)
+    :mnesia.clear_table(@expiry_table)
     :mnesia.clear_table(@results_table)
     :mnesia.clear_table(@delivery_table)
     :mnesia.clear_table(@drain_events_table)
@@ -749,33 +866,12 @@ defmodule Spillway.IdempotentStore do
 
   @impl true
   def handle_info(:cleanup, state) do
-    now = System.system_time(:millisecond)
-    key_and_job_spec = [{{:_, :_, :_, :"$1", :_}, [{:<, :"$1", now}], [:"$_"]}]
-    result_spec = [{{:_, :_, :_, :"$1"}, [{:<, :"$1", now}], [:"$_"]}]
+    # A full batch means more are due: carry on at once, letting other
+    # messages in between batches.
+    if expire_due(System.system_time(:millisecond)) == @expire_batch,
+      do: send(self(), :cleanup),
+      else: schedule_cleanup()
 
-    @keys_table
-    |> delete_matching(key_and_job_spec)
-    |> Enum.each(fn {@keys_table, hashed, job_id, _expires_at, _status} ->
-      gate_release(hashed, job_id)
-    end)
-
-    expired_jobs = delete_matching(@jobs_table, key_and_job_spec)
-
-    Enum.each(expired_jobs, fn {@jobs_table, job_id, _job, _expires_at, status} ->
-      count_delete(status)
-      unregister_job_owner_local(job_id)
-    end)
-
-    # Delivery modes have no expiry of their own; they go with their job.
-    :mnesia.transaction(fn ->
-      Enum.each(expired_jobs, fn {@jobs_table, job_id, _, _, _} ->
-        :mnesia.delete({@delivery_table, job_id})
-      end)
-    end)
-
-    delete_matching(@results_table, result_spec)
-
-    schedule_cleanup()
     {:noreply, state}
   end
 
@@ -815,14 +911,46 @@ defmodule Spillway.IdempotentStore do
     end
   end
 
-  defp delete_matching(table, spec) do
-    {:atomic, rows} = :mnesia.transaction(fn -> :mnesia.select(table, spec) end)
+  @doc false
+  # Deletes up to limit jobs whose expiry is at or before now, with their
+  # results, delivery modes and idempotency keys, reading the expiry index
+  # in order. Returns how many index entries it consumed.
+  def expire_due(now, limit \\ @expire_batch) do
+    due = due_keys(:mnesia.dirty_first(@expiry_table), now, limit, [])
+    Enum.each(due, &expire_one(&1, now))
+    length(due)
+  end
 
-    :mnesia.transaction(fn ->
-      Enum.each(rows, fn row -> :mnesia.delete_object(row) end)
-    end)
+  defp due_keys(:"$end_of_table", _now, _limit, acc), do: Enum.reverse(acc)
+  defp due_keys(_key, _now, 0, acc), do: Enum.reverse(acc)
 
-    rows
+  defp due_keys({expires_at, _job_id} = key, now, limit, acc) when expires_at <= now,
+    do: due_keys(:mnesia.dirty_next(@expiry_table, key), now, limit - 1, [key | acc])
+
+  defp due_keys(_key, _now, _limit, acc), do: Enum.reverse(acc)
+
+  defp expire_one({_expires_at, job_id} = key, now) do
+    case :mnesia.dirty_read(@jobs_table, job_id) do
+      [{@jobs_table, ^job_id, job, expires_at, status}] when expires_at <= now ->
+        hashed = hash_key(job)
+        :mnesia.dirty_delete({@jobs_table, job_id})
+        :mnesia.dirty_delete({@results_table, job_id})
+        :mnesia.dirty_delete({@delivery_table, job_id})
+
+        case :mnesia.dirty_read(@keys_table, hashed) do
+          [{@keys_table, ^hashed, ^job_id, _, _}] -> :mnesia.dirty_delete({@keys_table, hashed})
+          _ -> :ok
+        end
+
+        count_delete(status)
+        unregister_job_owner_local(job_id)
+
+      # Already gone, or its expiry moved later (a newer index entry covers it).
+      _ ->
+        :ok
+    end
+
+    :mnesia.dirty_delete({@expiry_table, key})
   end
 
   defp route_job(job_id, message, local_fun) do
@@ -994,7 +1122,13 @@ defmodule Spillway.IdempotentStore do
   def enforce_memory_budget do
     limit = Spillway.Admission.memory_limit_mb()
 
-    if limit > 0 and Spillway.MemoryUsage.vm_mb() * 100 > limit * @evict_at_pct do
+    over? =
+      Spillway.MemoryUsage.vm_mb() * 100 > limit * @evict_at_pct or
+        Spillway.MemoryUsage.mb() * 100 > limit * @evict_rss_pct
+
+    # With RocksDB storage finished jobs aren't held in RAM, so evicting
+    # them early frees nothing.
+    if limit > 0 and not rocksdb?() and over? do
       finished = finished_job_count()
       n = max(1, ceil(finished * @evict_fraction))
       evicted = evict_finished(n)
@@ -1034,9 +1168,10 @@ defmodule Spillway.IdempotentStore do
       :mnesia.transaction(fn ->
         Enum.flat_map(chunk, fn {_expires_at, job_id} ->
           case :mnesia.read(@jobs_table, job_id) do
-            [{@jobs_table, ^job_id, job, _expires_at, status}]
+            [{@jobs_table, ^job_id, job, expires_at, status}]
             when status in [:completed, :failed] ->
               hashed = hash_key(job)
+              :mnesia.delete({@expiry_table, {expires_at, job_id}})
               :mnesia.delete({@jobs_table, job_id})
               :mnesia.delete({@results_table, job_id})
               :mnesia.delete({@delivery_table, job_id})
@@ -1055,8 +1190,7 @@ defmodule Spillway.IdempotentStore do
         end)
       end)
 
-    Enum.each(evicted, fn {job_id, hashed, status} ->
-      gate_release(hashed, job_id)
+    Enum.each(evicted, fn {job_id, _hashed, status} ->
       count_delete(status)
       unregister_job_owner_local(job_id)
     end)

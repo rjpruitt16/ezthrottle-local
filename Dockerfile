@@ -1,6 +1,13 @@
 FROM elixir:1.17-alpine AS build
 
-RUN apk add --no-cache build-base git
+# cmake, bash and linux-headers build RocksDB (rocksdb, under mnesia_rocksdb)
+# from source; there's no prebuilt library for Alpine.
+RUN apk add --no-cache build-base git cmake bash linux-headers snappy-dev
+# RocksDB and its bundled Snappy use uint64_t without including <cstdint>,
+# which GCC 15 (Alpine's) no longer pulls in on its own. Include it in every
+# C++ file, and link Alpine's Snappy rather than building the bundled copy.
+ENV ERLANG_ROCKSDB_OPTS="-DWITH_SNAPPY=ON -DWITH_BUNDLE_LZ4=ON" \
+    CXXFLAGS="-include cstdint"
 
 WORKDIR /app
 
@@ -21,7 +28,7 @@ RUN mix release
 
 FROM alpine:3.22 AS app
 
-RUN apk add --no-cache libstdc++ openssl ncurses-libs
+RUN apk add --no-cache libstdc++ openssl ncurses-libs snappy
 
 WORKDIR /app
 
