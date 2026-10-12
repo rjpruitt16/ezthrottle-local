@@ -1,6 +1,8 @@
 FROM elixir:1.17-alpine AS build
 
-RUN apk add --no-cache build-base git
+# cmake, bash and linux-headers build RocksDB (rocksdb, under mnesia_rocksdb)
+# from source; there's no prebuilt library for Alpine.
+RUN apk add --no-cache build-base git cmake bash linux-headers
 
 WORKDIR /app
 
