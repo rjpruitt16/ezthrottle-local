@@ -131,7 +131,7 @@ defmodule Spillway.AccountQueueRegistry do
         {:accepted, job}
 
       {:rejected, _reason, _limit, _current} = rejected ->
-        IdempotentStore.delete_job(job)
+        IdempotentStore.discard_refused(job)
         rejected
     end
   end

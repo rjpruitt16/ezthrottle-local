@@ -107,7 +107,7 @@ defmodule SpillwayWeb.JobController do
 
           {:rejected, limit_reason, limit, current} ->
             Phoenix.PubSub.unsubscribe(Spillway.PubSub, "job:#{job.id}")
-            IdempotentStore.delete_job(job)
+            IdempotentStore.discard_refused(job)
 
             conn
             |> put_queue_headers(job)

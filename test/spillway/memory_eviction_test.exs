@@ -86,5 +86,30 @@ defmodule Spillway.MemoryEvictionTest do
     assert IdempotentStore.get_job(queued.id)
   end
 
+  test "a job refused before it was queued is discarded and its key freed" do
+    refused = insert("refused")
+    assert IdempotentStore.counts() == %{total_jobs: 1, queue_depth: 1}
+
+    assert IdempotentStore.discard_refused(refused) == :ok
+    assert IdempotentStore.get_job(refused.id) == nil
+    assert IdempotentStore.counts() == %{total_jobs: 0, queue_depth: 0}
+
+    # Discarding twice (the controller and the registry both clean up) is harmless.
+    assert IdempotentStore.discard_refused(refused) == :ok
+    assert IdempotentStore.counts() == %{total_jobs: 0, queue_depth: 0}
+
+    retry = %{
+      insert_job_like(refused)
+      | id: "refused-retry-#{System.unique_integer([:positive])}"
+    }
+
+    assert IdempotentStore.check_or_insert(retry) == :ok
+
+    # A key a newer job now holds is left alone.
+    assert IdempotentStore.discard_refused(refused) == :ok
+    assert {:duplicate, id} = IdempotentStore.check_or_insert(%{retry | id: "third"})
+    assert id == retry.id
+  end
+
   defp insert_job_like(job), do: %{job | status: :queued}
 end

@@ -12,6 +12,7 @@ defmodule Spillway.WebSocketStore do
 
   @streams :websocket_streams
   @events :websocket_events
+  @owners Spillway.WebSocketStreamOwners
   @cleanup_interval_ms 60_000
   # The budget pass trims only streams idle this long: an active stream is
   # trimmed on its own appends, and trimming it here as well contends with
@@ -46,12 +47,56 @@ defmodule Spillway.WebSocketStore do
     end
   end
 
+  # Every stream has one writer: the session process that claimed it (see
+  # claim_stream/1), or this GenServer while it holds the claim for cleanup
+  # or a budget trim. So appends and replay reads run as dirty operations,
+  # without Mnesia's lock manager. They were a synced transaction per
+  # message, which at 200 sessions (1,000 messages/s) took about a fifth of
+  # a saturated node's time in locks and commits. Dirty writes are still
+  # logged to disk; a crash can lose the last moments of a transcript, as
+  # it can the last flush interval of jobs.
+
+  @doc """
+  Makes the calling process the only writer of the session's stream. Called
+  by the session process; the claim ends when it exits. Waits while a
+  cleanup or trim pass holds the stream.
+  """
+  def claim_stream(session_id, attempts \\ 200) do
+    case Registry.register(@owners, hash_session(session_id), :session) do
+      {:ok, _} ->
+        :ok
+
+      {:error, {:already_registered, _pid}} when attempts > 0 ->
+        Process.sleep(5)
+        claim_stream(session_id, attempts - 1)
+
+      {:error, {:already_registered, pid}} ->
+        {:error, {:stream_owned_by, pid}}
+    end
+  end
+
+  # For this GenServer's passes: claims a stream nobody owns, runs fun and
+  # releases it. A live session's stream is left to the session.
+  defp with_unowned_stream(session_hash, fun) do
+    case Registry.register(@owners, session_hash, :maintenance) do
+      {:ok, _} ->
+        try do
+          fun.()
+        after
+          Registry.unregister(@owners, session_hash)
+        end
+
+      {:error, {:already_registered, pid}} ->
+        {:owned, pid}
+    end
+  end
+
   def append(session_id, direction, envelope) when direction in ["client", "backend"] do
     config = WebSocketConfig.load()
     session_hash = hash_session(session_id)
     now = System.system_time(:millisecond)
 
-    case :mnesia.sync_transaction(fn ->
+    case dirty(fn ->
            stream = current_stream(session_hash, now)
            {epoch, next_sequence, oldest_sequence, _newest_sequence} = stream
            sequence = next_sequence + 1
@@ -70,8 +115,36 @@ defmodule Spillway.WebSocketStore do
              recorded_at: now
            }
          end) do
-      {:atomic, event} -> {:ok, event}
-      {:aborted, reason} -> {:error, reason}
+      {:ok, event} -> {:ok, event}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp dirty(fun) do
+    {:ok, :mnesia.async_dirty(fun)}
+  catch
+    :exit, {:aborted, reason} -> {:error, reason}
+  end
+
+  @doc """
+  Trims the caller's own stream to limit events. The budget pass sends a
+  live session {:trim_transcript, limit}, and the session calls this.
+  """
+  def trim_owned(session_id, limit) do
+    session_hash = hash_session(session_id)
+
+    dirty(fn -> trim_stream(session_hash, limit) end)
+    :ok
+  end
+
+  defp trim_stream(session_hash, limit) do
+    case :mnesia.read(@streams, session_hash) do
+      [{@streams, ^session_hash, epoch, next, oldest, newest, expires_at}] ->
+        new_oldest = trim_to(session_hash, epoch, oldest, newest, limit)
+        :mnesia.write({@streams, session_hash, epoch, next, new_oldest, newest, expires_at})
+
+      [] ->
+        :ok
     end
   end
 
@@ -95,9 +168,11 @@ defmodule Spillway.WebSocketStore do
       session_hash = hash_session(session_id)
       now = System.system_time(:millisecond)
 
-      case :mnesia.transaction(fn -> read_events(session_hash, parsed, limit, now) end) do
-        {:atomic, result} -> result
-        {:aborted, reason} -> {:error, reason}
+      # Read by the session process that owns the stream, so no writer can
+      # interleave with it.
+      case dirty(fn -> read_events(session_hash, parsed, limit, now) end) do
+        {:ok, result} -> result
+        {:error, reason} -> {:error, reason}
       end
     end
   end
@@ -202,21 +277,17 @@ defmodule Spillway.WebSocketStore do
       ])
 
     Enum.each(over, fn session_hash ->
-      :mnesia.transaction(fn ->
-        case :mnesia.read(@streams, session_hash, :write) do
-          [{@streams, ^session_hash, epoch, next, oldest, newest, expires_at}] ->
-            new_oldest = trim_to(session_hash, epoch, oldest, newest, limit)
-            :mnesia.write({@streams, session_hash, epoch, next, new_oldest, newest, expires_at})
-
-          [] ->
-            :ok
-        end
-      end)
+      case with_unowned_stream(session_hash, fn ->
+             dirty(fn -> trim_stream(session_hash, limit) end)
+           end) do
+        {:owned, pid} -> send(pid, {:trim_transcript, limit})
+        _ -> :ok
+      end
     end)
   end
 
   defp current_stream(session_hash, now) do
-    case :mnesia.read(@streams, session_hash, :write) do
+    case :mnesia.read(@streams, session_hash) do
       [{@streams, ^session_hash, epoch, next_sequence, oldest, newest, expires_at}]
       when expires_at > now ->
         {epoch, next_sequence, oldest, newest}
@@ -311,23 +382,28 @@ defmodule Spillway.WebSocketStore do
   defp cleanup_expired do
     now = System.system_time(:millisecond)
 
-    case :mnesia.transaction(fn ->
-           :mnesia.select(@streams, [
-             {{@streams, :"$1", :"$2", :_, :"$3", :"$4", :"$5"}, [{:"=<", :"$5", now}],
-              [{{:"$1", :"$2", :"$3", :"$4"}}]}
-           ])
-         end) do
-      {:atomic, expired} ->
-        Enum.each(expired, fn {session_hash, epoch, oldest, newest} ->
-          :mnesia.transaction(fn ->
-            delete_event_range(session_hash, epoch, oldest, newest)
-            :mnesia.delete({@streams, session_hash})
-          end)
-        end)
+    expired =
+      :mnesia.dirty_select(@streams, [
+        {{@streams, :"$1", :_, :_, :_, :_, :"$2"}, [{:"=<", :"$2", now}], [:"$1"]}
+      ])
 
-      {:aborted, reason} ->
-        Logger.warning("WebSocket stream cleanup failed: #{inspect(reason)}")
-    end
+    # A live session's expired stream is left to it: its next append starts
+    # a new epoch and deletes the old events itself.
+    Enum.each(expired, fn session_hash ->
+      with_unowned_stream(session_hash, fn ->
+        dirty(fn ->
+          case :mnesia.read(@streams, session_hash) do
+            [{@streams, ^session_hash, epoch, _next, oldest, newest, expires_at}]
+            when expires_at <= now ->
+              delete_event_range(session_hash, epoch, oldest, newest)
+              :mnesia.delete({@streams, session_hash})
+
+            _ ->
+              :ok
+          end
+        end)
+      end)
+    end)
   end
 
   defp delete_event_range(_session_hash, _epoch, first, last) when first > last, do: :ok

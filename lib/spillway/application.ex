@@ -48,6 +48,7 @@ defmodule Spillway.Application do
              conn_opts: [transport_opts: [inet6: true]]
            ]
          }},
+        {Registry, keys: :unique, name: Spillway.WebSocketStreamOwners},
         {Spillway.WebSocketStore, websocket_config},
         {Spillway.WebSocketQueue, websocket_config},
         {Registry, keys: :unique, name: Spillway.WebSocketSessionRegistry},

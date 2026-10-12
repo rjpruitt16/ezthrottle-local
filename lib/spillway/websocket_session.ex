@@ -42,6 +42,8 @@ defmodule Spillway.WebSocketSession do
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
+    # This process is the only writer of the session's transcript.
+    :ok = WebSocketStore.claim_stream(Keyword.fetch!(opts, :session_id))
 
     {:ok,
      %{
@@ -162,6 +164,11 @@ defmodule Spillway.WebSocketSession do
   end
 
   @impl true
+  def handle_info({:trim_transcript, limit}, state) do
+    WebSocketStore.trim_owned(state.session_id, limit)
+    {:noreply, state}
+  end
+
   def handle_info(:ensure_upstream, state) do
     cond do
       map_size(state.clients) == 0 ->
