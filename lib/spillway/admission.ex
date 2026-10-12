@@ -14,9 +14,11 @@ defmodule Spillway.Admission do
   explicitly — start_link/1 logs a warning when it's unset.
 
   Env vars:
-    SPILLWAY_MEMORY_LIMIT_MB      - reject new jobs once BEAM's total
-                                       memory exceeds this many MB
-                                       (default: disabled)
+    SPILLWAY_MEMORY_LIMIT_MB      - reject new jobs once the process's
+                                       resident memory exceeds this many
+                                       MB (default: disabled). Finished
+                                       jobs are evicted before that point,
+                                       see IdempotentStore.
     SPILLWAY_MAX_BODY_BYTES       - reject oversized request bodies (413)
                                        (default: 1MB)
     SPILLWAY_DB_MAX_BYTES         - reject new jobs once the Mnesia
@@ -173,9 +175,7 @@ defmodule Spillway.Admission do
   defp sampled_memory_mb, do: sampled(4, 5, &current_memory_mb/0)
   defp sampled_db_bytes, do: sampled(2, 3, &mnesia_dir_bytes/0)
 
-  defp current_memory_mb do
-    div(:erlang.memory(:total), 1_048_576)
-  end
+  defp current_memory_mb, do: Spillway.MemoryUsage.mb()
 
   defp mnesia_dir_bytes do
     dir = :mnesia.system_info(:directory)
