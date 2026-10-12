@@ -289,6 +289,43 @@ defmodule Spillway.IdempotentStore do
     route_job(job.id, {:delete_job, job}, fn -> delete_job_local(job) end)
   end
 
+  @doc """
+  Undoes check_or_insert/1 for a job admission refused before it was ever
+  queued. It mirrors the insert: no transaction, since the key gate still
+  makes this job the only one for its key until it's released at the end.
+  delete_job/1's synced transaction cost as much as accepting a job, so
+  under overload every refusal added to the load that caused it (the soak
+  test found refusals taking ~12% of a saturated node).
+  """
+  def discard_refused(%Job{} = job) do
+    route_job(job.id, {:discard_refused, job}, fn -> discard_refused_local(job) end)
+  end
+
+  defp discard_refused_local(%Job{} = job) do
+    hashed = hash_key(job)
+    job_id = job.id
+
+    old_status =
+      case :mnesia.dirty_read(@jobs_table, job_id) do
+        [{@jobs_table, ^job_id, _, _, status}] -> status
+        [] -> nil
+      end
+
+    :mnesia.dirty_delete({@jobs_table, job_id})
+    :mnesia.dirty_delete({@results_table, job_id})
+    :mnesia.dirty_delete({@delivery_table, job_id})
+
+    case :mnesia.dirty_read(@keys_table, hashed) do
+      [{@keys_table, ^hashed, ^job_id, _, _}] -> :mnesia.dirty_delete({@keys_table, hashed})
+      _ -> :ok
+    end
+
+    gate_release(hashed, job_id)
+    if old_status, do: count_delete(old_status)
+    unregister_job_owner(job_id)
+    :ok
+  end
+
   defp delete_job_local(%Job{} = job) do
     hashed = hash_key(job)
 
@@ -682,6 +719,9 @@ defmodule Spillway.IdempotentStore do
 
   def handle_call({:job_store, {:delete_job, job}}, _from, state),
     do: {:reply, delete_job_local(job), state}
+
+  def handle_call({:job_store, {:discard_refused, job}}, _from, state),
+    do: {:reply, discard_refused_local(job), state}
 
   def handle_call({:job_store, {:update_status, job_id, status}}, _from, state),
     do: {:reply, update_status_local(job_id, status), state}

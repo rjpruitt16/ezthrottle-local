@@ -485,7 +485,7 @@ defmodule Spillway.UrlActor do
             {:accepted, job}
 
           {:rejected, _reason, _limit, _current} = rejected ->
-            IdempotentStore.delete_job(job)
+            IdempotentStore.discard_refused(job)
             rejected
 
           other ->
@@ -493,7 +493,7 @@ defmodule Spillway.UrlActor do
         end
 
       {:rejected, reason, snapshot} ->
-        IdempotentStore.delete_job(job)
+        IdempotentStore.discard_refused(job)
         {:rejected, reason, snapshot.max_backlog, snapshot.upstream_backlog - 1}
     end
   end
