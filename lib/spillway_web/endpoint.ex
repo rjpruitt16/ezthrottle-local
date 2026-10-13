@@ -41,6 +41,7 @@ defmodule SpillwayWeb.Endpoint do
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint], log: {__MODULE__, :log_level, []}
 
+  plug SpillwayWeb.Plugs.Fullness
   plug SpillwayWeb.Plugs.InFlightLimit
   plug SpillwayWeb.Plugs.BodyLimit
 

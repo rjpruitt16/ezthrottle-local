@@ -132,6 +132,15 @@ defmodule Spillway.Registration do
     |> put_if(:reserved_for, reserved_for())
     |> put_if(:role, role())
     |> put_if(:drain_state, drain_state && to_string(drain_state))
+    |> Map.put(:fullness, safe_fullness())
+  end
+
+  # Same number as the x-aqueduct-fullness response header, so a control
+  # plane knows how full this node is before sending it anything.
+  defp safe_fullness do
+    Spillway.Admission.fullness()
+  rescue
+    _ -> 0
   end
 
   defp put_if(map, _key, nil), do: map
