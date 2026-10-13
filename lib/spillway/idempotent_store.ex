@@ -258,6 +258,16 @@ defmodule Spillway.IdempotentStore do
     end
   end
 
+  @doc "The id of the job already holding this job's idempotency key, or nil."
+  def existing_job_id(%Job{} = job) do
+    hashed = hash_key(job)
+
+    case :mnesia.dirty_read(@keys_table, hashed) do
+      [{@keys_table, ^hashed, job_id, _expires_at, _status}] -> job_id
+      [] -> nil
+    end
+  end
+
   @doc """
   Check if an idempotent key already exists.
   If not, insert the full job into both tables.

@@ -74,14 +74,27 @@ defmodule Spillway.AccountQueueRegistry do
     pid = actor_for(job)
 
     if Cluster.standalone?() do
-      case AccountQueue.prepare_submission(job, true) do
-        {:prepared, prepared} -> admit_here(pid, prepared, account_queue_header, :new)
-        other -> other
+      # Refuse before storing when the queue is already full: see
+      # Intake.precheck/2. The account-queue header can change which queue
+      # the job lands in, so a submission that sets it skips the check.
+      with :allowed <- precheck(job, account_queue_header),
+           {:prepared, prepared} <- AccountQueue.prepare_submission(job, true) do
+        admit_here(pid, prepared, account_queue_header, :new)
       end
     else
       route_to_actor(pid, :submit, job, account_queue_header)
     end
   end
+
+  # A resubmitted key still gets its existing job back, overload or not.
+  defp precheck(job, nil) do
+    case Intake.precheck(route_key(job), job) do
+      :allowed -> :allowed
+      rejected -> if IdempotentStore.existing_job_id(job), do: :allowed, else: rejected
+    end
+  end
+
+  defp precheck(_job, _account_queue_header), do: :allowed
 
   def submit_internal(%Job{} = job, account_queue_header \\ nil) do
     pid = actor_for(job)
