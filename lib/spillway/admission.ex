@@ -194,19 +194,21 @@ defmodule Spillway.Admission do
 
   defp current_memory_mb, do: Spillway.MemoryUsage.mb()
 
-  defp mnesia_dir_bytes do
-    dir = :mnesia.system_info(:directory)
+  # Everything under the Mnesia directory. RocksDB tables
+  # (SPILLWAY_STORAGE=rocksdb) keep their files in subdirectories, which a
+  # flat listing counted as a few KB each, so the limit never fired.
+  defp mnesia_dir_bytes, do: dir_bytes(:mnesia.system_info(:directory))
 
-    case File.ls(dir) do
-      {:ok, files} ->
-        files
-        |> Enum.map(fn f ->
-          case File.stat(Path.join(dir, f)) do
-            {:ok, %File.Stat{size: size}} -> size
-            _ -> 0
-          end
-        end)
-        |> Enum.sum()
+  defp dir_bytes(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(path) do
+          {:ok, entries} -> entries |> Enum.map(&dir_bytes(Path.join(path, &1))) |> Enum.sum()
+          _ -> 0
+        end
+
+      {:ok, %File.Stat{size: size}} ->
+        size
 
       _ ->
         0
