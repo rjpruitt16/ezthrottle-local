@@ -150,6 +150,16 @@ defmodule Spillway.AccountQueue do
     ArgumentError -> 0
   end
 
+  @doc "Pending jobs for user_id in queue_pid, read without creating a row."
+  def user_pending(queue_pid, user_id) do
+    case :ets.lookup(@backlog_table, {queue_pid, user_id}) do
+      [{_, n}] -> n
+      [] -> 0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
   @doc "One fewer pending job for user_id in queue_pid; drops the row at zero."
   def user_release(_queue_pid, nil), do: :ok
 

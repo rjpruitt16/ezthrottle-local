@@ -84,6 +84,34 @@ defmodule Spillway.IntakeTest do
     assert {:ok, ^accepted} = AccountQueue.local_backlog(queue)
   end
 
+  test "a full queue refuses a new job before storing it, but a known key still gets its job" do
+    System.put_env("SPILLWAY_MAX_PENDING_PER_USER", "3")
+    stamp = System.unique_integer([:positive])
+    base = "http://precheck-#{stamp}.example"
+    actor = AccountQueueRegistry.actor_for(job("precheck-#{stamp}-0", "noisy", base))
+    UrlActor.update_max_concurrent(actor, 0)
+
+    for i <- 1..3 do
+      assert {:accepted, _} =
+               AccountQueueRegistry.submit(job("precheck-#{stamp}-#{i}", "noisy", base))
+    end
+
+    before = Spillway.IdempotentStore.counts()
+    refused = job("precheck-#{stamp}-4", "noisy", base)
+    assert {:rejected, "user_queue", 3, 3} = AccountQueueRegistry.submit(refused)
+    # Refused before the store: no row was written and then deleted.
+    assert Spillway.IdempotentStore.counts() == before
+    assert Spillway.IdempotentStore.existing_job_id(refused) == nil
+
+    # Resubmitting an accepted job's key returns that job, not a 429.
+    resubmit = %{
+      job("precheck-#{stamp}-again", "noisy", base)
+      | idempotent_key: "key-precheck-#{stamp}-1"
+    }
+
+    refute match?({:rejected, _, _, _}, AccountQueueRegistry.submit(resubmit))
+  end
+
   test "concurrent submissions from one user stop exactly at the per-user limit" do
     System.put_env("SPILLWAY_MAX_PENDING_PER_USER", "5")
     stamp = System.unique_integer([:positive])

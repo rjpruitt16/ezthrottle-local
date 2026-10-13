@@ -152,6 +152,47 @@ defmodule Spillway.Intake do
   # into a 429, so back off briefly (1, 4, 9 ... capped at 50ms).
   defp backoff(attempt), do: Process.sleep(min(attempt * attempt, 50))
 
+  @doc """
+  Whether admit/6 would refuse this job right now, read from ETS without
+  reserving a slot or spawning a queue. Lets a submission be refused before
+  the job is stored: a refusal used to store the job and then delete it,
+  about 11 store operations, and under sustained overload refusals
+  outnumbered accepted jobs five to one (soak run 3e), so most of the store
+  work was undoing jobs that never ran. admit/6 still decides atomically
+  after the store; a stale answer here costs at most one extra 429.
+  """
+  def precheck(domain, %Job{} = job) do
+    case :ets.lookup(@queues, {:settings, domain}) do
+      [{_, enabled, max_backlog}] ->
+        key = if enabled, do: Job.queue_key(job), else: :shared
+
+        case lookup_queue(domain, key) do
+          nil -> :allowed
+          queue -> peek(domain, queue, enabled, max_backlog, job.user_id)
+        end
+
+      [] ->
+        :allowed
+    end
+  end
+
+  defp peek(domain, queue, enabled, max_backlog, user_id) do
+    {active, total, mine} = UrlActor.counts_from(enabled, domain_backlogs(domain), queue, true)
+
+    case FairAdmission.decide(mine, total, active, max_backlog) do
+      {:allowed, _snapshot} ->
+        limit = AccountQueue.max_pending_per_user()
+        pending = AccountQueue.user_pending(queue, user_id)
+
+        if limit > 0 and pending >= limit,
+          do: {:rejected, "user_queue", limit, pending},
+          else: :allowed
+
+      {:rejected, reason, snapshot} ->
+        {:rejected, reason, snapshot.max_backlog, snapshot.upstream_backlog}
+    end
+  end
+
   @doc "Queue headers for a response, from ETS (UrlActor.queue_snapshot/2's shape)."
   def snapshot(actor, domain, %Job{} = job) do
     {enabled, max_backlog} = settings(actor, domain)
