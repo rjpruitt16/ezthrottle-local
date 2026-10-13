@@ -461,6 +461,7 @@ defmodule Spillway.AccountQueueRegistry do
 
     if elapsed_ms >= DrainFlush.timer_seconds() * 1_000 do
       if DrainFlush.attempt() do
+        Spillway.Registration.report_unassigned()
         %{state | drain_state: :unassigned}
       else
         state

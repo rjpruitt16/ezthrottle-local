@@ -21,6 +21,13 @@ defmodule Spillway.Webhook do
 
   @max_retries 4
 
+  @doc """
+  One attempt, no retries -- for best-effort reports sent while the node
+  is on its way out (registration's `offline`), where waiting through a
+  full backoff would only hold up shutdown.
+  """
+  def deliver_once(url, payload), do: deliver(url, payload, @max_retries)
+
   def deliver(url, payload, attempt \\ 0)
 
   def deliver(url, payload, attempt) when attempt < @max_retries do

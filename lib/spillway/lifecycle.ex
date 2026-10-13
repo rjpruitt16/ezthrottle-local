@@ -41,6 +41,7 @@ defmodule Spillway.Lifecycle do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
 
     begin_drain()
+    Spillway.Registration.report_lifecycle("draining")
     released = Spillway.Cluster.release_local_queues()
 
     Logger.info(
@@ -56,6 +57,7 @@ defmodule Spillway.Lifecycle do
       DrainFlush.flush_all_batches("shutdown")
     end
 
+    Spillway.Registration.report_lifecycle("offline")
     result
   end
 
