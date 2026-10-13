@@ -220,6 +220,8 @@ defmodule Spillway.IdempotentStore do
   defp ensure_table(name, attrs, node_list, type \\ :set) do
     copies = if rocksdb?() and name in @disk_tables, do: :rocksdb_copies, else: :disc_copies
 
+    # RocksDB tables use direct access (config :mnesia_rocksdb,
+    # :default_access_type).
     case :mnesia.create_table(name, [{:attributes, attrs}, {:type, type}, {copies, node_list}]) do
       {:atomic, :ok} ->
         Logger.info("[Mnesia] created table #{name} (#{copies})")
@@ -272,7 +274,7 @@ defmodule Spillway.IdempotentStore do
           # until it's released, so the check and the writes run without a
           # transaction: no trip through Mnesia's lock manager per
           # submission. Dirty writes are still logged.
-          result =
+          try do
             case :mnesia.dirty_read(@keys_table, hashed) do
               [{@keys_table, ^hashed, existing_id, _expires_at, _status}] ->
                 {:duplicate, existing_id}
@@ -283,9 +285,9 @@ defmodule Spillway.IdempotentStore do
                 index_put(expires_at, job.id)
                 :ok
             end
-
-          gate_unlock(hashed, job.id)
-          result
+          after
+            gate_unlock(hashed)
+          end
 
         :no_gate ->
           check_or_insert_transaction(hashed, job, expires_at)
@@ -303,10 +305,21 @@ defmodule Spillway.IdempotentStore do
   # transaction.
   @key_gate :idempotent_key_gate
 
+  # The lock records its holder, so a lock left by a process that died
+  # holding it (killed between lock and unlock) is taken over instead of
+  # blocking that key forever.
   defp gate_lock(hashed, job_id) do
-    if :ets.insert_new(@key_gate, {hashed, job_id}) do
+    if :ets.insert_new(@key_gate, {hashed, self()}) do
       :locked
     else
+      case :ets.lookup(@key_gate, hashed) do
+        [{^hashed, holder} = entry] when is_pid(holder) ->
+          unless Process.alive?(holder), do: :ets.delete_object(@key_gate, entry)
+
+        _ ->
+          :ok
+      end
+
       :erlang.yield()
       gate_lock(hashed, job_id)
     end
@@ -314,8 +327,8 @@ defmodule Spillway.IdempotentStore do
     ArgumentError -> :no_gate
   end
 
-  defp gate_unlock(hashed, job_id) do
-    :ets.delete_object(@key_gate, {hashed, job_id})
+  defp gate_unlock(hashed) do
+    :ets.delete_object(@key_gate, {hashed, self()})
   rescue
     ArgumentError -> :ok
   end
@@ -770,17 +783,36 @@ defmodule Spillway.IdempotentStore do
   """
   def clear_ledger do
     job_ids = local_job_ids()
-    :mnesia.clear_table(@keys_table)
-    :mnesia.clear_table(@jobs_table)
-    :mnesia.clear_table(@expiry_table)
-    :mnesia.clear_table(@results_table)
-    :mnesia.clear_table(@delivery_table)
-    :mnesia.clear_table(@drain_events_table)
-    :mnesia.clear_table(@drain_sequence_table)
+
+    Enum.each(
+      [
+        @keys_table,
+        @jobs_table,
+        @expiry_table,
+        @results_table,
+        @delivery_table,
+        @drain_events_table,
+        @drain_sequence_table
+      ],
+      &empty_table/1
+    )
+
     seed_counts()
     Enum.each(job_ids, &unregister_job_owner/1)
     if flush_interval_ms() == 0, do: :mnesia.dump_log()
     :ok
+  end
+
+  # :mnesia.clear_table on a RocksDB table drops and recreates it under any
+  # process still reading or writing it directly, and the VM segfaulted in
+  # RocksDB's NIF when one was (found in the test suite). Delete the rows
+  # instead; RAM tables still use clear_table.
+  defp empty_table(table) do
+    if storage_type(table) == :rocksdb_copies do
+      table |> :mnesia.dirty_all_keys() |> Enum.each(&:mnesia.dirty_delete(table, &1))
+    else
+      :mnesia.clear_table(table)
+    end
   end
 
   @doc """

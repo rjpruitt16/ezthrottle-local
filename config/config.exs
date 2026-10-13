@@ -10,6 +10,12 @@
 # General application configuration
 import Config
 
+# RocksDB tables (SPILLWAY_STORAGE=rocksdb): callers read and write RocksDB
+# directly. The default, legacy, sends every read and write through one
+# process per table; in soak run 3c those queued over 10,000 writes and the
+# node ran out of memory.
+config :mnesia_rocksdb, default_access_type: :direct
+
 config :spillway,
   generators: [timestamp_type: :utc_datetime],
   metrics_adapter: Spillway.Metrics.Noop

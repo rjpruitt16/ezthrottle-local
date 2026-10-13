@@ -24,6 +24,10 @@ defmodule Spillway.Admission do
     SPILLWAY_DB_MAX_BYTES         - reject new jobs once the Mnesia
                                        directory exceeds this many bytes
                                        (default: 800MB)
+    SPILLWAY_STORE_MAX_BACKLOG    - reject new jobs once this many store
+                                       writes are queued, see
+                                       Spillway.StorePressure (default:
+                                       5000; 0 disables)
     SPILLWAY_RETRY_AFTER_SECONDS  - base Retry-After on a 429 (default 5)
 
   Retry-After doubles on each consecutive rejection (capped at 60s),
@@ -53,13 +57,13 @@ defmodule Spillway.Admission do
   # process), not the Agent: an Agent.update per request made every
   # submission take turns through one process. Slots: 1 reject streak,
   # 2 cached Mnesia dir bytes, 3 when they were read (ms), 4 cached memory
-  # MB, 5 when it was read.
+  # MB, 5 when it was read, 6 cached store backlog, 7 when it was read.
   @sample_ttl_ms 250
 
   defp counters do
     case :persistent_term.get({__MODULE__, :counters}, nil) do
       nil ->
-        ref = :atomics.new(5, signed: true)
+        ref = :atomics.new(7, signed: true)
         :persistent_term.put({__MODULE__, :counters}, ref)
         ref
 
@@ -102,10 +106,12 @@ defmodule Spillway.Admission do
   def max_body_bytes, do: env_int("SPILLWAY_MAX_BODY_BYTES", @default_max_body_bytes)
   def db_max_bytes, do: env_int("SPILLWAY_DB_MAX_BYTES", @default_db_max_bytes)
   def base_retry_after_seconds, do: env_int("SPILLWAY_RETRY_AFTER_SECONDS", 5)
+  def store_max_backlog, do: env_int("SPILLWAY_STORE_MAX_BACKLOG", 5_000)
 
   @doc "True if at least one limit is actually configured, not just whether this process is running."
   def any_limit_configured? do
-    memory_limit_mb() > 0 or max_body_bytes() > 0 or db_max_bytes() > 0
+    memory_limit_mb() > 0 or max_body_bytes() > 0 or db_max_bytes() > 0 or
+      store_max_backlog() > 0
   end
 
   @doc """
@@ -121,6 +127,10 @@ defmodule Spillway.Admission do
       db_max_bytes() > 0 and sampled_db_bytes() > db_max_bytes() ->
         record_rejection()
         {:rejected, "db_size", db_max_bytes(), sampled_db_bytes()}
+
+      store_max_backlog() > 0 and sampled_store_backlog() > store_max_backlog() ->
+        record_rejection()
+        {:rejected, "store_backlog", store_max_backlog(), sampled_store_backlog()}
 
       true ->
         record_allowed()
@@ -158,6 +168,12 @@ defmodule Spillway.Admission do
       db_bytes: mnesia_dir_bytes(),
       db_max_bytes: db_max_bytes(),
       max_body_bytes: max_body_bytes(),
+      store_backlog: Spillway.StorePressure.backlog(),
+      store_max_backlog: store_max_backlog(),
+      store_queues: Spillway.StorePressure.detail(),
+      processes: :erlang.system_info(:process_count),
+      vm_memory_mb: Spillway.MemoryUsage.vm_mb(),
+      storage: Spillway.IdempotentStore.storage(),
       retry_after_seconds: retry_after_seconds()
     }
   end
@@ -174,22 +190,25 @@ defmodule Spillway.Admission do
 
   defp sampled_memory_mb, do: sampled(4, 5, &current_memory_mb/0)
   defp sampled_db_bytes, do: sampled(2, 3, &mnesia_dir_bytes/0)
+  defp sampled_store_backlog, do: sampled(6, 7, &Spillway.StorePressure.backlog/0)
 
   defp current_memory_mb, do: Spillway.MemoryUsage.mb()
 
-  defp mnesia_dir_bytes do
-    dir = :mnesia.system_info(:directory)
+  # Everything under the Mnesia directory. RocksDB tables
+  # (SPILLWAY_STORAGE=rocksdb) keep their files in subdirectories, which a
+  # flat listing counted as a few KB each, so the limit never fired.
+  defp mnesia_dir_bytes, do: dir_bytes(:mnesia.system_info(:directory))
 
-    case File.ls(dir) do
-      {:ok, files} ->
-        files
-        |> Enum.map(fn f ->
-          case File.stat(Path.join(dir, f)) do
-            {:ok, %File.Stat{size: size}} -> size
-            _ -> 0
-          end
-        end)
-        |> Enum.sum()
+  defp dir_bytes(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(path) do
+          {:ok, entries} -> entries |> Enum.map(&dir_bytes(Path.join(path, &1))) |> Enum.sum()
+          _ -> 0
+        end
+
+      {:ok, %File.Stat{size: size}} ->
+        size
 
       _ ->
         0

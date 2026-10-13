@@ -56,6 +56,7 @@ defmodule Spillway.MixProject do
       {:mint_web_socket, "~> 1.0"},
       {:jsv, "~> 0.26.0"},
       {:finch, "~> 0.19"},
+      {:redix, "~> 1.5"},
       # RocksDB storage for Mnesia tables (SPILLWAY_STORAGE=rocksdb). Not on
       # Hex; pinned to the commit that moved to emqx/erlang-rocksdb 1.8.0-emqx-10.
       {:mnesia_rocksdb,

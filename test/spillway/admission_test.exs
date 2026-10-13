@@ -14,7 +14,8 @@ defmodule Spillway.AdmissionTest do
       mem: System.get_env("SPILLWAY_MEMORY_LIMIT_MB"),
       body: System.get_env("SPILLWAY_MAX_BODY_BYTES"),
       db: System.get_env("SPILLWAY_DB_MAX_BYTES"),
-      retry: System.get_env("SPILLWAY_RETRY_AFTER_SECONDS")
+      retry: System.get_env("SPILLWAY_RETRY_AFTER_SECONDS"),
+      backlog: System.get_env("SPILLWAY_STORE_MAX_BACKLOG")
     }
 
     on_exit(fn ->
@@ -22,6 +23,7 @@ defmodule Spillway.AdmissionTest do
       restore_env("SPILLWAY_MAX_BODY_BYTES", prev.body)
       restore_env("SPILLWAY_DB_MAX_BYTES", prev.db)
       restore_env("SPILLWAY_RETRY_AFTER_SECONDS", prev.retry)
+      restore_env("SPILLWAY_STORE_MAX_BACKLOG", prev.backlog)
       reset_streak()
     end)
 
@@ -98,6 +100,22 @@ defmodule Spillway.AdmissionTest do
     assert Admission.retry_after_seconds() == 60
   end
 
+  test "rejects while the store backlog is over its limit" do
+    System.put_env("SPILLWAY_STORE_MAX_BACKLOG", "1")
+    # A stand-in for a per-table RocksDB process that isn't keeping up.
+    pid = spawn(fn -> receive(do: (:stop -> :ok)) end)
+    Process.register(pid, :mnesia_ext_proc_admission_test)
+
+    try do
+      for _ <- 1..5, do: send(pid, :write)
+      Process.sleep(300)
+      assert {:rejected, "store_backlog", 1, n} = Admission.check()
+      assert n >= 5
+    after
+      send(pid, :stop)
+    end
+  end
+
   test "snapshot reports enabled true by default (body/db defaults), false only if explicitly all disabled" do
     System.delete_env("SPILLWAY_MEMORY_LIMIT_MB")
     System.delete_env("SPILLWAY_MAX_BODY_BYTES")
@@ -106,6 +124,7 @@ defmodule Spillway.AdmissionTest do
 
     System.put_env("SPILLWAY_MAX_BODY_BYTES", "0")
     System.put_env("SPILLWAY_DB_MAX_BYTES", "0")
+    System.put_env("SPILLWAY_STORE_MAX_BACKLOG", "0")
     refute Admission.snapshot().enabled
 
     System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "1000000")

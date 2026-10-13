@@ -295,6 +295,8 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 
 | Env var | Default | Description |
 |---|---|---|
+| `SPILLWAY_VALKEY_URL` | *(unset)* | Keep WebSocket transcripts in Valkey/Redis streams (`XADD` with `MAXLEN`, expiring after `SPILLWAY_WS_STREAM_TTL_SECONDS`), as Aquifer does. Unset, they stay in Mnesia. |
+| `SPILLWAY_STORE_MAX_BACKLOG` | `5000` | Refuse new jobs with 429 (`store_backlog`) once this many store writes are queued, instead of letting them pile up. `0` disables. Queue depths are on `GET /health` under `admission`. |
 | `SPILLWAY_STORAGE` | `ram` | `rocksdb` keeps jobs, results and idempotency keys in RocksDB (via `mnesia_rocksdb`) instead of RAM: memory stops growing with how many jobs are retained, and a restart doesn't reload them all. `ram` is faster for small stores. Switching converts existing tables at boot. |
 | `SPILLWAY_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once the process's resident memory exceeds this many MB. Past 70% of it (VM memory), the oldest finished jobs are evicted before their retention ends; queued jobs never are. Finished jobs live in RAM, so set this on any instance with a high job rate. |
 | `SPILLWAY_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
