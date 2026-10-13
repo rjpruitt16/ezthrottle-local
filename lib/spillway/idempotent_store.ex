@@ -686,18 +686,20 @@ defmodule Spillway.IdempotentStore do
 
   @doc """
   Returns every Job currently at :queued or :in_flight status, regardless
-  of expiry. Called once at boot to re-enqueue work that survived a crash
-  or restart. Jobs stay :queued until they finish; :in_flight is still
-  matched so rows written by older versions are recovered too.
+  of expiry. Called once at boot, before the endpoint starts, to re-enqueue
+  work that survived a crash or restart (see Spillway.Recovery). Jobs stay
+  :queued until they finish; :in_flight is still matched so rows written by
+  older versions are recovered too.
+
+  A dirty scan: nothing else writes during boot, so a transaction's table
+  lock would protect nothing.
   """
   def recoverable_jobs do
-    {:atomic, jobs} =
-      :mnesia.transaction(fn ->
-        :mnesia.select(@jobs_table, [
-          {{@jobs_table, :_, :"$1", :_, :queued}, [], [:"$1"]},
-          {{@jobs_table, :_, :"$1", :_, :in_flight}, [], [:"$1"]}
-        ])
-      end)
+    jobs =
+      :mnesia.dirty_select(@jobs_table, [
+        {{@jobs_table, :_, :"$1", :_, :queued}, [], [:"$1"]},
+        {{@jobs_table, :_, :"$1", :_, :in_flight}, [], [:"$1"]}
+      ])
 
     Enum.map(jobs, &Job.upgrade/1)
   end
@@ -1056,8 +1058,11 @@ defmodule Spillway.IdempotentStore do
     end
   end
 
+  # Standalone nodes register nothing (see register_job_owner_local/1), so
+  # they skip the scan of every job id too.
   defp register_existing_job_owners do
-    Enum.each(local_job_ids(), &register_job_owner_local/1)
+    unless Cluster.standalone?(),
+      do: Enum.each(local_job_ids(), &register_job_owner_syn/1)
   end
 
   defp local_job_ids do

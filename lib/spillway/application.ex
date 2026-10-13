@@ -29,6 +29,11 @@ defmodule Spillway.Application do
 
     SpillwayWeb.Plugs.InFlightLimit.setup()
 
+    # Read before the endpoint takes traffic, so the scan sees only jobs
+    # from the previous run; Spillway.Recovery puts them back on their
+    # queues once the node is up.
+    recovered = Spillway.IdempotentStore.recoverable_jobs()
+
     children =
       [
         SpillwayWeb.Telemetry,
@@ -63,7 +68,8 @@ defmodule Spillway.Application do
           Spillway.IdempotentStore,
           Spillway.PoolRegistry,
           Spillway.RemoteBacklog,
-          Spillway.AccountQueueRegistry
+          Spillway.AccountQueueRegistry,
+          {Spillway.Recovery, recovered}
         ] ++
         region_redirect_children() ++ registration_children() ++ [SpillwayWeb.Endpoint]
 
@@ -71,14 +77,7 @@ defmodule Spillway.Application do
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Spillway.Supervisor]
 
-    case Supervisor.start_link(children, opts) do
-      {:ok, _pid} = ok ->
-        recover_queued_jobs()
-        ok
-
-      other ->
-        other
-    end
+    Supervisor.start_link(children, opts)
   end
 
   # Cross-region /proxy redirect (Spillway.Redirect) -- the region
@@ -183,19 +182,6 @@ defmodule Spillway.Application do
     dir = Application.get_env(:spillway, :mnesia_dir, "priv/mnesia")
     File.mkdir_p!(dir)
     Application.put_env(:mnesia, :dir, to_charlist(dir))
-  end
-
-  # Jobs left at :queued or :in_flight when the node last stopped have no
-  # way to resume on their own — this is what makes the Mnesia switch an
-  # actual durability guarantee rather than just "writes happen to
-  # survive on disk but nothing ever picks them back up."
-  defp recover_queued_jobs do
-    jobs = Spillway.IdempotentStore.recoverable_jobs()
-
-    if jobs != [] do
-      Logger.info("recovering #{length(jobs)} queued/in-flight jobs from Mnesia")
-      Enum.each(jobs, &Spillway.AccountQueueRegistry.enqueue/1)
-    end
   end
 
   # Tell Phoenix to update the endpoint configuration
