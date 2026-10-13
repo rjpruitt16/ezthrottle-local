@@ -147,15 +147,13 @@ defmodule Spillway.Admission do
     base = base_retry_after_seconds()
     streak = :atomics.get(counters(), 1)
 
-    if streak <= 1 do
-      base
-    else
-      backoff =
-        Enum.reduce(2..streak//1, base, fn _, acc ->
-          if acc < @max_retry_after_seconds, do: acc * 2, else: acc
-        end)
-
-      min(backoff, @max_retry_after_seconds)
+    # Doubling a positive base passes the cap within a few steps, so cap the
+    # exponent instead of looping once per rejection. The loop this replaces
+    # ran over the whole streak on every 429: under sustained overload in
+    # soak run 3d (over a million rejections) it took about 70% of the CPU.
+    cond do
+      streak <= 1 or base <= 0 -> base
+      true -> min(base * Integer.pow(2, min(streak - 1, 16)), @max_retry_after_seconds)
     end
   end
 

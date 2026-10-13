@@ -91,6 +91,14 @@ defmodule Spillway.AdmissionTest do
     assert Admission.retry_after_seconds() == 5
   end
 
+  test "retry_after_seconds costs the same however long the rejection streak" do
+    System.put_env("SPILLWAY_RETRY_AFTER_SECONDS", "5")
+    :atomics.put(:persistent_term.get({Admission, :counters}), 1, 10_000_000)
+    {micros, value} = :timer.tc(&Admission.retry_after_seconds/0)
+    assert value == 60
+    assert micros < 1_000
+  end
+
   test "retry_after_seconds caps at 60" do
     System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "1")
     System.put_env("SPILLWAY_RETRY_AFTER_SECONDS", "5")
