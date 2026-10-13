@@ -32,8 +32,7 @@ defmodule Spillway.Application do
     children =
       [
         SpillwayWeb.Telemetry,
-        {Cluster.Supervisor,
-         [Spillway.Cluster.topologies(), [name: Spillway.ClusterSupervisor]]},
+        {Cluster.Supervisor, [Spillway.Cluster.topologies(), [name: Spillway.ClusterSupervisor]]},
         {Phoenix.PubSub, name: Spillway.PubSub},
         # Pooled, persistent connections for upstream and webhook dispatch
         # (AccountQueue.make_request/6). inet6: true tries IPv6 first and
@@ -47,14 +46,17 @@ defmodule Spillway.Application do
              count: System.schedulers_online(),
              conn_opts: [transport_opts: [inet6: true]]
            ]
-         }},
-        {Registry, keys: :unique, name: Spillway.WebSocketStreamOwners},
-        {Spillway.WebSocketStore, websocket_config},
-        {Spillway.WebSocketQueue, websocket_config},
-        {Registry, keys: :unique, name: Spillway.WebSocketSessionRegistry},
-        Spillway.WebSocketSessionSupervisor,
-        Spillway.L8
+         }}
       ] ++
+        Spillway.WebSocketStore.Valkey.child_specs() ++
+        [
+          {Registry, keys: :unique, name: Spillway.WebSocketStreamOwners},
+          {Spillway.WebSocketStore, websocket_config},
+          {Spillway.WebSocketQueue, websocket_config},
+          {Registry, keys: :unique, name: Spillway.WebSocketSessionRegistry},
+          Spillway.WebSocketSessionSupervisor,
+          Spillway.L8
+        ] ++
         l8_schema_children() ++
         [
           Spillway.Admission,

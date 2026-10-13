@@ -9,6 +9,7 @@ defmodule Spillway.WebSocketStore do
   require Logger
 
   alias Spillway.{WebSocketBudget, WebSocketConfig}
+  alias Spillway.WebSocketStore.Valkey
 
   @streams :websocket_streams
   @events :websocket_events
@@ -91,7 +92,16 @@ defmodule Spillway.WebSocketStore do
     end
   end
 
+  # With SPILLWAY_VALKEY_URL set, transcripts live in Valkey streams
+  # (Spillway.WebSocketStore.Valkey) and the Mnesia code below is unused.
+
   def append(session_id, direction, envelope) when direction in ["client", "backend"] do
+    if Valkey.enabled?(),
+      do: Valkey.append(hash_session(session_id), direction, envelope, WebSocketConfig.load()),
+      else: append_mnesia(session_id, direction, envelope)
+  end
+
+  defp append_mnesia(session_id, direction, envelope) do
     config = WebSocketConfig.load()
     session_hash = hash_session(session_id)
     now = System.system_time(:millisecond)
@@ -131,9 +141,11 @@ defmodule Spillway.WebSocketStore do
   live session {:trim_transcript, limit}, and the session calls this.
   """
   def trim_owned(session_id, limit) do
-    session_hash = hash_session(session_id)
+    unless Valkey.enabled?() do
+      session_hash = hash_session(session_id)
+      dirty(fn -> trim_stream(session_hash, limit) end)
+    end
 
-    dirty(fn -> trim_stream(session_hash, limit) end)
     :ok
   end
 
@@ -150,6 +162,14 @@ defmodule Spillway.WebSocketStore do
 
   def check_cursor(session_id, cursor) do
     with {:ok, parsed} <- parse_cursor(cursor) do
+      if Valkey.enabled?(),
+        do: Valkey.check_cursor(hash_session(session_id), parsed),
+        else: check_cursor_mnesia(session_id, parsed)
+    end
+  end
+
+  defp check_cursor_mnesia(session_id, parsed) do
+    begin = fn ->
       session_hash = hash_session(session_id)
       now = System.system_time(:millisecond)
 
@@ -159,12 +179,22 @@ defmodule Spillway.WebSocketStore do
       # a transaction, where a concurrent trim can't silently drop events.
       :mnesia.async_dirty(fn -> validate_cursor(session_hash, parsed, now) end)
     end
+
+    begin.()
   catch
     :exit, {:aborted, reason} -> {:error, reason}
   end
 
   def read_after(session_id, cursor, limit) when is_integer(limit) and limit > 0 do
     with {:ok, parsed} <- parse_cursor(cursor) do
+      if Valkey.enabled?(),
+        do: Valkey.read_after(hash_session(session_id), parsed, limit),
+        else: read_after_mnesia(session_id, parsed, limit)
+    end
+  end
+
+  defp read_after_mnesia(session_id, parsed, limit) do
+    begin = fn ->
       session_hash = hash_session(session_id)
       now = System.system_time(:millisecond)
 
@@ -175,6 +205,8 @@ defmodule Spillway.WebSocketStore do
         {:error, reason} -> {:error, reason}
       end
     end
+
+    begin.()
   end
 
   def parse_cursor(nil), do: {:ok, {0, 0}}
@@ -205,8 +237,12 @@ defmodule Spillway.WebSocketStore do
 
   @impl true
   def init(config) do
-    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
-    schedule_budget()
+    # Valkey expires and caps streams itself.
+    unless Valkey.enabled?() do
+      Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+      schedule_budget()
+    end
+
     {:ok, config}
   end
 
@@ -236,7 +272,13 @@ defmodule Spillway.WebSocketStore do
   every stream to the per-session limit. Active streams are also trimmed on
   each append; this pass catches idle ones.
   """
-  def enforce_budget(budget_bytes \\ nil, idle_ms \\ @idle_before_trim_ms) do
+  def enforce_budget(budget_bytes \\ nil, idle_ms \\ @idle_before_trim_ms)
+
+  def enforce_budget(budget_bytes, idle_ms) do
+    if Valkey.enabled?(), do: :ok, else: enforce_budget_mnesia(budget_bytes, idle_ms)
+  end
+
+  defp enforce_budget_mnesia(budget_bytes, idle_ms) do
     {used, events, streams} = usage()
     budget_bytes = budget_bytes || WebSocketBudget.budget_bytes(used)
 
@@ -248,6 +290,12 @@ defmodule Spillway.WebSocketStore do
 
   @doc "Transcript memory for GET /health."
   def budget_snapshot do
+    if Valkey.enabled?(),
+      do: %{transcript_store: "valkey"},
+      else: budget_snapshot_mnesia()
+  end
+
+  defp budget_snapshot_mnesia do
     {used, events, streams} = usage()
 
     %{
