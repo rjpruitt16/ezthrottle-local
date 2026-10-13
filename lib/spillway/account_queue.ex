@@ -52,6 +52,12 @@ defmodule Spillway.AccountQueue do
     # walking the whole queue.
     positions_scheduled: false,
     last_request_at: 0,
+    # Timer for the next paced dispatch, when one is due later. The queue
+    # used to Process.sleep out the interval inline, and while it slept it
+    # read nothing: completions (and the faster pace they carry), new jobs.
+    # At the 0.5 rps floor after an upstream outage that was 2s per job, so
+    # a full queue barely drained and every new job was refused (soak run 3e).
+    dispatch_timer: nil,
     # Earliest execute_before among queued jobs (ms), nil when none has one.
     # expire_queued_jobs/1 runs on every :process_next; without this it
     # copied and filtered the whole queue each time, which grew
@@ -397,6 +403,8 @@ defmodule Spillway.AccountQueue do
   def handle_cast({:update_rps, rps}, state) do
     safe_rps = max(rps, @min_rps)
     Metrics.flow_rate(state.upstream, safe_rps)
+    # A faster pace can make the next dispatch due before the armed timer.
+    if not :queue.is_empty(state.queue), do: send(self(), :process_next)
     {:noreply, %{state | rps: safe_rps}, arm_idle_timeout()}
   end
 
@@ -409,6 +417,10 @@ defmodule Spillway.AccountQueue do
   def handle_info(:process_next, state) do
     state = expire_queued_jobs(state)
     {:noreply, dispatch_batch(state, @dispatch_batch), arm_idle_timeout()}
+  end
+
+  def handle_info(:dispatch_due, state) do
+    handle_info(:process_next, %{state | dispatch_timer: nil})
   end
 
   @impl true
@@ -549,6 +561,33 @@ defmodule Spillway.AccountQueue do
   end
 
   defp dispatch_one(state) do
+    # Enforce RPS with jitter to prevent synchronized bursts across queues.
+    # Not due yet: arm one timer and go back to the mailbox.
+    interval_ms = trunc(1_000 / state.rps)
+    elapsed = System.system_time(:millisecond) - state.last_request_at
+
+    if elapsed < interval_ms,
+      do: {:wait, arm_dispatch_timer(state, Jitter.add_ms(interval_ms - elapsed))},
+      else: dispatch_due(state)
+  end
+
+  defp arm_dispatch_timer(%{dispatch_timer: nil} = state, delay_ms),
+    do: %{state | dispatch_timer: Process.send_after(self(), :dispatch_due, delay_ms)}
+
+  # Already armed: keep it, unless the pace went up and the next dispatch is
+  # now due sooner than the timer would fire.
+  defp arm_dispatch_timer(%{dispatch_timer: ref} = state, delay_ms) do
+    case Process.read_timer(ref) do
+      remaining when is_integer(remaining) and remaining <= delay_ms ->
+        state
+
+      _ ->
+        Process.cancel_timer(ref)
+        %{state | dispatch_timer: Process.send_after(self(), :dispatch_due, delay_ms)}
+    end
+  end
+
+  defp dispatch_due(state) do
     case resolve_target(state) do
       :no_pool_members ->
         # Pool-backed queue with no live members yet. This can happen
@@ -560,15 +599,6 @@ defmodule Spillway.AccountQueue do
         {:wait, state}
 
       {:ok, job, dispatch_url, member, remaining_queue} ->
-        # Enforce RPS with jitter to prevent synchronized bursts across queues
-        now = System.system_time(:millisecond)
-        interval_ms = trunc(1_000 / state.rps)
-        elapsed = now - state.last_request_at
-
-        if elapsed < interval_ms do
-          Process.sleep(Jitter.add_ms(interval_ms - elapsed))
-        end
-
         new_state = %{
           state
           | queue: remaining_queue,
