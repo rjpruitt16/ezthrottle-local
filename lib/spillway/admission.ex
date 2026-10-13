@@ -57,13 +57,14 @@ defmodule Spillway.Admission do
   # process), not the Agent: an Agent.update per request made every
   # submission take turns through one process. Slots: 1 reject streak,
   # 2 cached Mnesia dir bytes, 3 when they were read (ms), 4 cached memory
-  # MB, 5 when it was read, 6 cached store backlog, 7 when it was read.
+  # MB, 5 when it was read, 6 cached store backlog, 7 when it was read,
+  # 8 cached fullness, 9 when it was read.
   @sample_ttl_ms 250
 
   defp counters do
     case :persistent_term.get({__MODULE__, :counters}, nil) do
       nil ->
-        ref = :atomics.new(7, signed: true)
+        ref = :atomics.new(9, signed: true)
         :persistent_term.put({__MODULE__, :counters}, ref)
         ref
 
@@ -155,6 +156,38 @@ defmodule Spillway.Admission do
       streak <= 1 or base <= 0 -> base
       true -> min(base * Integer.pow(2, min(streak - 1, 16)), @max_retry_after_seconds)
     end
+  end
+
+  @doc """
+  How full this node is, 0-100, for the `x-aqueduct-fullness` response
+  header (SpillwayWeb.Plugs.Fullness) and the registration ping. It's the
+  most-constrained of the limits this node already enforces -- memory,
+  the Mnesia directory, the store write backlog, and the fullest
+  upstream's backlog against its budget (Spillway.Intake) -- because that's
+  the one that will start turning work away first. Limits that are
+  switched off don't count. Same contract as Aquifer's X-Aqueduct-Fullness:
+  unlike admission pressure, which stays at 0 until fair admission's 70%
+  starting point, it rises from the first queued job, so whatever is in
+  front of this node (Canalis, or a client) sees it filling up before it
+  pushes back. Sampled at most every #{@sample_ttl_ms}ms, like the readings
+  behind it.
+  """
+  def fullness, do: sampled(8, 9, &compute_fullness/0)
+
+  @doc false
+  def compute_fullness do
+    [
+      memory_limit_mb() > 0 and sampled_memory_mb() / memory_limit_mb(),
+      db_max_bytes() > 0 and sampled_db_bytes() / db_max_bytes(),
+      store_max_backlog() > 0 and sampled_store_backlog() / store_max_backlog(),
+      Spillway.Intake.backlog_fullness_ratio()
+    ]
+    |> Enum.filter(&is_number/1)
+    |> Enum.max(fn -> 0.0 end)
+    |> min(1.0)
+    |> max(0.0)
+    |> Kernel.*(100)
+    |> round()
   end
 
   @doc "Snapshot for GET /health, independent of whether a request is currently being rejected."

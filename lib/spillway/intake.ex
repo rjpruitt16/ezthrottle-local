@@ -52,6 +52,27 @@ defmodule Spillway.Intake do
   def unregister_queue(domain, queue_key, pid),
     do: safe(fn -> :ets.delete_object(@queues, {{domain, queue_key}, pid}) end)
 
+  @doc """
+  The fullest upstream's backlog against its own backlog budget, 0.0 and
+  up, for Spillway.Admission.fullness/0. Per upstream, not summed: one
+  upstream at its limit is already turning work away, however idle the
+  others are. Domains with no budget (0) don't count.
+  """
+  def backlog_fullness_ratio do
+    @queues
+    |> :ets.match({{:settings, :"$1"}, :_, :"$2"})
+    |> Enum.reduce(0.0, fn [domain, max_backlog], fullest ->
+      if is_integer(max_backlog) and max_backlog > 0 do
+        backlog = domain |> domain_backlogs() |> Enum.reduce(0, fn {_pid, b}, sum -> sum + b end)
+        max(fullest, backlog / max_backlog)
+      else
+        fullest
+      end
+    end)
+  rescue
+    ArgumentError -> 0.0
+  end
+
   @doc "Every `{domain, queue_key, pid}` this node tracks whose process runs here."
   def local_queues do
     :ets.select(@queues, [
