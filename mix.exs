@@ -58,9 +58,12 @@ defmodule Spillway.MixProject do
       {:finch, "~> 0.19"},
       {:redix, "~> 1.5"},
       # RocksDB storage for Mnesia tables (SPILLWAY_STORAGE=rocksdb). Not on
-      # Hex; pinned to the commit that moved to emqx/erlang-rocksdb 1.8.0-emqx-10.
+      # Hex. A fork of aeternity/mnesia_rocksdb a6567a2 (emqx/erlang-rocksdb
+      # 1.8.0-emqx-10) that applies the configured RocksDB options when a
+      # store is reopened; upstream reopens every table with RocksDB's
+      # defaults (see config :mnesia_rocksdb, :rocksdb_opts).
       {:mnesia_rocksdb,
-       github: "aeternity/mnesia_rocksdb", ref: "a6567a217f54c40a36b2e4729ba30f1db08713bc"}
+       github: "rjpruitt16/mnesia_rocksdb", ref: "cd779d95c4fd86df2013e28ae500adc6490c4bf1"}
     ]
   end
 

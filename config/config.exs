@@ -16,6 +16,15 @@ import Config
 # node ran out of memory.
 config :mnesia_rocksdb, default_access_type: :direct
 
+# Small write buffers for every RocksDB table. Each table also keeps up to
+# max_write_buffer_number * write_buffer_size of flushed buffers for
+# transaction conflict checks, so with RocksDB's default 64MB buffers six
+# tables held about 700MB outside the BEAM. In soak run 3e that kept
+# resident memory over SPILLWAY_MEMORY_LIMIT_MB, and admission refused
+# every job for hours. 8MB keeps it near 25MB a table.
+config :mnesia_rocksdb,
+  rocksdb_opts: [write_buffer_size: 8 * 1024 * 1024, max_write_buffer_number: 2]
+
 config :spillway,
   generators: [timestamp_type: :utc_datetime],
   metrics_adapter: Spillway.Metrics.Noop
