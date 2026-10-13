@@ -124,6 +124,51 @@ defmodule Spillway.AdmissionTest do
     end
   end
 
+  describe "background readings" do
+    setup do
+      on_exit(fn ->
+        Application.delete_env(:spillway, :admission_db_bytes_reader)
+        Admission.refresh()
+      end)
+    end
+
+    test "rejects on the database size the background reading found" do
+      System.put_env("SPILLWAY_DB_MAX_BYTES", "1000")
+      Application.put_env(:spillway, :admission_db_bytes_reader, fn -> 5_000 end)
+      Admission.refresh()
+
+      assert {:rejected, "db_size", 1000, 5_000} = Admission.check()
+      assert Admission.snapshot().db_bytes == 5_000
+    end
+
+    # Soak run 3e: requests read the directory size themselves, each walk
+    # took minutes under load, and nearly every in-flight slot was spent
+    # waiting on one.
+    test "submissions never wait on a slow directory walk" do
+      System.put_env("SPILLWAY_DB_MAX_BYTES", "1000000000")
+      parent = self()
+
+      Application.put_env(:spillway, :admission_db_bytes_reader, fn ->
+        send(parent, :walking)
+        Process.sleep(2_000)
+        1
+      end)
+
+      send(Admission, :refresh)
+      assert_receive :walking, 2_000
+
+      {micros, results} =
+        :timer.tc(fn ->
+          1..200
+          |> Task.async_stream(fn _ -> Admission.check() end, max_concurrency: 200)
+          |> Enum.map(fn {:ok, r} -> r end)
+        end)
+
+      assert Enum.all?(results, &(&1 == :ok))
+      assert micros < 500_000
+    end
+  end
+
   test "snapshot reports enabled true by default (body/db defaults), false only if explicitly all disabled" do
     System.delete_env("SPILLWAY_MEMORY_LIMIT_MB")
     System.delete_env("SPILLWAY_MAX_BODY_BYTES")

@@ -34,12 +34,13 @@ defmodule Spillway.Admission do
   resetting the moment a request is allowed again — see retry_after_seconds/0.
   """
 
-  use Agent
+  use GenServer
   require Logger
 
   @max_retry_after_seconds 60
   @default_max_body_bytes 1 * 1024 * 1024
   @default_db_max_bytes 800 * 1024 * 1024
+  @refresh_ms 1_000
 
   def start_link(_opts) do
     if env_int("SPILLWAY_MEMORY_LIMIT_MB", 0) == 0 do
@@ -50,15 +51,15 @@ defmodule Spillway.Admission do
     end
 
     counters()
-    Agent.start_link(fn -> nil end, name: __MODULE__)
+    GenServer.start_link(__MODULE__, nil, name: __MODULE__)
   end
 
   # check/0 runs on every submission. Its state lives in :atomics (no
-  # process), not the Agent: an Agent.update per request made every
+  # process), not in this GenServer: a call per request made every
   # submission take turns through one process. Slots: 1 reject streak,
-  # 2 cached Mnesia dir bytes, 3 when they were read (ms), 4 cached memory
-  # MB, 5 when it was read, 6 cached store backlog, 7 when it was read,
-  # 8 cached fullness, 9 when it was read.
+  # 2 store dir bytes, 3 when they were read (ms), 4 memory MB, 5 when it
+  # was read, 6 cached store backlog, 7 when it was read, 8 cached fullness,
+  # 9 when it was read.
   @sample_ttl_ms 250
 
   defp counters do
@@ -73,12 +74,48 @@ defmodule Spillway.Admission do
     end
   end
 
-  # Both readings are expensive per request (stat-ing every Mnesia file;
-  # summing BEAM memory) and barely move in a few hundred milliseconds.
-  # Exactly one caller refreshes an expired reading; the rest keep using the
-  # cached value. Without that, every request in flight when the reading
-  # expired listed and stat-ed the Mnesia directory at once, and those
-  # calls all queue on OTP's single :file_server process.
+  # Memory and the Mnesia directory's size are read here, once a second,
+  # and requests only read the stored values. They used to be read by
+  # whichever request found the cached value expired. In soak run 3e the
+  # directory held about 150 RocksDB files and the CPU was saturated, so a
+  # walk took minutes in OTP's single :file_server process; a new request
+  # started another walk every 250ms while the first was still running,
+  # and 502 of the 512 in-flight request slots ended up waiting on walks.
+  # Every other submission got a 429. Here one walk runs at a time and the
+  # next starts only after it finishes, however slow it gets.
+  @impl true
+  def init(nil) do
+    refresh()
+    schedule_refresh()
+    {:ok, nil}
+  end
+
+  @impl true
+  def handle_info(:refresh, state) do
+    refresh()
+    schedule_refresh()
+    {:noreply, state}
+  end
+
+  @doc false
+  # Takes fresh readings now. Also used by tests.
+  def refresh do
+    ref = counters()
+    store(ref, 4, 5, current_memory_mb())
+    store(ref, 2, 3, db_bytes_reader().())
+    :ok
+  end
+
+  defp store(ref, value_slot, at_slot, value) do
+    :atomics.put(ref, value_slot, value)
+    :atomics.put(ref, at_slot, System.monotonic_time(:millisecond))
+  end
+
+  defp schedule_refresh, do: Process.send_after(self(), :refresh, @refresh_ms)
+
+  # The store backlog is a handful of message_queue_len reads, cheap enough
+  # to take in the caller. Exactly one caller refreshes an expired reading;
+  # the rest keep using the cached value.
   defp sampled(value_slot, at_slot, read) do
     ref = counters()
     now = System.monotonic_time(:millisecond)
@@ -103,6 +140,17 @@ defmodule Spillway.Admission do
     end
   end
 
+  # The last background reading. Before the first one (Admission not started
+  # yet) it reads directly, once per caller.
+  defp measured(value_slot, at_slot, read) do
+    ref = counters()
+
+    case :atomics.get(ref, at_slot) do
+      0 -> read.()
+      _ -> :atomics.get(ref, value_slot)
+    end
+  end
+
   def memory_limit_mb, do: env_int("SPILLWAY_MEMORY_LIMIT_MB", 0)
   def max_body_bytes, do: env_int("SPILLWAY_MAX_BODY_BYTES", @default_max_body_bytes)
   def db_max_bytes, do: env_int("SPILLWAY_DB_MAX_BYTES", @default_db_max_bytes)
@@ -121,13 +169,13 @@ defmodule Spillway.Admission do
   """
   def check do
     cond do
-      memory_limit_mb() > 0 and sampled_memory_mb() > memory_limit_mb() ->
+      memory_limit_mb() > 0 and measured_memory_mb() > memory_limit_mb() ->
         record_rejection()
-        {:rejected, "memory", memory_limit_mb(), sampled_memory_mb()}
+        {:rejected, "memory", memory_limit_mb(), measured_memory_mb()}
 
-      db_max_bytes() > 0 and sampled_db_bytes() > db_max_bytes() ->
+      db_max_bytes() > 0 and measured_db_bytes() > db_max_bytes() ->
         record_rejection()
-        {:rejected, "db_size", db_max_bytes(), sampled_db_bytes()}
+        {:rejected, "db_size", db_max_bytes(), measured_db_bytes()}
 
       store_max_backlog() > 0 and sampled_store_backlog() > store_max_backlog() ->
         record_rejection()
@@ -162,23 +210,23 @@ defmodule Spillway.Admission do
   How full this node is, 0-100, for the `x-aqueduct-fullness` response
   header (SpillwayWeb.Plugs.Fullness) and the registration ping. It's the
   most-constrained of the limits this node already enforces -- memory,
-  the Mnesia directory, the store write backlog, and the fullest
+  the database directory, the store write backlog, and the fullest
   upstream's backlog against its budget (Spillway.Intake) -- because that's
   the one that will start turning work away first. Limits that are
   switched off don't count. Same contract as Aquifer's X-Aqueduct-Fullness:
   unlike admission pressure, which stays at 0 until fair admission's 70%
   starting point, it rises from the first queued job, so whatever is in
   front of this node (Canalis, or a client) sees it filling up before it
-  pushes back. Sampled at most every #{@sample_ttl_ms}ms, like the readings
-  behind it.
+  pushes back. Sampled at most every #{@sample_ttl_ms}ms; memory and disk
+  come from the background readings, so a response never waits on them.
   """
   def fullness, do: sampled(8, 9, &compute_fullness/0)
 
   @doc false
   def compute_fullness do
     [
-      memory_limit_mb() > 0 and sampled_memory_mb() / memory_limit_mb(),
-      db_max_bytes() > 0 and sampled_db_bytes() / db_max_bytes(),
+      memory_limit_mb() > 0 and measured_memory_mb() / memory_limit_mb(),
+      db_max_bytes() > 0 and measured_db_bytes() / db_max_bytes(),
       store_max_backlog() > 0 and sampled_store_backlog() / store_max_backlog(),
       Spillway.Intake.backlog_fullness_ratio()
     ]
@@ -194,9 +242,9 @@ defmodule Spillway.Admission do
   def snapshot do
     %{
       enabled: any_limit_configured?(),
-      memory_mb: current_memory_mb(),
+      memory_mb: measured_memory_mb(),
       memory_limit_mb: memory_limit_mb(),
-      db_bytes: mnesia_dir_bytes(),
+      db_bytes: measured_db_bytes(),
       db_max_bytes: db_max_bytes(),
       max_body_bytes: max_body_bytes(),
       store_backlog: Spillway.StorePressure.backlog(),
@@ -219,27 +267,39 @@ defmodule Spillway.Admission do
     :ok
   end
 
-  defp sampled_memory_mb, do: sampled(4, 5, &current_memory_mb/0)
-  defp sampled_db_bytes, do: sampled(2, 3, &mnesia_dir_bytes/0)
+  defp measured_memory_mb, do: measured(4, 5, &current_memory_mb/0)
+  defp measured_db_bytes, do: measured(2, 3, fn -> db_bytes_reader().() end)
   defp sampled_store_backlog, do: sampled(6, 7, &Spillway.StorePressure.backlog/0)
 
   defp current_memory_mb, do: Spillway.MemoryUsage.mb()
 
+  # Tests swap in a slow reader to check requests never wait on it.
+  defp db_bytes_reader,
+    do: Application.get_env(:spillway, :admission_db_bytes_reader, &mnesia_dir_bytes/0)
+
   # Everything under the Mnesia directory. RocksDB tables
   # (SPILLWAY_STORAGE=rocksdb) keep their files in subdirectories, which a
-  # flat listing counted as a few KB each, so the limit never fired.
-  defp mnesia_dir_bytes, do: dir_bytes(:mnesia.system_info(:directory))
+  # flat listing counted as a few KB each, so the limit never fired. Raw
+  # file operations, so the walk doesn't queue behind other callers of
+  # OTP's :file_server.
+  defp mnesia_dir_bytes, do: dir_bytes(to_charlist(:mnesia.system_info(:directory)))
 
   defp dir_bytes(path) do
-    case File.lstat(path) do
-      {:ok, %File.Stat{type: :directory}} ->
-        case File.ls(path) do
-          {:ok, entries} -> entries |> Enum.map(&dir_bytes(Path.join(path, &1))) |> Enum.sum()
-          _ -> 0
-        end
+    case :file.read_link_info(path, [:raw]) do
+      {:ok, info} ->
+        case File.Stat.from_record(info) do
+          %File.Stat{type: :directory} ->
+            case :prim_file.list_dir(path) do
+              {:ok, entries} ->
+                entries |> Enum.map(&dir_bytes(:filename.join(path, &1))) |> Enum.sum()
 
-      {:ok, %File.Stat{size: size}} ->
-        size
+              _ ->
+                0
+            end
+
+          %File.Stat{size: size} ->
+            size
+        end
 
       _ ->
         0
