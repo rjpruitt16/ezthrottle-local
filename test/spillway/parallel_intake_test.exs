@@ -62,8 +62,10 @@ defmodule Spillway.ParallelIntakeTest do
     # Rewrite the stored struct without the newer field, as an older version would have.
     old = current |> Map.delete(:execute_before)
 
-    :mnesia.dirty_write(
-      {:jobs, current.id, old, System.system_time(:millisecond) + 60_000, :queued}
+    Spillway.Store.put(
+      :jobs,
+      current.id,
+      {old, System.system_time(:millisecond) + 60_000, :queued}
     )
 
     upgraded = IdempotentStore.get_job(current.id)

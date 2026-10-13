@@ -53,7 +53,7 @@ Every response also carries `X-Aqueduct-Fullness`: how full this node is, `0`–
 
 Spillway uses libcluster for optional BEAM discovery and Syn for queue ownership. When `DNS_CLUSTER_QUERY` is set, connected nodes agree on one `AccountQueue` owner for each upstream and queue key; a request received by any node is routed to that owner before idempotency admission, persistence, and enqueueing. Pacing state and circuit-breaker changes are propagated between the upstream's URL actors. Without `DNS_CLUSTER_QUERY`, the same code path runs as a standalone one-node cluster.
 
-This coordinates live processes; it does not turn each node's Mnesia directory into a replicated database. While the owning node is connected, job status and result calls route back to its local store. If that node is unavailable, its persisted jobs become available when it returns and performs normal recovery. Configure Mnesia replication separately if the deployment requires another node to serve that data during the owner's outage. Mnesia also binds its on-disk schema to the Erlang node name, so every clustered machine must retain the same node name when reusing its volume.
+This coordinates live processes; it does not replicate each node's store. While the owning node is connected, job status and result calls route back to its local store. If that node is unavailable, its persisted jobs become available when it returns and performs normal recovery.
 
 | Environment variable | Default | Effect |
 |---|---:|---|
@@ -127,13 +127,13 @@ A reroute is never silent to the caller — same principle as `proxy_fallback` a
 
 If literally no known-live region can help either — none live at all, or every one tried and failed — the request is **rejected**, not queued locally: **429**, `Retry-After` set to `SPILLWAY_REDIRECT_EXHAUSTED_RETRY_AFTER_SECONDS` (default 900 — a real regional outage, not a transient blip), `limit_reason: "redirect_exhausted"`, same response shape as an admission-control rejection. Queueing locally instead was never actually decided, so the default is to fail loudly rather than have the request land unnoticed on one struggling instance's queue. Separate from `SPILLWAY_REDIRECT_GATE_COOLDOWN_SECONDS` (default 500) — that one is purely internal probe-retry throttling, not what's told to the caller.
 
-**Honest limitation, not silently glossed over:** this instance's idempotency check remains per-instance (Mnesia), unchanged by this feature. If the exact same `idempotent_key` is independently submitted to two different regions at nearly the same moment (a real scenario — a caller's own client retrying after a timeout can land on a different region via Fly's anycast), each region may independently begin its own redirect tour, and in rare cases the job could end up durably queued in two places. The deterministic region selection above narrows this window but does not close it. During cross-region redirect specifically, treat delivery as at-least-once, not exactly-once.
+**Honest limitation, not silently glossed over:** this instance's idempotency check remains per-instance (its local store), unchanged by this feature. If the exact same `idempotent_key` is independently submitted to two different regions at nearly the same moment (a real scenario — a caller's own client retrying after a timeout can land on a different region via Fly's anycast), each region may independently begin its own redirect tour, and in rare cases the job could end up durably queued in two places. The deterministic region selection above narrows this window but does not close it. During cross-region redirect specifically, treat delivery as at-least-once, not exactly-once.
 
 ## GET /websocket
 
-WebSocket proxying with an ordered Mnesia transcript, cursor replay, paced upstream connection admission, and automatic reconnect. This is the same `aqueduct.v1` wire contract Aquifer exposes. Spillway does **not** authenticate callers or choose their destination; put it behind a trusted gateway that authenticates the request and injects the upstream URL.
+WebSocket proxying with an ordered transcript, cursor replay, paced upstream connection admission, and automatic reconnect. This is the same `aqueduct.v1` wire contract Aquifer exposes. Spillway does **not** authenticate callers or choose their destination; put it behind a trusted gateway that authenticates the request and injects the upstream URL.
 
-WebSockets are enabled by default because Mnesia is already part of Spillway. `SPILLWAY_WS_ENABLED=false` is an operational kill switch.
+WebSockets are enabled by default; transcripts use the node's local store unless `SPILLWAY_VALKEY_URL` is set. `SPILLWAY_WS_ENABLED=false` is an operational kill switch.
 
 ### Handshake
 
@@ -196,7 +196,7 @@ Neither direction buffers without bound:
 
 New handshakes are refused with **429** when `SPILLWAY_MEMORY_LIMIT_MB` or the database size limit is exceeded, with the same body and `Retry-After` as job admission.
 
-Transcripts retain the newest configured events and expire after an idle TTL. They are held in memory, so the node also caps their total size: `SPILLWAY_WS_TRANSCRIPT_MAX_MB` when set; otherwise whatever room the rest of the node leaves under a memory target (90% of `SPILLWAY_MEMORY_LIMIT_MB`, or 40% of the machine's memory), and never more than a quarter of memory. The budget shrinks as the rest of the node's memory grows. While transcripts are over that budget, each session keeps an equal share of it (at least 10 events), so the largest transcripts lose their oldest events first. A client whose cursor was trimmed gets **409** on reconnect. `GET /health` reports `transcript_mb`, `transcript_budget_mb` and the current `session_event_limit` under `websocket`. Mnesia uses the same `SPILLWAY_MNESIA_FLUSH_INTERVAL_MS` durability tradeoff as job storage. The current schema is local to one node, so cross-node replay requires sticky routing or a separately configured replicated Mnesia topology.
+Transcripts retain the newest configured events and expire after an idle TTL. The node also caps their total size: `SPILLWAY_WS_TRANSCRIPT_MAX_MB` when set; otherwise whatever room the rest of the node leaves under a memory target (90% of `SPILLWAY_MEMORY_LIMIT_MB`, or 40% of the machine's memory), and never more than a quarter of memory. The budget shrinks as the rest of the node's memory grows. While transcripts are over that budget, each session keeps an equal share of it (at least 10 events), so the largest transcripts lose their oldest events first. A client whose cursor was trimmed gets **409** on reconnect. `GET /health` reports `transcript_mb`, `transcript_budget_mb` and the current `session_event_limit` under `websocket`. The local store has the same `SPILLWAY_STORE_SYNC_INTERVAL_MS` durability tradeoff as job storage. It is local to one node, so cross-node replay requires sticky routing or Valkey (`SPILLWAY_VALKEY_URL`).
 
 #### What the transcript guarantees
 
@@ -204,7 +204,7 @@ The transcript is a **replay window**, not a durable log. It is built for reconn
 
 - **Guaranteed:** every message is recorded before it is forwarded or delivered, and a client that reconnects with a cursor still inside the window receives every backend event after it, in order, at least once.
 - **Not guaranteed:** history older than the window. The window shrinks under load: per-session retention, the TTL, and the node's transcript budget all trim the oldest events. A client whose cursor points before them is closed or gets **409** and must resynchronize from your application's own state. Spillway never skips events silently, but it does not keep them forever.
-- **Storage is this node's Mnesia,** in memory with a disk copy. It survives a restart of the node, not the loss of its disk, and it is not replicated across nodes.
+- **Storage is this node's RocksDB store** (or Valkey with `SPILLWAY_VALKEY_URL`). It survives a restart of the node, not the loss of its disk, and it is not replicated across nodes.
 
 If you need every message kept beyond the window (audit, analytics, replay from the beginning), record it in your own durable store from the backend, or follow the durable-transcript extension in the issue tracker.
 

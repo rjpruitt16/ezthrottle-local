@@ -11,8 +11,8 @@ rather than "latest" -- both projects ship frequently.
 
 ## Why `replicas: 1`
 
-This is not a simplification to loosen later. Spillway's durable queue is Mnesia
-`disc_copies` backed by a local `MNESIA_DIR` per instance, and pool membership plus the SSE/PubSub
+This is not a simplification to loosen later. Spillway's durable queue is a
+RocksDB store in a local `SPILLWAY_STORE_DIR` per instance, and pool membership plus the SSE/PubSub
 subscriber state are in-process (BEAM) only in this deployment shape. Scaling is by
 **partitioning** -- running one instance per upstream domain or tenant -- not by adding replicas
 behind one Service. Multiple replicas sharing this manifest's `Service` would risk double-dispatch
@@ -25,12 +25,12 @@ own PVC, own `HTTPRoute` path or hostname), not a higher `replicas` count.
 Not simplifications or defensive boilerplate -- both caused a hard boot failure in testing and are
 fixed in `deployment.yaml` as shipped:
 
-1. **Stable node naming (`RELEASE_NODE`), required.** `rel/env.sh.eex` names the Erlang node after
+1. **Stable node naming (`RELEASE_NODE`).** `rel/env.sh.eex` names the Erlang node after
    `$(hostname)` by default, which is the Pod's own name -- new on every single restart under a
-   Deployment. Mnesia's `disc_copies` schema is tied to the exact node name that created it, so
-   without a fixed name, any pod restart makes Mnesia treat its own on-disk data as belonging to a
-   node that no longer exists and fails to boot (`node_not_running`). Same class of bug already hit
-   and fixed for Fly.io (see the comment in `rel/env.sh.eex`); this is the Kubernetes equivalent.
+   Deployment. While the store was Mnesia this was required: its `disc_copies` schema was tied to
+   the node name that created it, so a pod restart under a new name failed to boot
+   (`node_not_running`). The RocksDB store isn't tied to the node name, so this is no longer a boot
+   requirement; the manifest keeps it so the node keeps one name across restarts.
 2. **No `resources.limits.memory`, deliberately.** Confirmed in testing (`kind` on Docker Desktop)
    that setting one -- at 512Mi *and* at 1Gi -- causes an instant `OOMKilled` (exit 137) on every
    boot attempt, despite the same image using ~136MiB under plain `docker run -m 512m`. A CPU limit
@@ -106,7 +106,7 @@ proxy, a real job (`POST /jobs` → `postman-echo.com`) returned 201 with a job 
 `GET /jobs/:id` afterward showed `"status": "completed"`. Also verified the specific thing that
 makes this deployment shape different from Aquifer's SQLite-backed one: deleted the running pod
 mid-test to force a real restart onto a new hostname, and confirmed the job created before the
-restart was still readable afterward -- Mnesia durability surviving a pod restart, not just a
+restart was still readable afterward -- durability surviving a pod restart (tested with the earlier Mnesia store), not just a
 process restart on the same machine. That only works because of the `RELEASE_NODE` fix documented
 in `deployment.yaml` below; without it, the second pod failed to boot at all.
 

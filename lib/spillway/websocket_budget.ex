@@ -3,9 +3,12 @@
 
 defmodule Spillway.WebSocketBudget do
   @moduledoc """
-  Bounds the memory WebSocket transcripts use on this node.
+  Bounds the space WebSocket transcripts use on this node, when they're kept
+  in the local store (no SPILLWAY_VALKEY_URL).
 
-  Transcripts live in Mnesia `disc_copies` tables, which are held in RAM.
+  Transcripts used to live in Mnesia `disc_copies` tables, held in RAM; they
+  are now in RocksDB (Spillway.WebSocketStore), but the budget still follows
+  memory, so a node's transcripts stay a bounded share of it.
   Retention was only per session (`SPILLWAY_WS_STREAM_MAX_EVENTS`,
   default 10,000), so the total grew with the number of sessions: 500 busy
   sessions could hold 5M events, more than a 2 GB machine has. In the Fly

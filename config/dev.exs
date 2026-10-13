@@ -45,7 +45,7 @@ config :spillway, SpillwayWeb.Endpoint,
 # Enable dev routes for dashboard and mailbox
 config :spillway, dev_routes: true
 
-config :spillway, :mnesia_dir, "priv/mnesia_dev"
+config :spillway, :store_dir, "priv/store_dev"
 
 # Do not include metadata nor timestamps in development logs
 config :logger, :console, format: "[$level] $message\n"

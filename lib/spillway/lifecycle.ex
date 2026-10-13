@@ -15,7 +15,7 @@ defmodule Spillway.Lifecycle do
      webhooks) has finished, bounded by SPILLWAY_SHUTDOWN_TIMEOUT_SECONDS,
   4. flushes the drain ledger once more when drain mode is enabled.
 
-  Work still queued at the deadline stays in Mnesia for startup recovery.
+  Work still queued at the deadline stays in the store for startup recovery.
   """
   require Logger
 

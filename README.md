@@ -60,7 +60,7 @@ In all three, the upstream can lower the dispatch pace via response headers. See
 ```
 clients  →  trusted gateway  →  GET /websocket  →  WebSocket backend
 ```
-The same `aqueduct.v1` protocol as Aquifer, backed locally by Mnesia: durable ordered messages, cursor replay, paced upstream connection openings, and automatic reconnect. Authentication remains the gateway's job. See [`GET /websocket`](API.md#get-websocket).
+The same `aqueduct.v1` protocol as Aquifer, backed by the node's local store: durable ordered messages, cursor replay, paced upstream connection openings, and automatic reconnect. Authentication remains the gateway's job. See [`GET /websocket`](API.md#get-websocket).
 
 ---
 
@@ -254,17 +254,19 @@ Every job requires an `idempotent_key`. Submitting the same key twice **for the 
 
 ---
 
-## Durability (Mnesia)
+## Durability (RocksDB)
 
-Jobs are written to Mnesia disc-backed tables, not kept purely in memory.
+Jobs, idempotency keys and results are written to RocksDB on the node's disk, called directly from Elixir. Spillway used Mnesia until soak run 3; its transaction layer and the Mnesia-to-RocksDB adapter were where the cost and most of the bugs were.
 
 <details>
-<summary>Full durability reference — MNESIA_DIR, flush interval tuning</summary>
+<summary>Full durability reference — store directory, log sync</summary>
 
 Two things matter for what "durable" actually means here:
 
-- `MNESIA_DIR`: where the on-disk tables live. **Must point at a persistent volume in production** (defaults to `/data/mnesia` in `fly.toml`, mirroring Aquifer's `DB_PATH`). Without a real volume mount, this data lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
-- `SPILLWAY_MNESIA_FLUSH_INTERVAL_MS` (default `100`): Mnesia's `disc_copies` tables live in RAM by default, with the disk copy caught up via a periodic flush, not on every write. `0` flushes synchronously on every write (zero loss, real per-request latency cost); a positive value batches the flush on a timer instead, bounding the loss window on a true crash to roughly that many milliseconds of writes. 100ms was found empirically to be a good default; see [benchmark.md](benchmark.md) for why going higher made things *worse*, not better.
+- `SPILLWAY_STORE_DIR`: where the database lives. **Must point at a persistent volume in production** (`/data/spillway` by default, mirroring Aquifer's `DB_PATH`). Without a real volume mount, this data lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
+- `SPILLWAY_STORE_SYNC_INTERVAL_MS` (default `100`): every write reaches RocksDB's write-ahead log before it returns, so a killed process loses nothing. The log is synced to disk on this timer, which bounds what a machine or kernel crash can lose to about this many milliseconds of writes. `0` syncs on every write (no loss on a machine crash, a disk flush per request).
+
+A job's rows are written as one atomic batch. Each node's store is its own; nodes don't replicate it.
 
 </details>
 
@@ -282,7 +284,7 @@ The two combine: a fleet can partition statically by upstream domain, while indi
 
 **External registration**: off by default, and orthogonal to the above. `SPILLWAY_REGISTRY_URL` makes a node periodically report its own listening port to an external control plane (deciding tenant assignment, scaling, etc. is entirely that service's job, not this node's). See **[REGISTRATION.md](REGISTRATION.md)** for the env vars and ping payload shape.
 
-**Region-local clustering is optional.** With `DNS_CLUSTER_QUERY` set, libcluster discovers sibling BEAM nodes and Syn gives each upstream/account queue one live owner across the connected cluster, so any node can accept a user's request without creating a second queue. Unset, Spillway remains standalone. Mnesia durability is still node-local unless you configure replication separately; see [API.md](API.md#region-local-queue-ownership) for the exact boundary and settings.
+**Region-local clustering is optional.** With `DNS_CLUSTER_QUERY` set, libcluster discovers sibling BEAM nodes and Syn gives each upstream/account queue one live owner across the connected cluster, so any node can accept a user's request without creating a second queue. Unset, Spillway remains standalone. Each node's store stays local to it; see [API.md](API.md#region-local-queue-ownership) for the exact boundary and settings.
 
 ---
 
@@ -295,12 +297,11 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 
 | Env var | Default | Description |
 |---|---|---|
-| `SPILLWAY_VALKEY_URL` | *(unset)* | Keep WebSocket transcripts in Valkey/Redis streams (`XADD` with `MAXLEN`, expiring after `SPILLWAY_WS_STREAM_TTL_SECONDS`), as Aquifer does. Unset, they stay in Mnesia. |
+| `SPILLWAY_VALKEY_URL` | *(unset)* | Keep WebSocket transcripts in Valkey/Redis streams (`XADD` with `MAXLEN`, expiring after `SPILLWAY_WS_STREAM_TTL_SECONDS`), as Aquifer does. Unset, they stay in the node's local store. |
 | `SPILLWAY_STORE_MAX_BACKLOG` | `5000` | Refuse new jobs with 429 (`store_backlog`) once this many store writes are queued, instead of letting them pile up. `0` disables. Queue depths are on `GET /health` under `admission`. |
-| `SPILLWAY_STORAGE` | `ram` | `rocksdb` keeps jobs, results and idempotency keys in RocksDB (via `mnesia_rocksdb`) instead of RAM: memory stops growing with how many jobs are retained, and a restart doesn't reload them all. `ram` is faster for small stores. Switching converts existing tables at boot. |
-| `SPILLWAY_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once the process's resident memory exceeds this many MB. Past 70% of it (VM memory), the oldest finished jobs are evicted before their retention ends; queued jobs never are. Finished jobs live in RAM, so set this on any instance with a high job rate. |
+| `SPILLWAY_MEMORY_LIMIT_MB` | *(disabled)* | Reject new jobs once the process's resident memory exceeds this many MB. Retained jobs live on disk, so memory doesn't grow with how many are kept. |
 | `SPILLWAY_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
-| `SPILLWAY_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the Mnesia directory exceeds this many bytes |
+| `SPILLWAY_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the store directory exceeds this many bytes |
 | `SPILLWAY_MAX_PENDING_PER_USER` | `10000` | Reject new client work for one user once its queued plus in-flight jobs reach this ceiling; `0` disables it |
 | `SPILLWAY_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
 | `SPILLWAY_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429`: doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |
@@ -420,7 +421,7 @@ docker run -p 4000:4000 spillway
 
 ## Deployment
 
-Run standalone, partition nodes by upstream, or connect a region-local cluster with `DNS_CLUSTER_QUERY`. Each node persists to its own Mnesia directory; Syn coordinates live queue ownership but does not replicate that disk state.
+Run standalone, partition nodes by upstream, or connect a region-local cluster with `DNS_CLUSTER_QUERY`. Each node persists to its own RocksDB store; Syn coordinates live queue ownership but does not replicate that disk state.
 
 <details>
 <summary>Full deployment reference — Fly.io, Kubernetes, partitioning, zero-downtime updates</summary>
@@ -433,7 +434,7 @@ fly volumes create ezthrottle_data --region iad --size 1
 fly deploy
 ```
 
-The volume is required now that jobs are Mnesia-backed (`disc_copies`), not pure ETS. Without it, `MNESIA_DIR` lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
+The volume is required: jobs are stored on disk. Without it, `SPILLWAY_STORE_DIR` lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
 
 For maximum queue capacity, use the largest available machine. A 32GB RAM machine can hold 3–32 million jobs in memory, enough buffer for hours of traffic at typical agentic workloads, giving your autoscaler time to catch up before a single request is dropped.
 
@@ -446,7 +447,7 @@ For maximum queue capacity, use the largest available machine. A 32GB RAM machin
 
 ### Deploy to Kubernetes
 
-A fourth deployment shape alongside sidecar, standalone, and embedded library: Spillway as a normal Deployment, reached through a Gateway API proxy (Envoy Gateway) instead of a sidecar. See [`examples/kubernetes/`](examples/kubernetes/), verified end-to-end against a real `kind` cluster, including a real pod restart proving Mnesia durability survives it (requires a stable `RELEASE_NODE`, documented there).
+A fourth deployment shape alongside sidecar, standalone, and embedded library: Spillway as a normal Deployment, reached through a Gateway API proxy (Envoy Gateway) instead of a sidecar. See [`examples/kubernetes/`](examples/kubernetes/), verified end-to-end against a real `kind` cluster, including a real pod restart (verified while the store was still Mnesia, which also needed a stable `RELEASE_NODE`).
 
 ### Scaling by partitioning
 
@@ -471,9 +472,11 @@ The project was renamed; behavior is unchanged.
 
 - **Environment variables** are now `SPILLWAY_*`. The old `EZTHROTTLE_*` names still work: at boot each is copied to its new name unless that is already set, and a line on stderr lists the ones still in use.
 - **Release and modules:** the release is `bin/spillway` and the OTP app is `:spillway`.
-- **Saved jobs** carry over. Mnesia stores each job tagged with its module name, and jobs saved under the old name are retagged at boot.
-- **Node name:** Mnesia's data on disk belongs to one node name. On Fly the name comes from the app name and doesn't change. Elsewhere it defaulted to `ezthrottle_local@<hostname>`; to keep data saved under that name, set `RELEASE_NODE=ezthrottle_local@<hostname>`.
 - **Wire headers are unchanged.** `X-EZTHROTTLE-*` request and response headers are shared with the managed EZThrottle service and its SDKs, and `X-Aqueduct-*` is the protocol both implementations speak.
+
+## Upgrading from the Mnesia store
+
+Versions before the RocksDB store kept jobs in Mnesia under `MNESIA_DIR`. That data is not migrated: let the node finish its queued jobs (stop sending traffic until `GET /health` shows none pending), then upgrade. `MNESIA_DIR`, `SPILLWAY_STORAGE` and `SPILLWAY_MNESIA_FLUSH_INTERVAL_MS` are no longer read; set `SPILLWAY_STORE_DIR` and `SPILLWAY_STORE_SYNC_INTERVAL_MS` instead. The store isn't tied to the Erlang node name, so a pinned `RELEASE_NODE` is no longer needed to keep it.
 
 ## License
 

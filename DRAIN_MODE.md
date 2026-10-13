@@ -13,7 +13,7 @@ since the last flush to a webhook, and only on confirmed delivery, clears its lo
 the node safe to hand to someone else.
 
 For longer-running assignments, drain mode can also stream acknowledged ledger batches before the
-node is idle. Batch streaming records each completed or failed user job in a small Mnesia journal,
+node is idle. Batch streaming records each completed or failed user job in a small journal in the node's store,
 posts bounded chunks to the same webhook, and deletes only the acknowledged journal events. The hot
 idempotency/job tables stay in place until the normal idle handoff succeeds.
 
@@ -88,7 +88,7 @@ sequence metadata:
 ```
 
 The webhook response is the acknowledgement: a successful delivery deletes events through
-`sequence_end`; a failed delivery leaves them in Mnesia for retry. Sequence numbers are local to one
+`sequence_end`; a failed delivery leaves them in the store for retry. Sequence numbers are local to one
 node and are for acknowledgement only, not global identity. Downstream dedupe should still key on
 `idempotent_key_hash`.
 

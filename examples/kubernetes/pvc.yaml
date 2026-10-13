@@ -1,9 +1,9 @@
 # ReadWriteOnce is intentional, not a placeholder to loosen later.
-# Spillway's durable queue is Mnesia disc_copies backed by a local
-# directory (MNESIA_DIR) per instance, and scaling is by partitioning
+# Spillway's durable queue is a RocksDB store in a local
+# directory (SPILLWAY_STORE_DIR) per instance, and scaling is by partitioning
 # instances (one per upstream/tenant), not by replicas sharing state -- see
 # the root README's partitioning notes (e.g. the pool-registration section).
-# A ReadWriteMany volume would let multiple pods mount the same Mnesia
+# A ReadWriteMany volume would let multiple pods mount the same store
 # directory, which this app never expects and does not coordinate around.
 apiVersion: v1
 kind: PersistentVolumeClaim

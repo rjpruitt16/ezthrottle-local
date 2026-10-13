@@ -284,7 +284,7 @@ defmodule Spillway.Job do
   def webhook_delivery_job?(%__MODULE__{webhook_url: url}), do: url in [nil, ""]
 
   @doc """
-  Rebuilds a job read back from Mnesia as the current struct. Records written
+  Rebuilds a job read back from the store as the current struct. Records written
   by older versions lack newer fields (execute_before, for one), and pattern
   matches on the struct crash on them; missing fields get their defaults.
   """

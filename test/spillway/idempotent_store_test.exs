@@ -11,8 +11,8 @@ defmodule Spillway.IdempotentStoreTest do
   # ETS-backed check_or_insert did :ets.lookup followed by a separate
   # :ets.insert, so two concurrent requests with the same idempotent key
   # could both observe an empty lookup and both proceed to insert,
-  # silently defeating duplicate detection. The Mnesia version wraps both
-  # steps in one transaction, which should make this impossible.
+  # silently defeating duplicate detection. The store now holds a per-key
+  # lock across both steps, which should make this impossible.
   test "concurrent check_or_insert calls with unique keys are never misreported as duplicates" do
     n = 50
     stamp = System.unique_integer([:positive])
@@ -119,7 +119,7 @@ defmodule Spillway.IdempotentStoreTest do
   # Drain mode's store-level primitives (Spillway.DrainFlush):
   # enumerate returns exactly what was inserted, hash-only, and clear wipes
   # the whole table so a previously-duplicate key is fresh afterward. Runs
-  # against the same shared Mnesia instance every other test in this file
+  # against the same shared store every other test in this file
   # does, so it explicitly clears first (rather than assuming a clean
   # table) and only asserts on its own uniquely-stamped entries.
   test "list_ledger and clear_ledger" do
@@ -225,29 +225,5 @@ defmodule Spillway.IdempotentStoreTest do
 
     assert entry.idempotent_key_hash ==
              "3140c2d8efe61829e6d590d2309b5a43257b0ad3098e7d8836bef6b91466b064"
-  end
-
-  test "jobs saved under the pre-rename module name load as Spillway jobs" do
-    id = "legacy-#{System.unique_integer([:positive])}"
-
-    job = %Job{
-      id: id,
-      user_id: "legacy-user",
-      idempotent_key: id,
-      url: "https://example.com/webhook",
-      method: "POST"
-    }
-
-    legacy_module = Module.concat(["Ezthrottle" <> "Local", "Job"])
-    legacy = Map.put(job, :__struct__, legacy_module)
-    expires_at = System.system_time(:millisecond) + 60_000
-    :ok = :mnesia.dirty_write({:jobs, id, legacy, expires_at, :queued})
-
-    IdempotentStore.migrate_renamed_jobs()
-
-    assert [{:jobs, ^id, %Job{id: ^id, user_id: "legacy-user"}, ^expires_at, :queued}] =
-             :mnesia.dirty_read(:jobs, id)
-
-    :mnesia.dirty_delete(:jobs, id)
   end
 end

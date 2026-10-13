@@ -14,9 +14,11 @@ defmodule Spillway.StoreCountsTest do
   alias Spillway.Job
 
   defp scan do
-    rows = :mnesia.dirty_match_object({:jobs, :_, :_, :_, :_})
-    pending = Enum.count(rows, fn {:jobs, _, _, _, status} -> status in [:queued, :in_flight] end)
-    %{total_jobs: length(rows), queue_depth: pending}
+    statuses =
+      Spillway.Store.fold(:jobs, [], fn {_id, {_job, _exp, status}}, acc -> [status | acc] end)
+
+    pending = Enum.count(statuses, &(&1 in [:queued, :in_flight]))
+    %{total_jobs: length(statuses), queue_depth: pending}
   end
 
   defp job(stamp, i) do
@@ -70,8 +72,10 @@ defmodule Spillway.StoreCountsTest do
     legacy = job(stamp, 1)
     :ok = IdempotentStore.check_or_insert(legacy)
 
-    :mnesia.dirty_write(
-      {:jobs, legacy.id, legacy, System.system_time(:millisecond) + 60_000, :in_flight}
+    Spillway.Store.put(
+      :jobs,
+      legacy.id,
+      {legacy, System.system_time(:millisecond) + 60_000, :in_flight}
     )
 
     IdempotentStore.seed_counts()

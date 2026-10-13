@@ -150,8 +150,10 @@ defmodule Spillway.PipelinePerfTest do
 
     for i <- 1..n,
         do:
-          :mnesia.dirty_write(
-            {:jobs, "retained-#{i}", %{job | id: "retained-#{i}"}, expires, :completed}
+          Spillway.Store.put(
+            :jobs,
+            "retained-#{i}",
+            {%{job | id: "retained-#{i}"}, expires, :completed}
           )
 
     Spillway.IdempotentStore.seed_counts()

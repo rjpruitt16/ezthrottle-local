@@ -3,16 +3,17 @@
 
 defmodule Spillway.StorePressure do
   @moduledoc """
-  How far the job store is behind: messages queued at the processes every
-  store write passes through (Mnesia's transaction manager, lock manager and
-  controller, the IdempotentStore GenServer, and any per-table RocksDB
-  process). In soak run 3c those queues reached 10,000 while new jobs kept
-  being admitted, and the callers waiting on them used enough memory to get
-  the node killed. Admission refuses new jobs past
+  How far the job store is behind: messages queued at the IdempotentStore
+  GenServer, which serves store calls routed from other nodes and the
+  expiry pass. Most writes go straight to RocksDB from the caller's process
+  (Spillway.Store) and queue nowhere. In soak run 3c, when every write
+  passed through Mnesia's processes, those queues reached 10,000 while new
+  jobs kept being admitted, and the callers waiting on them used enough
+  memory to get the node killed. Admission refuses new jobs past
   SPILLWAY_STORE_MAX_BACKLOG instead.
   """
 
-  @named [:mnesia_tm, :mnesia_locker, :mnesia_controller, Spillway.IdempotentStore]
+  @named [Spillway.IdempotentStore]
 
   @doc "Messages queued across the store's processes."
   def backlog do
@@ -40,12 +41,5 @@ defmodule Spillway.StorePressure do
         do: {inspect(name), n}
   end
 
-  defp store_processes do
-    rocksdb =
-      for name <- Process.registered(),
-          String.starts_with?(Atom.to_string(name), "mnesia_ext_proc_"),
-          do: name
-
-    @named ++ rocksdb
-  end
+  defp store_processes, do: @named
 end

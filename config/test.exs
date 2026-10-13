@@ -10,12 +10,12 @@ config :spillway, SpillwayWeb.Endpoint,
   secret_key_base: "HR2qlZsS3F111UZvJNY2Q6bmWTLPp5NnU5jqZq8syib+ObOflc5K8Ubu1QHGQUMJ",
   server: false
 
-# Fresh directory per test run — Mnesia has no per-test-case reset the way
+# Fresh directory per test run — the store has no per-test-case reset the way
 # a Go test can just create a new t.TempDir() SQLite file, so isolation
 # here is at the whole-suite level. Tests should use unique idempotent
 # keys/user_ids the way Aquifer's own tests do, rather than relying on a
 # clean slate between individual test cases.
-config :spillway, :mnesia_dir, "tmp/mnesia_test_#{System.system_time(:millisecond)}"
+config :spillway, :store_dir, "tmp/store_test_#{System.system_time(:millisecond)}"
 
 # Print only warnings and errors during test
 config :logger, level: :warning

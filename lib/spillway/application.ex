@@ -21,7 +21,6 @@ defmodule Spillway.Application do
   @impl true
   def start(_type, _args) do
     configure_httpc_ipfamily()
-    configure_mnesia_dir()
     Spillway.IdempotentStore.ensure_schema!()
     Spillway.WebSocketStore.ensure_tables!()
     Spillway.UserLoad.ensure_table!()
@@ -36,6 +35,9 @@ defmodule Spillway.Application do
 
     children =
       [
+        # Opened in ensure_schema! above; this process syncs its log and
+        # owns the idempotency key gate.
+        Spillway.Store,
         SpillwayWeb.Telemetry,
         {Cluster.Supervisor, [Spillway.Cluster.topologies(), [name: Spillway.ClusterSupervisor]]},
         {Phoenix.PubSub, name: Spillway.PubSub},
@@ -171,17 +173,6 @@ defmodule Spillway.Application do
   # both code paths share it.
   defp configure_httpc_ipfamily do
     :httpc.set_options(ipfamily: :inet6fb4)
-  end
-
-  # Mnesia's :dir is read at :mnesia.start()/:mnesia.create_schema() time,
-  # so it has to be set before Spillway.IdempotentStore.ensure_schema!
-  # runs. MNESIA_DIR should point at a persistent volume in production
-  # (mirrors Aquifer's DB_PATH) — without that, disc_copies data lives on
-  # the machine's ephemeral filesystem and durability is lost on redeploy.
-  defp configure_mnesia_dir do
-    dir = Application.get_env(:spillway, :mnesia_dir, "priv/mnesia")
-    File.mkdir_p!(dir)
-    Application.put_env(:mnesia, :dir, to_charlist(dir))
   end
 
   # Tell Phoenix to update the endpoint configuration

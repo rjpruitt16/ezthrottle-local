@@ -29,10 +29,12 @@ spillway-*.tar
 .l8-key
 /l8-trust/
 
-# Local Mnesia disc_copies data (dev/test only — prod points MNESIA_DIR at
-# a persistent volume via fly.toml)
+# Local store data (dev/test only — prod points SPILLWAY_STORE_DIR at a
+# persistent volume via fly.toml)
 /priv/mnesia/
 /priv/mnesia_dev/
+/priv/store/
+/priv/store_dev/
 
 # region-redirect e2e test — deployment state, local to whoever ran it
 test/region_redirect/.state
