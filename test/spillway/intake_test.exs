@@ -136,6 +136,40 @@ defmodule Spillway.IntakeTest do
              AccountQueueRegistry.submit_internal(job("peruser-#{stamp}-internal", "noisy", base))
   end
 
+  # Soak run 3e: after an upstream outage dropped a queue to the 0.5 rps
+  # floor, it slept out each 2s interval inline and read nothing meanwhile,
+  # so a full queue barely drained and every new job was refused.
+  test "a queue paced at the floor keeps reading its mailbox and speeds up at once" do
+    previous = Application.get_env(:spillway, :default_rps)
+    Application.put_env(:spillway, :default_rps, 0.5)
+    on_exit(fn -> Application.put_env(:spillway, :default_rps, previous || 2.0) end)
+
+    port = Enum.random(20_000..60_000)
+
+    start_supervised!(
+      {Bandit, plug: {Upstream, test_pid: self()}, port: port, startup_log: false}
+    )
+
+    base = "http://127.0.0.1:#{port}"
+    stamp = System.unique_integer([:positive])
+    actor = AccountQueueRegistry.actor_for(job("paced-#{stamp}-0", "u", base))
+
+    for i <- 1..5 do
+      assert {:accepted, _} = AccountQueueRegistry.submit(job("paced-#{stamp}-#{i}", "u", base))
+    end
+
+    assert_receive :hit, 3_000
+    queue = :sys.get_state(actor).queues.shared
+
+    # Between paced dispatches the queue still answers right away.
+    {micros, _} = :timer.tc(fn -> :sys.get_state(queue, 1_000) end)
+    assert micros < 300_000
+
+    # Raising the pace drains the rest now, not one per 2s.
+    AccountQueue.update_rps(queue, 1_000.0)
+    for _ <- 2..5, do: assert_receive(:hit, 1_500)
+  end
+
   test "jobs arriving while their queue retires after going idle are never lost" do
     System.put_env("SPILLWAY_IDLE_TIMEOUT_MS", "200")
     previous = Application.get_env(:spillway, :default_rps)
