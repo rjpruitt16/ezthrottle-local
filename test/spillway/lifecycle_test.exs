@@ -91,10 +91,9 @@ defmodule Spillway.LifecycleTest do
   end
 
   test "drain waits for accepted work and its webhook, then returns" do
-    # Drain waits for everything pending on the node, so start from an idle
-    # node: earlier tests can leave jobs retrying against unreachable hosts.
-    Spillway.NodeIdle.wait()
-    IdempotentStore.clear_ledger()
+    # Drain waits for everything pending on the node, so start from an empty
+    # one: earlier tests can leave jobs retrying against unreachable hosts.
+    Spillway.NodeIdle.reset()
     upstream = start_server(SlowPlug, 800)
     webhook = start_server(WebhookPlug, self())
     job_id = submit(upstream, webhook)

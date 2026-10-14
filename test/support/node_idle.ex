@@ -16,6 +16,58 @@ defmodule Spillway.NodeIdle do
     do_wait(deadline)
   end
 
+  @doc """
+  Stops every account queue and every request it has in flight, then clears
+  the store. For tests that measure node-wide state from a clean start.
+
+  wait/1 can't see a job sitting out a retry delay after the store was
+  cleared: its row is gone and it isn't in any queue's backlog. When the
+  delay ends it fails again and writes itself back as queued (record_retry),
+  so a drain that started "idle" waits on it. user_load_test leaves webhook
+  deliveries retrying against a server it has stopped, and the lifecycle
+  drain test failed on them.
+  """
+  def reset do
+    pids =
+      for pid <- Process.list(),
+          queue_process?(pid),
+          do: pid
+
+    Enum.each(pids, &Process.exit(&1, :kill))
+    Enum.each(pids, &wait_dead/1)
+
+    try do
+      :ets.delete_all_objects(:ez_queue_backlog)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    Spillway.IdempotentStore.clear_ledger()
+    :ok
+  end
+
+  # An account queue, or a request worker it spawned (a spawned fun's
+  # initial call names the module that defined it).
+  defp queue_process?(pid) do
+    case Process.info(pid, [:dictionary, :initial_call]) do
+      [{:dictionary, d}, {:initial_call, {mod, _, _}}] ->
+        d[:"$initial_call"] == {Spillway.AccountQueue, :init, 1} or mod == Spillway.AccountQueue
+
+      _ ->
+        false
+    end
+  end
+
+  defp wait_dead(pid) do
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, _, _, _} -> :ok
+    after
+      1_000 -> :ok
+    end
+  end
+
   # Some tests hold jobs on purpose by setting a queue's max_concurrent to 0
   # (only tests do that); such a queue never drains, so stop it.
   defp release_held_queues do
