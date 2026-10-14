@@ -30,5 +30,21 @@ defmodule Spillway.StoreOptionsTest do
     end
 
     assert text =~ ~r/^\s*keep_log_file_num=5$/m
+
+    tables = text |> String.split(~r/^\[TableOptions\/BlockBasedTable /m) |> tl()
+    assert length(tables) == 10
+
+    for table <- tables do
+      [name | _] = String.split(table, "\n", parts: 2)
+      assert table =~ ~r/^\s*filter_policy=bloomfilter:10:/m, "#{name} has no bloom filter"
+    end
+  end
+
+  test "reads go through a shared cache of SPILLWAY_STORE_CACHE_MB" do
+    expected = Integer.to_string(Spillway.Store.cache_mb() * 1024 * 1024)
+
+    for cf <- [:jobs, :keys, :results] do
+      assert Spillway.Store.property(cf, "rocksdb.block-cache-capacity") == expected
+    end
   end
 end

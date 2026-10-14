@@ -22,7 +22,8 @@ defmodule Spillway.Store do
   (default 100ms); 0 syncs on every write instead.
 
   The data lives under `SPILLWAY_STORE_DIR` (default `/data/spillway`,
-  `priv/store` in development).
+  `priv/store` in development). Reads go through a shared cache of
+  `SPILLWAY_STORE_CACHE_MB` (default 256).
   """
 
   use GenServer
@@ -37,6 +38,16 @@ defmodule Spillway.Store do
   # admission's memory limit can't see it coming (soak run 3e).
   @cf_options [write_buffer_size: 8 * 1024 * 1024, max_write_buffer_number: 2]
 
+  # Reads go through one LRU block cache shared by every column family. On
+  # RocksDB's 8MB default nearly every read missed and went to the volume:
+  # in soak run 3f, 35% of busy processes sat in Store.get after one hour
+  # (727MB of data). Bloom filters let a lookup for a key that isn't there,
+  # the common case for a new submission's idempotency key, skip reading
+  # the table files. The cache lives outside the BEAM but inside resident
+  # memory, so admission's memory limit counts it.
+  @default_cache_mb 256
+  @bloom_bits_per_key 10
+
   @db_options [
     create_if_missing: true,
     create_missing_column_families: true,
@@ -50,6 +61,9 @@ defmodule Spillway.Store do
   @doc "Where the database lives."
   def dir, do: Application.get_env(:spillway, :store_dir, "priv/store")
 
+  @doc "Size of the shared read cache, in MB (`SPILLWAY_STORE_CACHE_MB`)."
+  def cache_mb, do: Application.get_env(:spillway, :store_cache_mb, @default_cache_mb)
+
   @doc """
   Opens the database. Called once at boot, before anything reads or writes;
   the GenServer started later only syncs the log and closes the database.
@@ -60,13 +74,25 @@ defmodule Spillway.Store do
         path = dir()
         File.mkdir_p!(path)
 
+        {:ok, cache} = :rocksdb.new_cache(:lru, cache_mb() * 1024 * 1024)
+
+        cf_options =
+          @cf_options ++
+            [
+              block_based_table_options: [
+                block_cache: cache,
+                bloom_filter_policy: @bloom_bits_per_key
+              ]
+            ]
+
         descriptors = [
-          {~c"default", @cf_options} | Enum.map(@column_families, &{~c"#{&1}", @cf_options})
+          {~c"default", cf_options} | Enum.map(@column_families, &{~c"#{&1}", cf_options})
         ]
 
         {:ok, db, [_default | handles]} =
           :rocksdb.open(to_charlist(path), @db_options, descriptors)
 
+        :persistent_term.put({__MODULE__, :cache}, cache)
         :persistent_term.put({__MODULE__, :db}, db)
         :persistent_term.put({__MODULE__, :cfs}, Map.new(Enum.zip(@column_families, handles)))
         Logger.info("[Store] opened #{path}")

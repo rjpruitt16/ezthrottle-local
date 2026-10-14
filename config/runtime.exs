@@ -83,6 +83,10 @@ if config_env() == :prod do
   # DB_PATH): on the machine's own filesystem the store is lost on redeploy.
   config :spillway, :store_dir, System.get_env("SPILLWAY_STORE_DIR", "/data/spillway")
 
+  config :spillway,
+         :store_cache_mb,
+         String.to_integer(System.get_env("SPILLWAY_STORE_CACHE_MB", "256"))
+
   config :spillway, SpillwayWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [
