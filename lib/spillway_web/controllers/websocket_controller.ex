@@ -105,7 +105,7 @@ defmodule SpillwayWeb.WebSocketController do
   end
 
   # The same memory and database-size ceilings as new jobs: a session holds
-  # memory for as long as it's open, and its transcript lives in Mnesia.
+  # memory for as long as it's open, and its transcript is stored on this node.
   defp admit do
     case Admission.check() do
       :ok -> :ok

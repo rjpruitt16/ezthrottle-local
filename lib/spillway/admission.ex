@@ -21,7 +21,7 @@ defmodule Spillway.Admission do
                                        see IdempotentStore.
     SPILLWAY_MAX_BODY_BYTES       - reject oversized request bodies (413)
                                        (default: 1MB)
-    SPILLWAY_DB_MAX_BYTES         - reject new jobs once the Mnesia
+    SPILLWAY_DB_MAX_BYTES         - reject new jobs once the store
                                        directory exceeds this many bytes
                                        (default: 800MB)
     SPILLWAY_STORE_MAX_BACKLOG    - reject new jobs once this many store
@@ -74,7 +74,7 @@ defmodule Spillway.Admission do
     end
   end
 
-  # Memory and the Mnesia directory's size are read here, once a second,
+  # Memory and the store directory's size are read here, once a second,
   # and requests only read the stored values. They used to be read by
   # whichever request found the cached value expired. In soak run 3e the
   # directory held about 150 RocksDB files and the CPU was saturated, so a
@@ -275,14 +275,11 @@ defmodule Spillway.Admission do
 
   # Tests swap in a slow reader to check requests never wait on it.
   defp db_bytes_reader,
-    do: Application.get_env(:spillway, :admission_db_bytes_reader, &mnesia_dir_bytes/0)
+    do: Application.get_env(:spillway, :admission_db_bytes_reader, &store_dir_bytes/0)
 
-  # Everything under the Mnesia directory. RocksDB tables
-  # (SPILLWAY_STORAGE=rocksdb) keep their files in subdirectories, which a
-  # flat listing counted as a few KB each, so the limit never fired. Raw
-  # file operations, so the walk doesn't queue behind other callers of
-  # OTP's :file_server.
-  defp mnesia_dir_bytes, do: dir_bytes(to_charlist(:mnesia.system_info(:directory)))
+  # Everything under the store directory, with raw file operations so the
+  # walk doesn't queue behind other callers of OTP's :file_server.
+  defp store_dir_bytes, do: dir_bytes(to_charlist(Spillway.Store.dir()))
 
   defp dir_bytes(path) do
     case :file.read_link_info(path, [:raw]) do

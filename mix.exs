@@ -22,16 +22,7 @@ defmodule Spillway.MixProject do
   def application do
     [
       mod: {Spillway.Application, []},
-      extra_applications: [:logger, :runtime_tools, :inets, :crypto],
-      # :mnesia goes in included_applications, not extra_applications:
-      # extra_applications get auto-started by OTP *before*
-      # Spillway.Application.start/2 runs, which would start Mnesia
-      # with its default (RAM-only) directory before our code ever gets to
-      # configure :dir and call create_schema/start explicitly.
-      # included_applications still bundles Mnesia's code into a release
-      # without OTP auto-starting it — we start it ourselves in
-      # IdempotentStore.ensure_schema!/0, after configuring where it writes.
-      included_applications: [:mnesia]
+      extra_applications: [:logger, :runtime_tools, :inets, :crypto]
     ]
   end
 
@@ -57,13 +48,9 @@ defmodule Spillway.MixProject do
       {:jsv, "~> 0.26.0"},
       {:finch, "~> 0.19"},
       {:redix, "~> 1.5"},
-      # RocksDB storage for Mnesia tables (SPILLWAY_STORAGE=rocksdb). Not on
-      # Hex. A fork of aeternity/mnesia_rocksdb a6567a2 (emqx/erlang-rocksdb
-      # 1.8.0-emqx-10) that applies the configured RocksDB options when a
-      # store is reopened; upstream reopens every table with RocksDB's
-      # defaults (see config :mnesia_rocksdb, :rocksdb_opts).
-      {:mnesia_rocksdb,
-       github: "rjpruitt16/mnesia_rocksdb", ref: "cd779d95c4fd86df2013e28ae500adc6490c4bf1"}
+      # The job store (Spillway.Store). EMQX's maintained build of
+      # erlang-rocksdb; not on Hex.
+      {:rocksdb, github: "emqx/erlang-rocksdb", tag: "1.8.0-emqx-10"}
     ]
   end
 

@@ -8,11 +8,9 @@ defmodule Spillway.WebSocketStore do
 
   require Logger
 
-  alias Spillway.{WebSocketBudget, WebSocketConfig}
+  alias Spillway.{Store, WebSocketBudget, WebSocketConfig}
   alias Spillway.WebSocketStore.Valkey
 
-  @streams :websocket_streams
-  @events :websocket_events
   @owners Spillway.WebSocketStreamOwners
   @cleanup_interval_ms 60_000
   # The budget pass trims only streams idle this long: an active stream is
@@ -24,38 +22,29 @@ defmodule Spillway.WebSocketStore do
     GenServer.start_link(__MODULE__, config, name: __MODULE__)
   end
 
+  @doc """
+  Loads the transcript counts. Called once at boot, after Spillway.Store
+  is open.
+  """
   def ensure_tables! do
-    nodes = [node()]
+    {events, bytes} =
+      Store.fold(:ws_events, {0, 0}, fn {_key, value}, {n, b} ->
+        {n + 1, b + :erlang.external_size(value)}
+      end)
 
-    ensure_table(
-      @streams,
-      [:session_hash, :epoch, :next_sequence, :oldest_sequence, :newest_sequence, :expires_at],
-      :set,
-      nodes
-    )
-
-    ensure_table(
-      @events,
-      [:key, :direction, :envelope, :recorded_at],
-      :ordered_set,
-      nodes
-    )
-
-    case :mnesia.wait_for_tables([@streams, @events], 30_000) do
-      :ok -> :ok
-      {:timeout, tables} -> raise "Mnesia WebSocket tables unavailable: #{inspect(tables)}"
-      {:error, reason} -> raise "Mnesia WebSocket tables failed: #{inspect(reason)}"
-    end
+    streams = Store.fold(:ws_streams, 0, fn _, n -> n + 1 end)
+    ref = usage_counters()
+    :atomics.put(ref, 1, events)
+    :atomics.put(ref, 2, streams)
+    :atomics.put(ref, 3, bytes)
+    :atomics.put(ref, 4, events)
+    :ok
   end
 
   # Every stream has one writer: the session process that claimed it (see
   # claim_stream/1), or this GenServer while it holds the claim for cleanup
-  # or a budget trim. So appends and replay reads run as dirty operations,
-  # without Mnesia's lock manager. They were a synced transaction per
-  # message, which at 200 sessions (1,000 messages/s) took about a fifth of
-  # a saturated node's time in locks and commits. Dirty writes are still
-  # logged to disk; a crash can lose the last moments of a transcript, as
-  # it can the last flush interval of jobs.
+  # or a budget trim. So appends and replay reads need no transaction: a
+  # stream's event and its new head are written as one atomic batch.
 
   @doc """
   Makes the calling process the only writer of the session's stream. Called
@@ -93,47 +82,39 @@ defmodule Spillway.WebSocketStore do
   end
 
   # With SPILLWAY_VALKEY_URL set, transcripts live in Valkey streams
-  # (Spillway.WebSocketStore.Valkey) and the Mnesia code below is unused.
+  # (Spillway.WebSocketStore.Valkey) and the RocksDB code below is unused.
 
   def append(session_id, direction, envelope) when direction in ["client", "backend"] do
     if Valkey.enabled?(),
       do: Valkey.append(hash_session(session_id), direction, envelope, WebSocketConfig.load()),
-      else: append_mnesia(session_id, direction, envelope)
+      else: append_local(session_id, direction, envelope)
   end
 
-  defp append_mnesia(session_id, direction, envelope) do
+  defp append_local(session_id, direction, envelope) do
     config = WebSocketConfig.load()
     session_hash = hash_session(session_id)
     now = System.system_time(:millisecond)
 
-    case dirty(fn ->
-           stream = current_stream(session_hash, now)
-           {epoch, next_sequence, oldest_sequence, _newest_sequence} = stream
-           sequence = next_sequence + 1
-           expires_at = now + config.stream_ttl_ms
-           oldest = prune_for_limit(session_hash, epoch, oldest_sequence, sequence, config)
-           key = {session_hash, epoch, sequence}
+    {epoch, next_sequence, oldest_sequence, _newest_sequence} = current_stream(session_hash, now)
+    sequence = next_sequence + 1
+    expires_at = now + config.stream_ttl_ms
+    oldest = prune_for_limit(session_hash, epoch, oldest_sequence, sequence, config)
+    value = {direction, envelope, now}
 
-           :mnesia.write({@events, key, direction, envelope, now})
+    Store.write([
+      {:put, :ws_events, event_key(session_hash, epoch, sequence), value},
+      {:put, :ws_streams, session_hash, {epoch, sequence, oldest, sequence, expires_at}}
+    ])
 
-           :mnesia.write({@streams, session_hash, epoch, sequence, oldest, sequence, expires_at})
+    count_appended(:erlang.external_size(value))
 
-           %{
-             stream_id: format_cursor(epoch, sequence),
-             direction: direction,
-             envelope: envelope,
-             recorded_at: now
-           }
-         end) do
-      {:ok, event} -> {:ok, event}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp dirty(fun) do
-    {:ok, :mnesia.async_dirty(fun)}
-  catch
-    :exit, {:aborted, reason} -> {:error, reason}
+    {:ok,
+     %{
+       stream_id: format_cursor(epoch, sequence),
+       direction: direction,
+       envelope: envelope,
+       recorded_at: now
+     }}
   end
 
   @doc """
@@ -142,20 +123,19 @@ defmodule Spillway.WebSocketStore do
   """
   def trim_owned(session_id, limit) do
     unless Valkey.enabled?() do
-      session_hash = hash_session(session_id)
-      dirty(fn -> trim_stream(session_hash, limit) end)
+      trim_stream(hash_session(session_id), limit)
     end
 
     :ok
   end
 
   defp trim_stream(session_hash, limit) do
-    case :mnesia.read(@streams, session_hash) do
-      [{@streams, ^session_hash, epoch, next, oldest, newest, expires_at}] ->
+    case Store.get(:ws_streams, session_hash) do
+      {:ok, {epoch, next, oldest, newest, expires_at}} ->
         new_oldest = trim_to(session_hash, epoch, oldest, newest, limit)
-        :mnesia.write({@streams, session_hash, epoch, next, new_oldest, newest, expires_at})
+        Store.put(:ws_streams, session_hash, {epoch, next, new_oldest, newest, expires_at})
 
-      [] ->
+      :not_found ->
         :ok
     end
   end
@@ -164,49 +144,17 @@ defmodule Spillway.WebSocketStore do
     with {:ok, parsed} <- parse_cursor(cursor) do
       if Valkey.enabled?(),
         do: Valkey.check_cursor(hash_session(session_id), parsed),
-        else: check_cursor_mnesia(session_id, parsed)
+        else: validate_cursor(hash_session(session_id), parsed, System.system_time(:millisecond))
     end
-  end
-
-  defp check_cursor_mnesia(session_id, parsed) do
-    begin = fn ->
-      session_hash = hash_session(session_id)
-      now = System.system_time(:millisecond)
-
-      # A dirty read: this only validates the cursor at handshake (one read
-      # of one row), and a transaction per new connection was measurable
-      # under a connection burst. The replay itself (read_after) stays in
-      # a transaction, where a concurrent trim can't silently drop events.
-      :mnesia.async_dirty(fn -> validate_cursor(session_hash, parsed, now) end)
-    end
-
-    begin.()
-  catch
-    :exit, {:aborted, reason} -> {:error, reason}
   end
 
   def read_after(session_id, cursor, limit) when is_integer(limit) and limit > 0 do
     with {:ok, parsed} <- parse_cursor(cursor) do
       if Valkey.enabled?(),
         do: Valkey.read_after(hash_session(session_id), parsed, limit),
-        else: read_after_mnesia(session_id, parsed, limit)
+        else:
+          read_events(hash_session(session_id), parsed, limit, System.system_time(:millisecond))
     end
-  end
-
-  defp read_after_mnesia(session_id, parsed, limit) do
-    begin = fn ->
-      session_hash = hash_session(session_id)
-      now = System.system_time(:millisecond)
-
-      # Read by the session process that owns the stream, so no writer can
-      # interleave with it.
-      case dirty(fn -> read_events(session_hash, parsed, limit, now) end) do
-        {:ok, result} -> result
-        {:error, reason} -> {:error, reason}
-      end
-    end
-
-    begin.()
   end
 
   def parse_cursor(nil), do: {:ok, {0, 0}}
@@ -275,10 +223,10 @@ defmodule Spillway.WebSocketStore do
   def enforce_budget(budget_bytes \\ nil, idle_ms \\ @idle_before_trim_ms)
 
   def enforce_budget(budget_bytes, idle_ms) do
-    if Valkey.enabled?(), do: :ok, else: enforce_budget_mnesia(budget_bytes, idle_ms)
+    if Valkey.enabled?(), do: :ok, else: enforce_budget_local(budget_bytes, idle_ms)
   end
 
-  defp enforce_budget_mnesia(budget_bytes, idle_ms) do
+  defp enforce_budget_local(budget_bytes, idle_ms) do
     {used, events, streams} = usage()
     budget_bytes = budget_bytes || WebSocketBudget.budget_bytes(used)
 
@@ -292,10 +240,10 @@ defmodule Spillway.WebSocketStore do
   def budget_snapshot do
     if Valkey.enabled?(),
       do: %{transcript_store: "valkey"},
-      else: budget_snapshot_mnesia()
+      else: budget_snapshot_local()
   end
 
-  defp budget_snapshot_mnesia do
+  defp budget_snapshot_local do
     {used, events, streams} = usage()
 
     %{
@@ -307,10 +255,33 @@ defmodule Spillway.WebSocketStore do
     }
   end
 
+  # Transcript size, from running counts: events and streams held, and the
+  # bytes and count of every event appended, for an average event size.
+  # Slots: 1 events, 2 streams, 3 bytes appended, 4 events appended.
   defp usage do
-    words = :mnesia.table_info(@events, :memory) + :mnesia.table_info(@streams, :memory)
-    used = words * :erlang.system_info(:wordsize)
-    {used, :mnesia.table_info(@events, :size), :mnesia.table_info(@streams, :size)}
+    ref = usage_counters()
+    events = max(:atomics.get(ref, 1), 0)
+    per_event = :atomics.get(ref, 3) / max(:atomics.get(ref, 4), 1)
+    {trunc(events * per_event), events, max(:atomics.get(ref, 2), 0)}
+  end
+
+  defp usage_counters do
+    case :persistent_term.get({__MODULE__, :usage}, nil) do
+      nil ->
+        ref = :atomics.new(4, signed: true)
+        :persistent_term.put({__MODULE__, :usage}, ref)
+        ref
+
+      ref ->
+        ref
+    end
+  end
+
+  defp count_appended(bytes) do
+    ref = usage_counters()
+    :atomics.add(ref, 1, 1)
+    :atomics.add(ref, 3, bytes)
+    :atomics.add(ref, 4, 1)
   end
 
   defp trim_streams_over(limit, idle_ms) do
@@ -319,15 +290,15 @@ defmodule Spillway.WebSocketStore do
     idle_expiry = System.system_time(:millisecond) + ttl_ms - idle_ms
 
     over =
-      :mnesia.dirty_select(@streams, [
-        {{@streams, :"$1", :_, :_, :"$2", :"$3", :"$4"},
-         [{:>, {:-, :"$3", :"$2"}, limit - 1}, {:"=<", :"$4", idle_expiry}], [:"$1"]}
-      ])
+      Store.fold(:ws_streams, [], fn {session_hash, {_epoch, _next, oldest, newest, expires_at}},
+                                     acc ->
+        if newest - oldest > limit - 1 and expires_at <= idle_expiry,
+          do: [session_hash | acc],
+          else: acc
+      end)
 
     Enum.each(over, fn session_hash ->
-      case with_unowned_stream(session_hash, fn ->
-             dirty(fn -> trim_stream(session_hash, limit) end)
-           end) do
+      case with_unowned_stream(session_hash, fn -> trim_stream(session_hash, limit) end) do
         {:owned, pid} -> send(pid, {:trim_transcript, limit})
         _ -> :ok
       end
@@ -335,16 +306,16 @@ defmodule Spillway.WebSocketStore do
   end
 
   defp current_stream(session_hash, now) do
-    case :mnesia.read(@streams, session_hash) do
-      [{@streams, ^session_hash, epoch, next_sequence, oldest, newest, expires_at}]
-      when expires_at > now ->
+    case Store.get(:ws_streams, session_hash) do
+      {:ok, {epoch, next_sequence, oldest, newest, expires_at}} when expires_at > now ->
         {epoch, next_sequence, oldest, newest}
 
-      [{@streams, ^session_hash, epoch, _next_sequence, oldest, newest, _expires_at}] ->
+      {:ok, {epoch, _next_sequence, oldest, newest, _expires_at}} ->
         delete_event_range(session_hash, epoch, oldest, newest)
         {new_epoch(now, epoch), 0, 1, 0}
 
-      [] ->
+      :not_found ->
+        :atomics.add(usage_counters(), 2, 1)
         {now, 0, 1, 0}
     end
   end
@@ -372,8 +343,8 @@ defmodule Spillway.WebSocketStore do
   defp validate_cursor(_session_hash, {0, 0}, _now), do: :ok
 
   defp validate_cursor(session_hash, {cursor_epoch, cursor_sequence}, now) do
-    case :mnesia.read(@streams, session_hash) do
-      [{@streams, ^session_hash, epoch, _next, oldest, _newest, expires_at}]
+    case Store.get(:ws_streams, session_hash) do
+      {:ok, {epoch, _next, oldest, _newest, expires_at}}
       when expires_at > now and epoch == cursor_epoch and cursor_sequence >= oldest ->
         :ok
 
@@ -383,15 +354,14 @@ defmodule Spillway.WebSocketStore do
   end
 
   defp read_events(session_hash, {cursor_epoch, cursor_sequence}, limit, now) do
-    case :mnesia.read(@streams, session_hash) do
-      [] ->
+    case Store.get(:ws_streams, session_hash) do
+      :not_found ->
         if {cursor_epoch, cursor_sequence} == {0, 0}, do: {:ok, []}, else: {:error, :replay_gap}
 
-      [{@streams, ^session_hash, _epoch, _next, _oldest, _newest, expires_at}]
-      when expires_at <= now ->
+      {:ok, {_epoch, _next, _oldest, _newest, expires_at}} when expires_at <= now ->
         if {cursor_epoch, cursor_sequence} == {0, 0}, do: {:ok, []}, else: {:error, :replay_gap}
 
-      [{@streams, ^session_hash, epoch, _next, oldest, newest, _expires_at}] ->
+      {:ok, {epoch, _next, oldest, newest, _expires_at}} ->
         cond do
           {cursor_epoch, cursor_sequence} == {0, 0} ->
             {:ok, load_event_range(session_hash, epoch, oldest, newest, limit)}
@@ -408,22 +378,25 @@ defmodule Spillway.WebSocketStore do
   defp load_event_range(_session_hash, _epoch, first, last, _limit) when first > last, do: []
 
   defp load_event_range(session_hash, epoch, first, last, limit) do
-    first..min(last, first + limit - 1)
-    |> Enum.flat_map(fn sequence ->
-      case :mnesia.read(@events, {session_hash, epoch, sequence}) do
-        [{@events, _key, direction, envelope, recorded_at}] ->
-          [
-            %{
-              stream_id: format_cursor(epoch, sequence),
-              direction: direction,
-              envelope: envelope,
-              recorded_at: recorded_at
-            }
-          ]
+    last = min(last, first + limit - 1)
 
-        [] ->
-          []
-      end
+    :ws_events
+    |> Store.take_from(event_key(session_hash, epoch, first), last - first + 1, fn
+      <<^session_hash::binary-size(byte_size(session_hash)), ^epoch::unsigned-64,
+        seq::unsigned-64>> ->
+        seq <= last
+
+      _ ->
+        false
+    end)
+    |> Enum.map(fn {<<_::binary-size(byte_size(session_hash)), _::unsigned-64,
+                      sequence::unsigned-64>>, {direction, envelope, recorded_at}} ->
+      %{
+        stream_id: format_cursor(epoch, sequence),
+        direction: direction,
+        envelope: envelope,
+        recorded_at: recorded_at
+      }
     end)
   end
 
@@ -431,25 +404,23 @@ defmodule Spillway.WebSocketStore do
     now = System.system_time(:millisecond)
 
     expired =
-      :mnesia.dirty_select(@streams, [
-        {{@streams, :"$1", :_, :_, :_, :_, :"$2"}, [{:"=<", :"$2", now}], [:"$1"]}
-      ])
+      Store.fold(:ws_streams, [], fn {session_hash, {_, _, _, _, expires_at}}, acc ->
+        if expires_at <= now, do: [session_hash | acc], else: acc
+      end)
 
     # A live session's expired stream is left to it: its next append starts
     # a new epoch and deletes the old events itself.
     Enum.each(expired, fn session_hash ->
       with_unowned_stream(session_hash, fn ->
-        dirty(fn ->
-          case :mnesia.read(@streams, session_hash) do
-            [{@streams, ^session_hash, epoch, _next, oldest, newest, expires_at}]
-            when expires_at <= now ->
-              delete_event_range(session_hash, epoch, oldest, newest)
-              :mnesia.delete({@streams, session_hash})
+        case Store.get(:ws_streams, session_hash) do
+          {:ok, {epoch, _next, oldest, newest, expires_at}} when expires_at <= now ->
+            delete_event_range(session_hash, epoch, oldest, newest)
+            Store.delete(:ws_streams, session_hash)
+            :atomics.sub(usage_counters(), 2, 1)
 
-            _ ->
-              :ok
-          end
-        end)
+          _ ->
+            :ok
+        end
       end)
     end)
   end
@@ -457,22 +428,19 @@ defmodule Spillway.WebSocketStore do
   defp delete_event_range(_session_hash, _epoch, first, last) when first > last, do: :ok
 
   defp delete_event_range(session_hash, epoch, first, last) do
-    Enum.each(first..last, fn sequence ->
-      :mnesia.delete({@events, {session_hash, epoch, sequence}})
-    end)
+    Store.delete_range(
+      :ws_events,
+      event_key(session_hash, epoch, first),
+      event_key(session_hash, epoch, last + 1)
+    )
+
+    :atomics.sub(usage_counters(), 1, last - first + 1)
   end
 
-  defp ensure_table(name, attributes, type, nodes) do
-    case :mnesia.create_table(name,
-           attributes: attributes,
-           disc_copies: nodes,
-           type: type
-         ) do
-      {:atomic, :ok} -> Logger.info("[Mnesia] created table #{name}")
-      {:aborted, {:already_exists, ^name}} -> :ok
-      {:aborted, reason} -> raise "failed to create #{name}: #{inspect(reason)}"
-    end
-  end
+  # Ordered by session, then epoch, then sequence, so a stream's events are
+  # one contiguous key range.
+  defp event_key(session_hash, epoch, sequence),
+    do: <<session_hash::binary, epoch::unsigned-64, sequence::unsigned-64>>
 
   defp hash_session(session_id),
     do: :crypto.hash(:sha256, session_id) |> Base.encode16(case: :lower)

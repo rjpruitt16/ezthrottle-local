@@ -1,5 +1,5 @@
-# replicas: 1 is load-bearing, not a default left unconfigured. Mnesia
-# disc_copies here is a local, per-instance directory (MNESIA_DIR), and
+# replicas: 1 is load-bearing, not a default left unconfigured. The
+# store here is a local, per-instance directory (SPILLWAY_STORE_DIR), and
 # pool membership plus the SSE/PubSub subscriber state are in-process only
 # (BEAM, not shared across nodes in this deployment shape). Scaling is by
 # **partitioning** -- running one instance per upstream domain or tenant --
@@ -36,21 +36,16 @@ spec:
               value: "4000"
             - name: PHX_HOST
               value: spillway.example.com # the Gateway's own hostname/domain in your cluster
-            - name: MNESIA_DIR
-              value: /data/mnesia
-            # Required, not optional -- rel/env.sh.eex otherwise names the
-            # Erlang node after $(hostname), which is the Pod's own name
-            # and changes on every single restart under a Deployment.
-            # Mnesia's disc_copies schema is tied to the exact node name
-            # that created it, so without this, ANY pod restart (rolling
-            # update, crash recovery, reschedule) makes Mnesia treat its
-            # own on-disk data as belonging to a node that no longer
-            # exists (node_not_running), crash-looping on boot. Confirmed
-            # by deleting the pod mid-test: without this var the new pod
-            # (different hostname) failed to boot; with it, the new pod
-            # came up clean and a job created before the restart was still
-            # readable after. Same fix already applied for Fly.io via
-            # FLY_APP_NAME in rel/env.sh.eex -- this is the K8s equivalent.
+            - name: SPILLWAY_STORE_DIR
+              value: /data/spillway
+            # A stable node name. rel/env.sh.eex otherwise names the Erlang
+            # node after $(hostname), the Pod's own name, which changes on
+            # every restart. When the store was Mnesia this was required:
+            # its on-disk schema belonged to one node name, and a pod with
+            # a new name crash-looped on boot (node_not_running). The
+            # RocksDB store isn't tied to the node name; this stays so the
+            # node keeps one name across restarts. Fly.io does the same via
+            # FLY_APP_NAME in rel/env.sh.eex.
             - name: RELEASE_NODE
               value: spillway@localhost
             - name: SECRET_KEY_BASE

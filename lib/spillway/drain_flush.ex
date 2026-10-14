@@ -99,7 +99,7 @@ defmodule Spillway.DrainFlush do
   @doc """
   Sends one bounded batch of unacknowledged terminal drain events. Returns
   true when the batch was delivered or there was nothing to send, and false
-  when delivery failed and the events were intentionally left in Mnesia for
+  when delivery failed and the events were intentionally left in the store for
   the next attempt.
   """
   def flush_batch(event \\ "ledger_batch") do

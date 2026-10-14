@@ -45,7 +45,7 @@ end
 # default_rps was already read via Application.get_env in url_actor.ex but
 # had no env var wired to it anywhere -- every UrlActor silently used the
 # 2.0 fallback regardless of deployment. Wired here the same way
-# MNESIA_DIR/SPILLWAY_MEMORY_LIMIT_MB already are.
+# SPILLWAY_STORE_DIR/SPILLWAY_MEMORY_LIMIT_MB already are.
 if rps = System.get_env("SPILLWAY_DEFAULT_RPS") do
   case Float.parse(rps) do
     {value, _} -> config :spillway, default_rps: value
@@ -79,7 +79,9 @@ if config_env() == :prod do
   host = System.get_env("PHX_HOST") || "example.com"
   port = String.to_integer(System.get_env("PORT") || "4000")
 
-  config :spillway, :mnesia_dir, System.get_env("MNESIA_DIR", "/data/mnesia")
+  # Point SPILLWAY_STORE_DIR at a persistent volume (mirrors Aquifer's
+  # DB_PATH): on the machine's own filesystem the store is lost on redeploy.
+  config :spillway, :store_dir, System.get_env("SPILLWAY_STORE_DIR", "/data/spillway")
 
   config :spillway, SpillwayWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],

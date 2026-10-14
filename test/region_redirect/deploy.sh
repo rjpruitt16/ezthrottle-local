@@ -74,7 +74,7 @@ primary_region = "$REGION_1"
   PHX_SERVER = "true"
   PORT = "$APP_PORT"
   PHX_HOST = "localhost"
-  MNESIA_DIR = "/tmp/mnesia"
+  SPILLWAY_STORE_DIR = "/tmp/spillway"
   SPILLWAY_FLY_REGIONS = "$REGION_1,$REGION_2"
   SPILLWAY_FLY_POLL_INTERVAL_SECONDS = "5"
 

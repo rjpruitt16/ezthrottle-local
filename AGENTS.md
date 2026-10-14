@@ -1,6 +1,6 @@
 # AGENTS.md
 
-spillway is the Elixir/Phoenix sibling of Aquifer: the same job API, pacing headers, `POST /proxy`, drain mode, and L8, built on OTP (GenServers, Mnesia, Syn). Many modules say "mirrors Aquifer's X"; when porting, read the Aquifer file first.
+spillway is the Elixir/Phoenix sibling of Aquifer: the same job API, pacing headers, `POST /proxy`, drain mode, and L8, built on OTP (GenServers, Syn) with a RocksDB store. Many modules say "mirrors Aquifer's X"; when porting, read the Aquifer file first.
 
 ## Related repos
 
@@ -18,14 +18,14 @@ Shared contracts that must stay identical across Aquifer and spillway: `X-Aquedu
 
 ## Commands
 
-- Tests: `mix test` (runs with a fresh `tmp/mnesia_test_*` directory). `mix compile --warnings-as-errors` should stay clean.
+- Tests: `mix test` (runs with a fresh `tmp/store_test_*` directory). `mix compile --warnings-as-errors` should stay clean.
 - Formatting: run `mix format` only on files you touch that were already formatter-clean; `l8.ex`, `redirect.ex`, and `l8_controller.ex` use hand-aligned style.
 - Python L8 integration: `test/integration/l8_receiver.py` + `test/integration/test_l8.py`. The test config sets the endpoint `server: false`, so start a live server with `MIX_ENV=test mix run --no-start --no-halt -e '...'` after setting the endpoint's `:server` to true.
 - Cross-repo contracts: from `../aqueduct-runner`, e.g. `make contract-test-ezthrottle`.
 
 ## Where things live
 
-- `lib/spillway/job.ex` (`Job.new/1`), `idempotent_store.ex` (`hash_key/1`, Mnesia tables), `account_queue.ex` (`make_request/6`, the upstream dispatch path), `proxy.ex`, `webhook.ex`.
+- `lib/spillway/job.ex` (`Job.new/1`), `idempotent_store.ex` (`hash_key/1`, job store), `store.ex` (RocksDB), `account_queue.ex` (`make_request/6`, the upstream dispatch path), `proxy.ex`, `webhook.ex`.
 - `lib/spillway/l8.ex` and `l8/schemas.ex`: L8 handshake, signing, encryption, request schemas.
 - `lib/spillway_web/controllers/job_controller.ex`: HTTP glue for `/jobs` and `/proxy`.
 - Cluster routing: a request goes to the Syn owner of its (upstream, account queue) before idempotency admission; the account queue key is derived from `user_id`.

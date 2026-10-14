@@ -9,7 +9,7 @@ defmodule Spillway.SynEventHandler do
   account queue for the same user and upstream) has two processes. Syn's
   default keeps the more recently registered one and kills the other with
   `{:syn_resolve_kill, ...}`. A killed account queue loses the jobs it held
-  in memory, while their Mnesia rows stay `:queued` with nothing left to
+  in memory, while their stored rows stay `:queued` with nothing left to
   dispatch them.
 
   This handler picks the same winner Syn would (later registration, pid as

@@ -11,14 +11,14 @@ defmodule Spillway.WebSocketStore.Valkey do
   A transcript is an append-only, capped, expiring log, which is what
   streams are for. Kept in Mnesia it cost a write per message through
   Mnesia's lock manager and log, and in soak run 3 competed with job writes
-  for one CPU. Stream IDs (`<ms>-<seq>`) have the same form as the Mnesia
-  store's cursors, so clients see no difference.
+  for one CPU. Stream IDs (`<ms>-<seq>`) have the same form as the local
+  store's cursors (Spillway.WebSocketStore), so clients see no difference.
   """
 
   @connections 4
   @prefix "spillway:ws:"
 
-  @doc "The Valkey URL, or nil when transcripts stay in Mnesia."
+  @doc "The Valkey URL, or nil when transcripts stay in the local store."
   def url do
     case System.get_env("SPILLWAY_VALKEY_URL") do
       nil -> nil

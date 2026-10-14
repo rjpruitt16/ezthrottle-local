@@ -48,7 +48,7 @@ defmodule Spillway.AccountQueueRegistry do
   Route a job to the correct UrlActor, spawning one if needed.
   account_queue_header is the raw X-Aqueduct-Account-Queue/
   X-EZThrottle-Account-Queue value from the originating request, or nil if
-  this job has no live request behind it (e.g. recovered from Mnesia at
+  this job has no live request behind it (e.g. recovered from the store at
   startup). nil leaves the UrlActor's current account-queue mode
   unchanged rather than forcing it off — the mode is shared per upstream
   domain, so one request that doesn't care about it shouldn't be able to
@@ -65,7 +65,7 @@ defmodule Spillway.AccountQueueRegistry do
   owner node.
 
   On a standalone node the owner is always this node, so the persist step
-  (the Mnesia insert and instance admission) runs here in the caller's
+  (the store insert and instance admission) runs here in the caller's
   process instead of inside the UrlActor and AccountQueue processes. Those
   are one per domain, and doing the insert inside them made every
   submission and webhook for a domain wait in line for the one before it.

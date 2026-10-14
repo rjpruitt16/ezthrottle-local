@@ -51,7 +51,7 @@ defmodule Spillway.AdmissionTest do
     assert Admission.max_body_bytes() == 1 * 1024 * 1024
     assert Admission.db_max_bytes() == 800 * 1024 * 1024
     assert Admission.any_limit_configured?()
-    # The Mnesia dir in a test run is well under the 800MB default, so a
+    # The store dir in a test run is well under the 800MB default, so a
     # real check() still passes even with a size ceiling on by default.
     assert :ok = Admission.check()
   end
@@ -110,17 +110,17 @@ defmodule Spillway.AdmissionTest do
 
   test "rejects while the store backlog is over its limit" do
     System.put_env("SPILLWAY_STORE_MAX_BACKLOG", "1")
-    # A stand-in for a per-table RocksDB process that isn't keeping up.
-    pid = spawn(fn -> receive(do: (:stop -> :ok)) end)
-    Process.register(pid, :mnesia_ext_proc_admission_test)
+    # The store process not keeping up: suspended, with messages waiting.
+    store = Process.whereis(Spillway.IdempotentStore)
+    :sys.suspend(store)
 
     try do
-      for _ <- 1..5, do: send(pid, :write)
+      for _ <- 1..5, do: send(store, :backlog_test_noop)
       Process.sleep(300)
       assert {:rejected, "store_backlog", 1, n} = Admission.check()
       assert n >= 5
     after
-      send(pid, :stop)
+      :sys.resume(store)
     end
   end
 

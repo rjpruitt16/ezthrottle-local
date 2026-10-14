@@ -1,6 +1,6 @@
 FROM elixir:1.17-alpine AS build
 
-# cmake, bash and linux-headers build RocksDB (rocksdb, under mnesia_rocksdb)
+# cmake, bash and linux-headers build RocksDB (the rocksdb dependency)
 # from source; there's no prebuilt library for Alpine.
 RUN apk add --no-cache build-base git cmake bash linux-headers snappy-dev
 # RocksDB and its bundled Snappy use uint64_t without including <cstdint>,
