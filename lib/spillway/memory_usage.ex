@@ -24,7 +24,8 @@ defmodule Spillway.MemoryUsage do
   def vm_mb, do: div(:erlang.memory(:total), 1_048_576)
 
   defp rss_bytes do
-    with {:ok, status} <- File.read("/proc/self/status"),
+    # Raw, so it doesn't queue behind other callers of OTP's :file_server.
+    with {:ok, status} <- :file.read_file(~c"/proc/self/status", [:raw]),
          [_, kb] <- Regex.run(~r/^VmRSS:\s+(\d+) kB/m, status) do
       {:ok, String.to_integer(kb) * 1024}
     else
