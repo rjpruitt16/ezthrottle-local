@@ -58,6 +58,33 @@ defmodule Spillway.StoreExpiryTest do
     assert IdempotentStore.check_or_insert(again) == :ok
   end
 
+  test "cleanup resumes from where the last batch stopped" do
+    jobs = for i <- 1..25, do: insert("resume-#{i}")
+    Enum.each(jobs, &complete/1)
+    later = System.system_time(:millisecond) + 31 * 60 * 1_000
+
+    {10, c1} = IdempotentStore.expire_due_from(later, 10, <<>>)
+    {10, c2} = IdempotentStore.expire_due_from(later, 10, c1)
+    {5, _} = IdempotentStore.expire_due_from(later, 10, c2)
+
+    for job <- jobs, do: assert(IdempotentStore.get_job(job.id) == nil)
+    assert IdempotentStore.counts() == %{total_jobs: 0, queue_depth: 0}
+  end
+
+  test "an index entry written before it carried the hash still expires" do
+    job = insert("legacy")
+    complete(job)
+    later = System.system_time(:millisecond) + 31 * 60 * 1_000
+
+    # Rewrite the job's entry the way older versions stored it.
+    [{key, _}] = Spillway.Store.take_from(:expiry, <<>>, 1, fn _ -> true end)
+    Spillway.Store.put(:expiry, key, nil)
+
+    assert IdempotentStore.expire_due(later, 10) == 1
+    assert IdempotentStore.get_job(job.id) == nil
+    assert IdempotentStore.check_or_insert(%{job | id: "legacy-again"}) == :ok
+  end
+
   test "a job refused before it was queued is discarded and its key freed" do
     refused = insert("refused")
     assert IdempotentStore.counts() == %{total_jobs: 1, queue_depth: 1}

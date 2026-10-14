@@ -85,7 +85,7 @@ if config_env() == :prod do
 
   config :spillway,
          :store_cache_mb,
-         String.to_integer(System.get_env("SPILLWAY_STORE_CACHE_MB", "256"))
+         String.to_integer(System.get_env("SPILLWAY_STORE_CACHE_MB", "128"))
 
   config :spillway, SpillwayWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
