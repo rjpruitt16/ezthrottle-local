@@ -223,6 +223,27 @@ defmodule Spillway.WebSocketBackpressureTest do
     assert Process.alive?(survivor)
   end
 
+  test "a late store reply doesn't take the session down" do
+    {url, _sent} = start_backend(1, 10)
+
+    {:ok, session} =
+      WebSocketSessionSupervisor.get_or_start(
+        session_id: "late-reply-#{System.unique_integer([:positive])}",
+        upstream_url: url,
+        upstream_headers: [],
+        config: WebSocketConfig.load()
+      )
+
+    {:ok, _replayed} = WebSocketSession.attach(session, self(), "0-0")
+    ref = Process.monitor(session)
+
+    # What Redix leaves behind when a reply beats its alias being dropped.
+    send(session, {make_ref(), {:ok, ["1-0", 1]}})
+
+    assert {:ok, _} = WebSocketSession.attach(session, self(), "0-0")
+    refute_received {:DOWN, ^ref, :process, _, _}
+  end
+
   test "a lagging client whose events were trimmed is closed once and dropped" do
     {url, _sent} = start_backend(50, 10)
     session_id = "trimmed-#{System.unique_integer([:positive])}"

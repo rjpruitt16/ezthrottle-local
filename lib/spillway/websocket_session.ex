@@ -323,6 +323,14 @@ defmodule Spillway.WebSocketSession do
     end
   end
 
+  # A Valkey reply can land just after Redix gave up waiting for it (the
+  # timeout fires, then the reply arrives before the alias is dropped). It is
+  # a stray {ref, reply}; crashing on it took every client of the session down.
+  def handle_info(message, state) do
+    Logger.debug("websocket session ignored #{inspect(message, limit: 5)}")
+    {:noreply, state}
+  end
+
   @impl true
   def terminate(_reason, state) do
     if state.queue_ref, do: WebSocketQueue.cancel(state.queue_ref)
