@@ -42,13 +42,16 @@ defmodule Spillway.Application do
         # Pooled, persistent connections for upstream and webhook dispatch
         # (AccountQueue.make_request/6). inet6: true tries IPv6 first and
         # falls back to IPv4, matching the :httpc ipfamily below, so Fly's
-        # IPv6-only private network still works.
+        # IPv6-only private network still works. Each pool is one process
+        # that hands out connections; with one per scheduler a 1-CPU node
+        # had a single process for every request, and under load its
+        # checkout queue backed up. At least 8 spreads that out.
         {Finch,
          name: Spillway.Finch,
          pools: %{
            default: [
-             size: 256,
-             count: System.schedulers_online(),
+             size: 64,
+             count: max(System.schedulers_online(), 8),
              conn_opts: [transport_opts: [inet6: true]]
            ]
          }}
