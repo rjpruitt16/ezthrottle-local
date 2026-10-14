@@ -94,6 +94,72 @@ jobs:
             --source=./spillway
             --websocket-dir=./aqueduct-runner/websocket
 
+  # Spillway registering with a real Canalis, and signing its pings so a
+  # Canalis that only trusts allowlisted nodes accepts it (alongside a
+  # trusted Aquifer, with an unlisted node refused). Its own job: it builds
+  # two more repos, no reason to hold up the checks above on it.
+  contract-test-registration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout spillway
+        uses: actions/checkout@v4
+        with:
+          path: spillway
+
+      - name: Checkout aquifer
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/aquifer
+          path: aquifer
+
+      - name: Checkout canalis-rs
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/canalis-rs
+          path: canalis-rs
+
+      - name: Pick the aqueduct-runner branch
+        id: runner
+        env:
+          BRANCH: ${{ github.head_ref }}
+        # A runner branch with the same name as this PR's branch carries the
+        # matching contract change; test against it. Otherwise use main.
+        run: |
+          ref=main
+          if [ -n "$BRANCH" ] && git ls-remote --exit-code --heads https://github.com/rjpruitt16/aqueduct-runner "$BRANCH" >/dev/null; then
+            ref="$BRANCH"
+          fi
+          echo "Testing with aqueduct-runner@$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout aqueduct-runner
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/aqueduct-runner
+          ref: ${{ steps.runner.outputs.ref }}
+          path: aqueduct-runner
+
+      - name: Contract test -- Spillway registers with Canalis
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-spillway-registration
+            --spillway-source=./spillway
+            --canalis-source=./canalis-rs
+
+      - name: Contract test -- only allowlisted Aquifer and Spillway nodes can register with Canalis
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-signed-registration
+            --aquifer-source=./aquifer
+            --spillway-source=./spillway
+            --canalis-source=./canalis-rs
+
   # Separate job so a slow drain-mode regression doesn't hold up the fast
   # checks above -- both start immediately, no `needs:` dependency.
   contract-test-drain:
