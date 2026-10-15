@@ -88,7 +88,8 @@ defmodule Spillway.RegistrationPayloadTest do
 
   setup do
     on_exit(fn ->
-      for key <- ~w(SPILLWAY_REGISTRY_URL SPILLWAY_REGISTRY_RESERVED_FOR SPILLWAY_REGISTRY_ROLE) do
+      for key <-
+            ~w(SPILLWAY_REGISTRY_URL SPILLWAY_REGISTRY_RESERVED_FOR SPILLWAY_REGISTRY_ROLE SPILLWAY_REGISTRY_POOLS) do
         System.delete_env(key)
       end
 
@@ -102,6 +103,12 @@ defmodule Spillway.RegistrationPayloadTest do
     assert payload.state == "active"
     refute Map.has_key?(payload, :reserved_for)
     refute Map.has_key?(payload, :role)
+    refute Map.has_key?(payload, :pools)
+  end
+
+  test "reports the pools it joins, dropping blanks" do
+    System.put_env("SPILLWAY_REGISTRY_POOLS", " gpu, ,eu ")
+    assert Registration.payload().pools == ["gpu", "eu"]
   end
 
   test "reports draining once shutdown has started" do
