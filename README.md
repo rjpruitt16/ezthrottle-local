@@ -265,7 +265,7 @@ Two things matter for what "durable" actually means here:
 
 - `SPILLWAY_STORE_DIR`: where the database lives. **Must point at a persistent volume in production** (`/data/spillway` by default, mirroring Aquifer's `DB_PATH`). Without a real volume mount, this data lives on the machine's ephemeral filesystem and durability is lost on every redeploy.
 - `SPILLWAY_STORE_SYNC_INTERVAL_MS` (default `100`): every write reaches RocksDB's write-ahead log before it returns, so a killed process loses nothing. The log is synced to disk on this timer, which bounds what a machine or kernel crash can lose to about this many milliseconds of writes. `0` syncs on every write (no loss on a machine crash, a disk flush per request).
-- `SPILLWAY_STORE_CACHE_MB` (default `256`): RocksDB's read cache, shared by every table. It sits outside the BEAM but counts toward resident memory, so leave room for it under `SPILLWAY_MEMORY_LIMIT_MB`. Each table also keeps a bloom filter, so looking up a key that isn't stored (a new idempotency key) rarely reads the disk.
+- `SPILLWAY_STORE_CACHE_MB` (default `128`): RocksDB's read cache, shared by every table. It sits outside the BEAM but counts toward resident memory, so leave room for it under `SPILLWAY_MEMORY_LIMIT_MB`. Each table also keeps a bloom filter, so looking up a key that isn't stored (a new idempotency key) rarely reads the disk.
 
 A job's rows are written as one atomic batch. Each node's store is its own; nodes don't replicate it.
 

@@ -23,7 +23,7 @@ defmodule Spillway.Store do
 
   The data lives under `SPILLWAY_STORE_DIR` (default `/data/spillway`,
   `priv/store` in development). Reads go through a shared cache of
-  `SPILLWAY_STORE_CACHE_MB` (default 256).
+  `SPILLWAY_STORE_CACHE_MB` (default 128).
   """
 
   use GenServer
@@ -45,7 +45,7 @@ defmodule Spillway.Store do
   # the common case for a new submission's idempotency key, skip reading
   # the table files. The cache lives outside the BEAM but inside resident
   # memory, so admission's memory limit counts it.
-  @default_cache_mb 256
+  @default_cache_mb 128
   @bloom_bits_per_key 10
 
   @db_options [

@@ -57,7 +57,13 @@ defmodule Spillway.IdempotentStore do
 
   defp expiry_key(expires_at, job_id), do: <<expires_at::unsigned-64, job_id::binary>>
 
-  defp index_put_op(expires_at, job_id), do: {:put, :expiry, expiry_key(expires_at, job_id), nil}
+  # The entry carries what expiry needs to delete the job (its idempotency
+  # hash and status), so expiring doesn't read the job back. Every write that
+  # moves a job's expiry deletes its old entry in the same batch, so an entry
+  # that is due is the job's current expiry.
+  defp index_put_op(expires_at, job_id, hashed, status),
+    do: {:put, :expiry, expiry_key(expires_at, job_id), {hashed, status}}
+
   defp index_delete_op(expires_at, job_id), do: {:delete, :expiry, expiry_key(expires_at, job_id)}
 
   defp read_job_row(job_id) do
@@ -112,7 +118,7 @@ defmodule Spillway.IdempotentStore do
             Store.write([
               {:put, :keys, hashed, {job.id, expires_at, :queued}},
               {:put, :jobs, job.id, {job, expires_at, :queued}},
-              index_put_op(expires_at, job.id)
+              index_put_op(expires_at, job.id, hashed, :queued)
             ])
 
             :ok
@@ -257,7 +263,7 @@ defmodule Spillway.IdempotentStore do
         Store.write(
           [
             {:put, :jobs, job_id, {job, new_expires, status}},
-            index_put_op(new_expires, job_id)
+            index_put_op(new_expires, job_id, hashed, status)
           ] ++
             if(old_expires != new_expires, do: [index_delete_op(old_expires, job_id)], else: []) ++
             key_ops ++ drain_event_ops(job, hashed, status)
@@ -294,7 +300,10 @@ defmodule Spillway.IdempotentStore do
 
     Store.write(
       old_index ++
-        [{:put, :jobs, job.id, {job, expires_at, :queued}}, index_put_op(expires_at, job.id)]
+        [
+          {:put, :jobs, job.id, {job, expires_at, :queued}},
+          index_put_op(expires_at, job.id, hash_key(job), :queued)
+        ]
     )
   end
 
@@ -566,7 +575,7 @@ defmodule Spillway.IdempotentStore do
     register_existing_job_owners()
     # Rows that expired while the node was down go now, not a minute in.
     send(self(), :cleanup)
-    {:ok, %{}}
+    {:ok, %{expiry_cursor: <<>>}}
   end
 
   @impl true
@@ -610,13 +619,24 @@ defmodule Spillway.IdempotentStore do
 
   @impl true
   def handle_info(:cleanup, state) do
-    # A full batch means more are due: carry on at once, letting other
-    # messages in between batches.
-    if expire_due(System.system_time(:millisecond)) == @expire_batch,
-      do: send(self(), :cleanup),
-      else: schedule_cleanup()
+    now = System.system_time(:millisecond)
+    cursor = Map.get(state, :expiry_cursor, <<>>)
+    {count, last} = expire_due_from(now, @expire_batch, cursor)
 
-    {:noreply, state}
+    # A full batch means more are due: carry on at once from where this one
+    # stopped, letting other messages in between batches. Seeking from the
+    # start every time walked past the deletion marker of every entry
+    # expired since the last compaction, so cleanup slowed as it fell behind
+    # (soak run 3f: 362 minutes overdue after 7 hours). Once caught up, the
+    # next pass starts a minute before the last entry, in case the clock
+    # stepped back.
+    if count == @expire_batch do
+      send(self(), :cleanup)
+      {:noreply, %{state | expiry_cursor: last}}
+    else
+      schedule_cleanup()
+      {:noreply, %{state | expiry_cursor: rewind(last || cursor)}}
+    end
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -626,16 +646,48 @@ defmodule Spillway.IdempotentStore do
   # results, delivery modes and idempotency keys, reading the expiry index
   # in order. Returns how many index entries it consumed.
   def expire_due(now, limit \\ @expire_batch) do
+    {count, _last} = expire_due_from(now, limit, <<>>)
+    count
+  end
+
+  @doc false
+  # expire_due/2 starting at the index key from. Returns how many entries it
+  # consumed and the last one (nil if none).
+  def expire_due_from(now, limit, from) do
     due =
-      Store.take_from(:expiry, <<>>, limit, fn <<expires_at::unsigned-64, _::binary>> ->
+      Store.take_from(:expiry, from, limit, fn <<expires_at::unsigned-64, _::binary>> ->
         expires_at <= now
       end)
 
-    Enum.each(due, fn {key, _} -> expire_one(key, now) end)
-    length(due)
+    Enum.each(due, fn {key, value} -> expire_one(key, value, now) end)
+
+    case List.last(due) do
+      {last, _} -> {length(due), last}
+      nil -> {0, nil}
+    end
   end
 
-  defp expire_one(<<_::unsigned-64, job_id::binary>> = key, now) do
+  defp rewind(<<expires_at::unsigned-64, _::binary>>),
+    do: <<max(expires_at - 60_000, 0)::unsigned-64>>
+
+  defp rewind(_), do: <<>>
+
+  defp expire_one(<<_::unsigned-64, job_id::binary>> = key, {hashed, status}, _now) do
+    Store.write(
+      [
+        {:delete, :jobs, job_id},
+        {:delete, :results, job_id},
+        {:delete, :delivery, job_id},
+        {:delete, :expiry, key}
+      ] ++ key_delete_ops(hashed, job_id)
+    )
+
+    count_delete(status)
+    unregister_job_owner_local(job_id)
+  end
+
+  # Entries written before the index carried the hash and status.
+  defp expire_one(<<_::unsigned-64, job_id::binary>> = key, nil, now) do
     case read_job_row(job_id) do
       {job, expires_at, status} when expires_at <= now ->
         hashed = hash_key(job)
