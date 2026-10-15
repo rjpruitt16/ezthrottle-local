@@ -21,7 +21,9 @@ defmodule Spillway.Registration do
   away, see Spillway.Lifecycle), and a best-effort `offline` once accepted
   work is done. Optional fields, left out when unset: `reserved_for`
   (SPILLWAY_REGISTRY_RESERVED_FOR, this node is dedicated to one user_id),
-  `role` (SPILLWAY_REGISTRY_ROLE, e.g. "http" or "ws"), and `drain_state`
+  `role` (SPILLWAY_REGISTRY_ROLE, e.g. "http" or "ws"), `pools`
+  (SPILLWAY_REGISTRY_POOLS, comma-separated pools this node joins; none
+  means the default pool), and `drain_state`
   when drain mode is on -- kept apart from `state` because drain mode's
   "draining" means "finishing one tenant's burst", not "shutting down".
 
@@ -57,6 +59,19 @@ defmodule Spillway.Registration do
     case env_trimmed("SPILLWAY_REGISTRY_ROLE") do
       nil -> nil
       role -> String.downcase(role)
+    end
+  end
+
+  def pools do
+    case env_trimmed("SPILLWAY_REGISTRY_POOLS") do
+      nil ->
+        nil
+
+      list ->
+        case list |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == "")) do
+          [] -> nil
+          pools -> pools
+        end
     end
   end
 
@@ -131,6 +146,7 @@ defmodule Spillway.Registration do
     %{port: port(), state: state, reported_at: DateTime.utc_now() |> DateTime.to_iso8601()}
     |> put_if(:reserved_for, reserved_for())
     |> put_if(:role, role())
+    |> put_if(:pools, pools())
     |> put_if(:drain_state, drain_state && to_string(drain_state))
     |> Map.put(:fullness, safe_fullness())
   end
