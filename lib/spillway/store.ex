@@ -130,6 +130,22 @@ defmodule Spillway.Store do
     :ok = :rocksdb.write(db(), actions, write_options())
   end
 
+  @doc """
+  RocksDB's estimate of live data per column family, in MB, for the ones
+  that grow with jobs. Cheap: read from table metadata, not by scanning.
+  """
+  def table_sizes_mb do
+    Map.new([:jobs, :keys, :results, :expiry], fn cf ->
+      bytes =
+        case property(cf, "rocksdb.estimate-live-data-size") do
+          nil -> 0
+          value -> String.to_integer(value)
+        end
+
+      {cf, div(bytes, 1024 * 1024)}
+    end)
+  end
+
   @doc "Deletes every key in [first, last) from a column family."
   def delete_range(cf, first, last) do
     :ok = :rocksdb.delete_range(db(), cf(cf), first, last, write_options())

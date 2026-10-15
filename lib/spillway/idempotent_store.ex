@@ -35,6 +35,8 @@ defmodule Spillway.IdempotentStore do
   # expiry, and deleted a batch at a time.
   @cleanup_interval_ms 10_000
   @expire_batch 2_000
+  @expire_chunk 250
+  @expire_concurrency 8
 
   # ---- Public API ----
 
@@ -630,6 +632,8 @@ defmodule Spillway.IdempotentStore do
     # (soak run 3f: 362 minutes overdue after 7 hours). Once caught up, the
     # next pass starts a minute before the last entry, in case the clock
     # stepped back.
+    record_expiry_lag(count, last, now)
+
     if count == @expire_batch do
       send(self(), :cleanup)
       {:noreply, %{state | expiry_cursor: last}}
@@ -659,7 +663,28 @@ defmodule Spillway.IdempotentStore do
         expires_at <= now
       end)
 
-    Enum.each(due, fn {key, value} -> expire_one(key, value, now) end)
+    {current, legacy} = Enum.split_with(due, fn {_key, value} -> is_tuple(value) end)
+
+    # One write per chunk, chunks in parallel. Cleanup is a single process
+    # competing with every request process for RocksDB's dirty schedulers,
+    # and with a read and a write per job it got a sliver of them: in soak
+    # run 3g the store still grew 1GB an hour. Owner unregistration stays in
+    # this process (it only acts when called from the store's own process).
+    current
+    |> Enum.chunk_every(@expire_chunk)
+    |> Task.async_stream(&expire_chunk/1,
+      max_concurrency: @expire_concurrency,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.each(fn {:ok, expired} ->
+      Enum.each(expired, fn {job_id, status} ->
+        count_delete(status)
+        unregister_job_owner_local(job_id)
+      end)
+    end)
+
+    Enum.each(legacy, fn {key, value} -> expire_one(key, value, now) end)
 
     case List.last(due) do
       {last, _} -> {length(due), last}
@@ -667,23 +692,63 @@ defmodule Spillway.IdempotentStore do
     end
   end
 
+  @doc """
+  How far cleanup is behind, in seconds: 0 when the last pass caught up,
+  otherwise how long the newest entry it expired had been due. Reported on
+  GET /health; a number that keeps climbing means the store is outgrowing
+  expiry.
+  """
+  def expiry_lag_seconds do
+    case :persistent_term.get({__MODULE__, :expiry_lag}, nil) do
+      nil -> 0
+      ref -> :atomics.get(ref, 1)
+    end
+  end
+
+  defp record_expiry_lag(count, last, now) do
+    ref =
+      case :persistent_term.get({__MODULE__, :expiry_lag}, nil) do
+        nil ->
+          ref = :atomics.new(1, signed: false)
+          :persistent_term.put({__MODULE__, :expiry_lag}, ref)
+          ref
+
+        ref ->
+          ref
+      end
+
+    lag =
+      case {count == @expire_batch, last} do
+        {true, <<expires_at::unsigned-64, _::binary>>} -> max(div(now - expires_at, 1000), 0)
+        _ -> 0
+      end
+
+    :atomics.put(ref, 1, lag)
+  end
+
   defp rewind(<<expires_at::unsigned-64, _::binary>>),
     do: <<max(expires_at - 60_000, 0)::unsigned-64>>
 
   defp rewind(_), do: <<>>
 
-  defp expire_one(<<_::unsigned-64, job_id::binary>> = key, {hashed, status}, _now) do
-    Store.write(
-      [
-        {:delete, :jobs, job_id},
-        {:delete, :results, job_id},
-        {:delete, :delivery, job_id},
-        {:delete, :expiry, key}
-      ] ++ key_delete_ops(hashed, job_id)
-    )
+  defp expire_chunk(entries) do
+    {ops, expired} =
+      Enum.reduce(entries, {[], []}, fn {<<_::unsigned-64, job_id::binary>> = key,
+                                         {hashed, status}},
+                                        {ops, expired} ->
+        job_ops =
+          [
+            {:delete, :jobs, job_id},
+            {:delete, :results, job_id},
+            {:delete, :delivery, job_id},
+            {:delete, :expiry, key}
+          ] ++ key_delete_ops(hashed, job_id)
 
-    count_delete(status)
-    unregister_job_owner_local(job_id)
+        {job_ops ++ ops, [{job_id, status} | expired]}
+      end)
+
+    Store.write(ops)
+    expired
   end
 
   # Entries written before the index carried the hash and status.
