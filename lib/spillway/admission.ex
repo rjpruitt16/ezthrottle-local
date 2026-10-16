@@ -28,6 +28,10 @@ defmodule Spillway.Admission do
                                        writes are queued, see
                                        Spillway.StorePressure (default:
                                        5000; 0 disables)
+    SPILLWAY_MAX_EXPIRY_LAG_SECONDS - reject new jobs while cleanup of
+                                       expired jobs is more than this many
+                                       seconds behind (default: 300; 0
+                                       disables)
     SPILLWAY_RETRY_AFTER_SECONDS  - base Retry-After on a 429 (default 5)
 
   Retry-After doubles on each consecutive rejection (capped at 60s),
@@ -40,6 +44,7 @@ defmodule Spillway.Admission do
   @max_retry_after_seconds 60
   @default_max_body_bytes 1 * 1024 * 1024
   @default_db_max_bytes 800 * 1024 * 1024
+  @default_max_expiry_lag_seconds 300
   @refresh_ms 1_000
 
   def start_link(_opts) do
@@ -157,15 +162,19 @@ defmodule Spillway.Admission do
   def base_retry_after_seconds, do: env_int("SPILLWAY_RETRY_AFTER_SECONDS", 5)
   def store_max_backlog, do: env_int("SPILLWAY_STORE_MAX_BACKLOG", 5_000)
 
+  def max_expiry_lag_seconds,
+    do: env_int("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", @default_max_expiry_lag_seconds)
+
   @doc "True if at least one limit is actually configured, not just whether this process is running."
   def any_limit_configured? do
     memory_limit_mb() > 0 or max_body_bytes() > 0 or db_max_bytes() > 0 or
-      store_max_backlog() > 0
+      store_max_backlog() > 0 or max_expiry_lag_seconds() > 0
   end
 
   @doc """
   Returns :ok if the request is admitted, or {:rejected, reason, limit, current}.
-  reason is "memory" or "db_size", matching Aquifer's AdmissionDecision.
+  reason is "memory", "db_size", "store_backlog" or "expiry_lag"; the first
+  two match Aquifer's AdmissionDecision.
   """
   def check do
     cond do
@@ -180,6 +189,14 @@ defmodule Spillway.Admission do
       store_max_backlog() > 0 and sampled_store_backlog() > store_max_backlog() ->
         record_rejection()
         {:rejected, "store_backlog", store_max_backlog(), sampled_store_backlog()}
+
+      # Intake that outruns cleanup grows the store until db_size refuses
+      # everything, and a bigger store makes every read slower on the way:
+      # soak run 3h went from 500 to 175 jobs/s over six hours with cleanup
+      # 3.5 hours behind. Refusing early lets cleanup catch up instead.
+      max_expiry_lag_seconds() > 0 and expiry_lag() > max_expiry_lag_seconds() ->
+        record_rejection()
+        {:rejected, "expiry_lag", max_expiry_lag_seconds(), expiry_lag()}
 
       true ->
         record_allowed()
@@ -228,6 +245,7 @@ defmodule Spillway.Admission do
       memory_limit_mb() > 0 and measured_memory_mb() / memory_limit_mb(),
       db_max_bytes() > 0 and measured_db_bytes() / db_max_bytes(),
       store_max_backlog() > 0 and sampled_store_backlog() / store_max_backlog(),
+      max_expiry_lag_seconds() > 0 and expiry_lag() / max_expiry_lag_seconds(),
       Spillway.Intake.backlog_fullness_ratio()
     ]
     |> Enum.filter(&is_number/1)
@@ -253,7 +271,9 @@ defmodule Spillway.Admission do
       processes: :erlang.system_info(:process_count),
       vm_memory_mb: Spillway.MemoryUsage.vm_mb(),
       storage: Spillway.IdempotentStore.storage(),
-      expiry_lag_seconds: Spillway.IdempotentStore.expiry_lag_seconds(),
+      expiry_lag_seconds: expiry_lag(),
+      max_expiry_lag_seconds: max_expiry_lag_seconds(),
+      expiry: Spillway.IdempotentStore.expiry_stats(),
       store_tables_mb: Spillway.Store.table_sizes_mb(),
       retry_after_seconds: retry_after_seconds()
     }
@@ -274,6 +294,15 @@ defmodule Spillway.Admission do
   defp sampled_store_backlog, do: sampled(6, 7, &Spillway.StorePressure.backlog/0)
 
   defp current_memory_mb, do: Spillway.MemoryUsage.mb()
+
+  # An :atomics read kept by cleanup. Tests swap in a fixed value.
+  defp expiry_lag do
+    Application.get_env(
+      :spillway,
+      :admission_expiry_lag_reader,
+      &Spillway.IdempotentStore.expiry_lag_seconds/0
+    ).()
+  end
 
   # Tests swap in a slow reader to check requests never wait on it.
   defp db_bytes_reader,
