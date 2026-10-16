@@ -81,10 +81,28 @@ defmodule Spillway.StoreExpiryTest do
     assert Enum.all?(jobs, &(IdempotentStore.get_job(&1.id) == nil))
   end
 
-  test "health reports cleanup lag and table sizes" do
+  test "health reports cleanup lag, timings and table sizes" do
     snapshot = Spillway.Admission.snapshot()
     assert is_integer(snapshot.expiry_lag_seconds)
+    assert snapshot.max_expiry_lag_seconds == 300
     assert %{jobs: _, keys: _, results: _, expiry: _} = snapshot.store_tables_mb
+
+    assert %{
+             lag_seconds: _,
+             passes: _,
+             expired: _,
+             last_pass_entries: _,
+             last_pass_ms: _,
+             last_read_ms: _
+           } = snapshot.expiry
+  end
+
+  test "a cleanup pass is counted in the stats" do
+    before = IdempotentStore.expiry_stats()
+    send(IdempotentStore, :cleanup)
+    # A call after the message means the pass has finished.
+    :sys.get_state(IdempotentStore)
+    assert IdempotentStore.expiry_stats().passes > before.passes
   end
 
   test "an index entry written before it carried the hash still expires" do

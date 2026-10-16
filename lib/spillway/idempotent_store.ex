@@ -623,6 +623,7 @@ defmodule Spillway.IdempotentStore do
   def handle_info(:cleanup, state) do
     now = System.system_time(:millisecond)
     cursor = Map.get(state, :expiry_cursor, <<>>)
+    started = System.monotonic_time(:microsecond)
     {count, last} = expire_due_from(now, @expire_batch, cursor)
 
     # A full batch means more are due: carry on at once from where this one
@@ -632,7 +633,7 @@ defmodule Spillway.IdempotentStore do
     # (soak run 3f: 362 minutes overdue after 7 hours). Once caught up, the
     # next pass starts a minute before the last entry, in case the clock
     # stepped back.
-    record_expiry_lag(count, last, now)
+    record_expiry_pass(count, last, now, System.monotonic_time(:microsecond) - started)
 
     if count == @expire_batch do
       send(self(), :cleanup)
@@ -658,10 +659,14 @@ defmodule Spillway.IdempotentStore do
   # expire_due/2 starting at the index key from. Returns how many entries it
   # consumed and the last one (nil if none).
   def expire_due_from(now, limit, from) do
+    started = System.monotonic_time(:microsecond)
+
     due =
       Store.take_from(:expiry, from, limit, fn <<expires_at::unsigned-64, _::binary>> ->
         expires_at <= now
       end)
+
+    record_expiry_read(System.monotonic_time(:microsecond) - started)
 
     {current, legacy} = Enum.split_with(due, fn {_key, value} -> is_tuple(value) end)
 
@@ -696,26 +701,47 @@ defmodule Spillway.IdempotentStore do
   How far cleanup is behind, in seconds: 0 when the last pass caught up,
   otherwise how long the newest entry it expired had been due. Reported on
   GET /health; a number that keeps climbing means the store is outgrowing
-  expiry.
+  expiry. Admission refuses new jobs while it's over
+  SPILLWAY_MAX_EXPIRY_LAG_SECONDS.
   """
-  def expiry_lag_seconds do
-    case :persistent_term.get({__MODULE__, :expiry_lag}, nil) do
-      nil -> 0
-      ref -> :atomics.get(ref, 1)
+  def expiry_lag_seconds, do: :atomics.get(expiry_stats_ref(), 1)
+
+  @doc """
+  What cleanup has been doing, for GET /health: passes and jobs expired
+  since boot, and the last pass's size and time split between reading the
+  expiry index and deleting. Two readings a minute apart give the rate.
+  """
+  def expiry_stats do
+    ref = expiry_stats_ref()
+
+    %{
+      lag_seconds: :atomics.get(ref, 1),
+      passes: :atomics.get(ref, 2),
+      expired: :atomics.get(ref, 3),
+      last_pass_entries: :atomics.get(ref, 4),
+      last_pass_ms: div(:atomics.get(ref, 5), 1000),
+      last_read_ms: div(:atomics.get(ref, 6), 1000)
+    }
+  end
+
+  # Slots: 1 lag (s), 2 passes, 3 entries expired, 4 last pass's entries,
+  # 5 last pass's time (us), 6 last index read's time (us).
+  defp expiry_stats_ref do
+    case :persistent_term.get({__MODULE__, :expiry_stats}, nil) do
+      nil ->
+        ref = :atomics.new(6, signed: false)
+        :persistent_term.put({__MODULE__, :expiry_stats}, ref)
+        ref
+
+      ref ->
+        ref
     end
   end
 
-  defp record_expiry_lag(count, last, now) do
-    ref =
-      case :persistent_term.get({__MODULE__, :expiry_lag}, nil) do
-        nil ->
-          ref = :atomics.new(1, signed: false)
-          :persistent_term.put({__MODULE__, :expiry_lag}, ref)
-          ref
+  defp record_expiry_read(micros), do: :atomics.put(expiry_stats_ref(), 6, micros)
 
-        ref ->
-          ref
-      end
+  defp record_expiry_pass(count, last, now, micros) do
+    ref = expiry_stats_ref()
 
     lag =
       case {count == @expire_batch, last} do
@@ -724,6 +750,10 @@ defmodule Spillway.IdempotentStore do
       end
 
     :atomics.put(ref, 1, lag)
+    :atomics.add(ref, 2, 1)
+    :atomics.add(ref, 3, count)
+    :atomics.put(ref, 4, count)
+    :atomics.put(ref, 5, micros)
   end
 
   defp rewind(<<expires_at::unsigned-64, _::binary>>),
@@ -731,6 +761,14 @@ defmodule Spillway.IdempotentStore do
 
   defp rewind(_), do: <<>>
 
+  # The key row is deleted without reading it first. Only the job holding a
+  # key ever deletes it (here, or in remove_job/1 with the job's own index
+  # entry), and a key is only claimed once it's gone, so while a job's
+  # entry is due its key is still its own. The read cost one RocksDB lookup
+  # per expired job, most of them cache misses on an old key. The one gap:
+  # a job deleted while cleanup is expiring it, its key reclaimed by a new
+  # job within those milliseconds, loses that new key. The read it replaces
+  # left the same gap between its read and its write.
   defp expire_chunk(entries) do
     {ops, expired} =
       Enum.reduce(entries, {[], []}, fn {<<_::unsigned-64, job_id::binary>> = key,
@@ -741,8 +779,9 @@ defmodule Spillway.IdempotentStore do
             {:delete, :jobs, job_id},
             {:delete, :results, job_id},
             {:delete, :delivery, job_id},
-            {:delete, :expiry, key}
-          ] ++ key_delete_ops(hashed, job_id)
+            {:delete, :expiry, key},
+            {:delete, :keys, hashed}
+          ]
 
         {job_ops ++ ops, [{job_id, status} | expired]}
       end)

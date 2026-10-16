@@ -15,7 +15,8 @@ defmodule Spillway.AdmissionTest do
       body: System.get_env("SPILLWAY_MAX_BODY_BYTES"),
       db: System.get_env("SPILLWAY_DB_MAX_BYTES"),
       retry: System.get_env("SPILLWAY_RETRY_AFTER_SECONDS"),
-      backlog: System.get_env("SPILLWAY_STORE_MAX_BACKLOG")
+      backlog: System.get_env("SPILLWAY_STORE_MAX_BACKLOG"),
+      lag: System.get_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS")
     }
 
     on_exit(fn ->
@@ -24,6 +25,8 @@ defmodule Spillway.AdmissionTest do
       restore_env("SPILLWAY_DB_MAX_BYTES", prev.db)
       restore_env("SPILLWAY_RETRY_AFTER_SECONDS", prev.retry)
       restore_env("SPILLWAY_STORE_MAX_BACKLOG", prev.backlog)
+      restore_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", prev.lag)
+      Application.delete_env(:spillway, :admission_expiry_lag_reader)
       reset_streak()
     end)
 
@@ -124,6 +127,23 @@ defmodule Spillway.AdmissionTest do
     end
   end
 
+  test "rejects while cleanup is further behind than the limit" do
+    System.put_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", "300")
+    Application.put_env(:spillway, :admission_expiry_lag_reader, fn -> 301 end)
+
+    assert {:rejected, "expiry_lag", 300, 301} = Admission.check()
+    assert Admission.snapshot().expiry_lag_seconds == 301
+    assert Admission.compute_fullness() == 100
+
+    Application.put_env(:spillway, :admission_expiry_lag_reader, fn -> 150 end)
+    assert Admission.check() == :ok
+    assert Admission.compute_fullness() >= 50
+
+    System.put_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", "0")
+    Application.put_env(:spillway, :admission_expiry_lag_reader, fn -> 10_000 end)
+    assert Admission.check() == :ok
+  end
+
   describe "background readings" do
     setup do
       on_exit(fn ->
@@ -178,6 +198,7 @@ defmodule Spillway.AdmissionTest do
     System.put_env("SPILLWAY_MAX_BODY_BYTES", "0")
     System.put_env("SPILLWAY_DB_MAX_BYTES", "0")
     System.put_env("SPILLWAY_STORE_MAX_BACKLOG", "0")
+    System.put_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", "0")
     refute Admission.snapshot().enabled
 
     System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "1000000")
