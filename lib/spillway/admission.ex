@@ -253,6 +253,8 @@ defmodule Spillway.Admission do
       processes: :erlang.system_info(:process_count),
       vm_memory_mb: Spillway.MemoryUsage.vm_mb(),
       storage: Spillway.IdempotentStore.storage(),
+      expiry_lag_seconds: Spillway.IdempotentStore.expiry_lag_seconds(),
+      store_tables_mb: Spillway.Store.table_sizes_mb(),
       retry_after_seconds: retry_after_seconds()
     }
   end

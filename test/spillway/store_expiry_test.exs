@@ -71,6 +71,22 @@ defmodule Spillway.StoreExpiryTest do
     assert IdempotentStore.counts() == %{total_jobs: 0, queue_depth: 0}
   end
 
+  test "a batch larger than one chunk expires every job once" do
+    jobs = for i <- 1..600, do: insert("chunked-#{i}")
+    Enum.each(jobs, &complete/1)
+    later = System.system_time(:millisecond) + 31 * 60 * 1_000
+
+    assert IdempotentStore.expire_due(later, 2_000) == 600
+    assert IdempotentStore.counts() == %{total_jobs: 0, queue_depth: 0}
+    assert Enum.all?(jobs, &(IdempotentStore.get_job(&1.id) == nil))
+  end
+
+  test "health reports cleanup lag and table sizes" do
+    snapshot = Spillway.Admission.snapshot()
+    assert is_integer(snapshot.expiry_lag_seconds)
+    assert %{jobs: _, keys: _, results: _, expiry: _} = snapshot.store_tables_mb
+  end
+
   test "an index entry written before it carried the hash still expires" do
     job = insert("legacy")
     complete(job)
