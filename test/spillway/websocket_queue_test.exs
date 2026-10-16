@@ -43,6 +43,33 @@ defmodule Spillway.WebSocketQueueTest do
     end
   end
 
+  test "a client slot is freed when its holder dies without releasing it" do
+    queue = start_queue(max_clients: 2)
+    parent = self()
+
+    holder =
+      spawn(fn ->
+        send(parent, {:reserved, WebSocketQueue.reserve_client(queue)})
+        receive do: (:crash -> exit(:boom))
+      end)
+
+    assert_receive {:reserved, {:ok, _token}}
+    assert {:ok, mine} = WebSocketQueue.reserve_client(queue)
+    assert {:error, :client_limit} = WebSocketQueue.reserve_client(queue)
+
+    ref = Process.monitor(holder)
+    send(holder, :crash)
+    assert_receive {:DOWN, ^ref, :process, ^holder, :boom}
+
+    assert {:ok, _} = WebSocketQueue.reserve_client(queue)
+    assert WebSocketQueue.snapshot(queue).clients == 2
+
+    # An explicit release still frees the slot, and releasing twice is harmless.
+    WebSocketQueue.release_client(mine, queue)
+    WebSocketQueue.release_client(mine, queue)
+    assert WebSocketQueue.snapshot(queue).clients == 1
+  end
+
   test "admits at the configured rate, not one per jittered millisecond" do
     queue = start_queue(connect_rps: 2_000.0, slow_start_rps: 2_000.0)
     n = 5_000
