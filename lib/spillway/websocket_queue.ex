@@ -64,13 +64,14 @@ defmodule Spillway.WebSocketQueue do
     {:ok,
      %{
        config: config,
-       client_tokens: MapSet.new(),
+       # token -> monitor of the client process holding the slot
+       client_tokens: %{},
        # FIFO of waiter refs; a cancelled waiter's ref stays until it
        # reaches the front and is skipped.
        order: :queue.new(),
        waiting: %{},
        active: %{},
-       # monitor ref -> {:waiting, ref} | {:active, token}
+       # monitor ref -> {:waiting, ref} | {:active, token} | {:client, token}
        monitors: %{},
        advertised_max: nil,
        advertised_rps: nil,
@@ -85,12 +86,24 @@ defmodule Spillway.WebSocketQueue do
   end
 
   @impl true
-  def handle_call(:reserve_client, _from, state) do
-    if MapSet.size(state.client_tokens) >= state.config.max_clients do
+  # The slot is freed when its holder exits, as well as on release_client/1.
+  # Release alone leaked: a client process that crashed (a session's call
+  # into Valkey timing out takes the caller down with it) never released,
+  # and in soak run 3h the node reported all 3,000 slots taken with 24
+  # clients connected, so every new connection got a 429.
+  def handle_call(:reserve_client, {pid, _tag}, state) do
+    if map_size(state.client_tokens) >= state.config.max_clients do
       {:reply, {:error, :client_limit}, state}
     else
       token = make_ref()
-      {:reply, {:ok, token}, %{state | client_tokens: MapSet.put(state.client_tokens, token)}}
+      monitor = Process.monitor(pid)
+
+      {:reply, {:ok, token},
+       %{
+         state
+         | client_tokens: Map.put(state.client_tokens, token, monitor),
+           monitors: Map.put(state.monitors, monitor, {:client, token})
+       }}
     end
   end
 
@@ -126,7 +139,7 @@ defmodule Spillway.WebSocketQueue do
   def handle_call(:snapshot, _from, state) do
     snapshot = %{
       enabled: state.config.enabled,
-      clients: MapSet.size(state.client_tokens),
+      clients: map_size(state.client_tokens),
       active_upstreams: map_size(state.active),
       waiting: map_size(state.waiting),
       max_client_connections: state.config.max_clients,
@@ -143,7 +156,16 @@ defmodule Spillway.WebSocketQueue do
 
   @impl true
   def handle_cast({:release_client, token}, state) do
-    {:noreply, %{state | client_tokens: MapSet.delete(state.client_tokens, token)}}
+    case Map.pop(state.client_tokens, token) do
+      {nil, _tokens} ->
+        {:noreply, state}
+
+      {monitor, tokens} ->
+        Process.demonitor(monitor, [:flush])
+
+        {:noreply,
+         %{state | client_tokens: tokens, monitors: Map.delete(state.monitors, monitor)}}
+    end
   end
 
   def handle_cast({:cancel, ref}, state) do
@@ -196,6 +218,7 @@ defmodule Spillway.WebSocketQueue do
       case entry do
         {:waiting, ref} -> %{state | waiting: Map.delete(state.waiting, ref)}
         {:active, token} -> %{state | active: Map.delete(state.active, token)}
+        {:client, token} -> %{state | client_tokens: Map.delete(state.client_tokens, token)}
         nil -> state
       end
 
