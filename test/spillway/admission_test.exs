@@ -16,7 +16,8 @@ defmodule Spillway.AdmissionTest do
       db: System.get_env("SPILLWAY_DB_MAX_BYTES"),
       retry: System.get_env("SPILLWAY_RETRY_AFTER_SECONDS"),
       backlog: System.get_env("SPILLWAY_STORE_MAX_BACKLOG"),
-      lag: System.get_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS")
+      lag: System.get_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS"),
+      sync: System.get_env("SPILLWAY_MAX_SYNC_LAG_MS")
     }
 
     on_exit(fn ->
@@ -26,6 +27,8 @@ defmodule Spillway.AdmissionTest do
       restore_env("SPILLWAY_RETRY_AFTER_SECONDS", prev.retry)
       restore_env("SPILLWAY_STORE_MAX_BACKLOG", prev.backlog)
       restore_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", prev.lag)
+      restore_env("SPILLWAY_MAX_SYNC_LAG_MS", prev.sync)
+      Application.delete_env(:spillway, :admission_sync_lag_reader)
       Application.delete_env(:spillway, :admission_expiry_lag_reader)
       reset_streak()
     end)
@@ -144,6 +147,77 @@ defmodule Spillway.AdmissionTest do
     assert Admission.check() == :ok
   end
 
+  test "rejects while the store's log sync is further behind than the limit" do
+    System.put_env("SPILLWAY_MAX_SYNC_LAG_MS", "1000")
+    Application.put_env(:spillway, :admission_sync_lag_reader, fn -> 1_500 end)
+    assert {:rejected, "sync_lag", 1000, 1500} = Admission.check()
+    assert Admission.snapshot().sync_lag_ms == 1500
+
+    Application.put_env(:spillway, :admission_sync_lag_reader, fn -> 120 end)
+    assert Admission.check() == :ok
+
+    System.put_env("SPILLWAY_MAX_SYNC_LAG_MS", "0")
+    Application.put_env(:spillway, :admission_sync_lag_reader, fn -> 60_000 end)
+    assert Admission.check() == :ok
+  end
+
+  test "the store's real sync lag stays near its 100ms interval" do
+    Process.sleep(300)
+    lag = Spillway.Store.sync_lag_ms()
+    assert lag >= 0 and lag < 300
+  end
+
+  test "the default memory limit is 70% of the container's limit, else the machine's memory" do
+    dir = Path.join(System.tmp_dir!(), "spw-mem-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    write = fn name, body ->
+      path = Path.join(dir, name)
+      File.write!(path, body)
+      path
+    end
+
+    missing = Path.join(dir, "missing")
+    meminfo = write.("meminfo", "MemTotal:        2048000 kB\nMemFree:          100000 kB\n")
+
+    v2 = write.("memory.max", "1073741824\n")
+
+    assert Admission.derive_memory_limit_mb(%{
+             cgroup_v2: v2,
+             cgroup_v1: missing,
+             meminfo: meminfo
+           }) == 716
+
+    unlimited = write.("memory.max.unlimited", "max\n")
+    v1huge = write.("limit_in_bytes", "9223372036854771712\n")
+
+    assert Admission.derive_memory_limit_mb(%{
+             cgroup_v2: unlimited,
+             cgroup_v1: v1huge,
+             meminfo: meminfo
+           }) == 1400
+
+    v1 = write.("limit_in_bytes.512m", "536870912\n")
+
+    assert Admission.derive_memory_limit_mb(%{
+             cgroup_v2: missing,
+             cgroup_v1: v1,
+             meminfo: meminfo
+           }) == 358
+
+    assert Admission.derive_memory_limit_mb(%{
+             cgroup_v2: missing,
+             cgroup_v1: missing,
+             meminfo: missing
+           }) == 0
+
+    System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "0")
+    assert Admission.memory_limit_mb() == 0
+    System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "900")
+    assert Admission.memory_limit_mb() == 900
+  end
+
   describe "background readings" do
     setup do
       on_exit(fn ->
@@ -199,6 +273,9 @@ defmodule Spillway.AdmissionTest do
     System.put_env("SPILLWAY_DB_MAX_BYTES", "0")
     System.put_env("SPILLWAY_STORE_MAX_BACKLOG", "0")
     System.put_env("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", "0")
+    System.put_env("SPILLWAY_MAX_SYNC_LAG_MS", "0")
+    # Unset, the memory limit is derived from the machine, so off means 0.
+    System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "0")
     refute Admission.snapshot().enabled
 
     System.put_env("SPILLWAY_MEMORY_LIMIT_MB", "1000000")
