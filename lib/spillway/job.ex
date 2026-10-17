@@ -134,7 +134,7 @@ defmodule Spillway.Job do
   defp reject_nul(_user_id), do: :ok
 
   @default_max_retries 4
-  @default_webhook_max_retries -1
+  @default_webhook_max_retries 10
   @max_allowed_retries 100
   # Bounds retry_until_complete when there is no execute_before: the same
   # 24h default the idempotency TTL uses for queued jobs.
@@ -155,12 +155,13 @@ defmodule Spillway.Job do
   the two calls go to different places: a non-idempotent upstream can be tried
   once while its webhook keeps retrying through a receiver outage. Same values
   as max_retries; nil (unset, or a job stored before this field existed) means
-  -1, retry until delivered, bounded like any other job by 24h after the
-  delivery was queued. Four retries (1+2+4+8s) used to be the default, which
-  dropped every webhook that finished during a receiver outage longer than
-  about 15 seconds. With backoff capped at SPILLWAY_RETRY_MAX_BACKOFF_SECONDS,
-  an outage now costs time instead of results. Mirrors Aquifer's
-  webhook_max_retries / X-Aqueduct-Webhook-Max-Retries.
+  the default 10. With backoff doubling from 1s and capped at
+  SPILLWAY_RETRY_MAX_BACKOFF_SECONDS (300), that is about 13 minutes of
+  retries: enough to ride out a receiver deploy or restart, while a receiver
+  that stays down fails its webhooks instead of piling them up. The result
+  stays readable at GET /jobs/:id either way. Four retries (about 15 seconds)
+  used to be the default. Mirrors Aquifer's webhook_max_retries /
+  X-Aqueduct-Webhook-Max-Retries.
   """
   def webhook_max_retries(%__MODULE__{} = job),
     do: Map.get(job, :webhook_max_retries) || @default_webhook_max_retries
