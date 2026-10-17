@@ -199,7 +199,7 @@ defmodule Spillway.AccountQueueRegistry do
   The one way it can still fail to queue is no live queue being found; that
   is logged, and the result stays readable at GET /jobs/:id.
   """
-  def enqueue_webhook(original_job_id, user_id, webhook_url, payload, max_retries \\ 4)
+  def enqueue_webhook(original_job_id, user_id, webhook_url, payload, max_retries \\ -1)
 
   def enqueue_webhook(_original_job_id, _user_id, webhook_url, _payload, _max_retries)
       when webhook_url in [nil, ""],

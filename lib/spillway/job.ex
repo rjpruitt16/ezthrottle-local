@@ -118,8 +118,7 @@ defmodule Spillway.Job do
     if shared_idempotency_enabled?(),
       do: {:ok, "shared"},
       else:
-        {:error,
-         ~s(idempotency_scope "shared" requires SPILLWAY_SHARED_IDEMPOTENCY_ENABLED=true)}
+        {:error, ~s(idempotency_scope "shared" requires SPILLWAY_SHARED_IDEMPOTENCY_ENABLED=true)}
   end
 
   defp parse_idempotency_scope(_), do: {:error, ~s(idempotency_scope must be "user" or "shared")}
@@ -135,6 +134,7 @@ defmodule Spillway.Job do
   defp reject_nul(_user_id), do: :ok
 
   @default_max_retries 4
+  @default_webhook_max_retries -1
   @max_allowed_retries 100
   # Bounds retry_until_complete when there is no execute_before: the same
   # 24h default the idempotency TTL uses for queued jobs.
@@ -155,11 +155,15 @@ defmodule Spillway.Job do
   the two calls go to different places: a non-idempotent upstream can be tried
   once while its webhook keeps retrying through a receiver outage. Same values
   as max_retries; nil (unset, or a job stored before this field existed) means
-  the default 4. Mirrors Aquifer's webhook_max_retries /
-  X-Aqueduct-Webhook-Max-Retries.
+  -1, retry until delivered, bounded like any other job by 24h after the
+  delivery was queued. Four retries (1+2+4+8s) used to be the default, which
+  dropped every webhook that finished during a receiver outage longer than
+  about 15 seconds. With backoff capped at SPILLWAY_RETRY_MAX_BACKOFF_SECONDS,
+  an outage now costs time instead of results. Mirrors Aquifer's
+  webhook_max_retries / X-Aqueduct-Webhook-Max-Retries.
   """
   def webhook_max_retries(%__MODULE__{} = job),
-    do: Map.get(job, :webhook_max_retries) || @default_max_retries
+    do: Map.get(job, :webhook_max_retries) || @default_webhook_max_retries
 
   def retry_deadline_ms(%__MODULE__{execute_before: before})
       when is_integer(before) and before > 0,
@@ -254,7 +258,7 @@ defmodule Spillway.Job do
         user_id,
         webhook_url,
         payload,
-        max_retries \\ @default_max_retries
+        max_retries \\ @default_webhook_max_retries
       ) do
     %__MODULE__{
       id: generate_id(),
