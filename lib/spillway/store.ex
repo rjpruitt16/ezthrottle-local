@@ -226,15 +226,48 @@ defmodule Spillway.Store do
   def init(nil) do
     Process.flag(:trap_exit, true)
     Spillway.IdempotentStore.create_key_gate()
+    mark_synced(System.monotonic_time(:millisecond))
     schedule_sync()
     {:ok, nil}
   end
 
   @impl true
   def handle_info(:sync, state) do
+    started = System.monotonic_time(:millisecond)
     :rocksdb.sync_wal(db())
+    mark_synced(started)
     schedule_sync()
     {:noreply, state}
+  end
+
+  @doc """
+  How long writes may have gone without reaching disk: the age of the start
+  of the newest completed log sync, in ms. Normally about the sync interval
+  (100ms). It grows when this process can't get scheduled to run the sync,
+  which on a saturated node can take seconds. 0 when every write syncs.
+  Admission refuses new jobs once it passes SPILLWAY_MAX_SYNC_LAG_MS.
+  """
+  def sync_lag_ms do
+    case {sync_interval_ms(), :persistent_term.get({__MODULE__, :last_sync}, nil)} do
+      {0, _} -> 0
+      {_, nil} -> 0
+      {_, ref} -> max(System.monotonic_time(:millisecond) - :atomics.get(ref, 1), 0)
+    end
+  end
+
+  defp mark_synced(started) do
+    ref =
+      case :persistent_term.get({__MODULE__, :last_sync}, nil) do
+        nil ->
+          ref = :atomics.new(1, signed: true)
+          :persistent_term.put({__MODULE__, :last_sync}, ref)
+          ref
+
+        ref ->
+          ref
+      end
+
+    :atomics.put(ref, 1, started)
   end
 
   @impl true

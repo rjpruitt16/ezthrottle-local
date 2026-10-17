@@ -13,7 +13,7 @@ defmodule Spillway.FullnessTest do
   alias Spillway.{Admission, Intake}
 
   @limits ~w(SPILLWAY_MEMORY_LIMIT_MB SPILLWAY_DB_MAX_BYTES SPILLWAY_STORE_MAX_BACKLOG
-              SPILLWAY_MAX_EXPIRY_LAG_SECONDS)
+              SPILLWAY_MAX_EXPIRY_LAG_SECONDS SPILLWAY_MAX_SYNC_LAG_MS)
 
   setup do
     prev = Map.new(@limits, &{&1, System.get_env(&1)})

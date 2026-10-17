@@ -45,14 +45,15 @@ defmodule Spillway.Admission do
   @default_max_body_bytes 1 * 1024 * 1024
   @default_db_max_bytes 800 * 1024 * 1024
   @default_max_expiry_lag_seconds 300
+  @default_max_sync_lag_ms 1_000
+  @memory_share_of_machine 0.7
   @refresh_ms 1_000
 
   def start_link(_opts) do
-    if env_int("SPILLWAY_MEMORY_LIMIT_MB", 0) == 0 do
-      Logger.warning(
-        "[Admission] SPILLWAY_MEMORY_LIMIT_MB is not set — BEAM memory is unbounded. " <>
-          "Benchmarked safe at 400MB on a 512MB instance; set it to protect against OOM under burst load."
-      )
+    case System.get_env("SPILLWAY_MEMORY_LIMIT_MB") do
+      unset when unset in [nil, ""] -> log_derived_memory_limit(derived_memory_limit_mb())
+      "0" -> Logger.warning("[Admission] SPILLWAY_MEMORY_LIMIT_MB=0, so memory is unbounded")
+      _ -> :ok
     end
 
     counters()
@@ -156,7 +157,102 @@ defmodule Spillway.Admission do
     end
   end
 
-  def memory_limit_mb, do: env_int("SPILLWAY_MEMORY_LIMIT_MB", 0)
+  @doc """
+  SPILLWAY_MEMORY_LIMIT_MB, or when it's unset #{round(@memory_share_of_machine * 100)}% of the
+  container's memory limit, or of the machine's memory without one (0, so
+  off, where neither can be read). Aquifer's storm test found the cost of
+  no default: on a 2GB machine at 1,500 jobs/s for two hours it never
+  refused a request and the kernel OOM-killed it 25 times.
+  """
+  def memory_limit_mb do
+    case System.get_env("SPILLWAY_MEMORY_LIMIT_MB") do
+      unset when unset in [nil, ""] -> derived_memory_limit_mb()
+      _ -> env_int("SPILLWAY_MEMORY_LIMIT_MB", 0)
+    end
+  end
+
+  # Read once: the machine doesn't change under a running node.
+  defp derived_memory_limit_mb do
+    case :persistent_term.get({__MODULE__, :derived_memory_limit_mb}, nil) do
+      nil ->
+        mb = derive_memory_limit_mb(memory_sources())
+        :persistent_term.put({__MODULE__, :derived_memory_limit_mb}, mb)
+        mb
+
+      mb ->
+        mb
+    end
+  end
+
+  defp memory_sources do
+    %{
+      cgroup_v2: "/sys/fs/cgroup/memory.max",
+      cgroup_v1: "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+      meminfo: "/proc/meminfo"
+    }
+  end
+
+  @doc false
+  # 70% of the memory available, in MB, or 0. Public for tests.
+  def derive_memory_limit_mb(sources) do
+    case available_memory_bytes(sources) do
+      {bytes, _from} -> trunc(bytes * @memory_share_of_machine / 1_048_576)
+      nil -> 0
+    end
+  end
+
+  defp log_derived_memory_limit(0) do
+    Logger.warning(
+      "[Admission] SPILLWAY_MEMORY_LIMIT_MB is not set and this machine's memory can't be read; " <>
+        "memory is unbounded. Set it to about 70% of the memory Spillway may use."
+    )
+  end
+
+  defp log_derived_memory_limit(mb) do
+    {bytes, from} = available_memory_bytes(memory_sources())
+
+    Logger.info(
+      "[Admission] SPILLWAY_MEMORY_LIMIT_MB not set; refusing new jobs above #{mb}MB " <>
+        "(70% of #{div(bytes, 1_048_576)}MB, #{from}). If anything else runs on this machine " <>
+        "(Valkey, a sidecar), or it is resized, set SPILLWAY_MEMORY_LIMIT_MB for it."
+    )
+  end
+
+  # cgroup v2 says "max" without a limit; v1 reports a huge number.
+  defp available_memory_bytes(sources) do
+    limit =
+      Enum.find_value([sources.cgroup_v2, sources.cgroup_v1], fn path ->
+        case read_int_file(path) do
+          {:ok, n} when n > 0 and n < 1_152_921_504_606_846_976 -> n
+          _ -> nil
+        end
+      end)
+
+    cond do
+      limit -> {limit, "the container's memory limit"}
+      total = meminfo_total_bytes(sources.meminfo) -> {total, "the machine's memory"}
+      true -> nil
+    end
+  end
+
+  defp read_int_file(path) do
+    with {:ok, data} <- :file.read_file(String.to_charlist(path), [:raw]),
+         {n, ""} <- Integer.parse(String.trim(data)) do
+      {:ok, n}
+    else
+      _ -> :error
+    end
+  end
+
+  defp meminfo_total_bytes(path) do
+    with {:ok, data} <- :file.read_file(String.to_charlist(path), [:raw]),
+         [_, kb] <- Regex.run(~r/^MemTotal:\s+(\d+) kB/m, data) do
+      String.to_integer(kb) * 1024
+    else
+      _ -> nil
+    end
+  end
+
   def max_body_bytes, do: env_int("SPILLWAY_MAX_BODY_BYTES", @default_max_body_bytes)
   def db_max_bytes, do: env_int("SPILLWAY_DB_MAX_BYTES", @default_db_max_bytes)
   def base_retry_after_seconds, do: env_int("SPILLWAY_RETRY_AFTER_SECONDS", 5)
@@ -165,10 +261,12 @@ defmodule Spillway.Admission do
   def max_expiry_lag_seconds,
     do: env_int("SPILLWAY_MAX_EXPIRY_LAG_SECONDS", @default_max_expiry_lag_seconds)
 
+  def max_sync_lag_ms, do: env_int("SPILLWAY_MAX_SYNC_LAG_MS", @default_max_sync_lag_ms)
+
   @doc "True if at least one limit is actually configured, not just whether this process is running."
   def any_limit_configured? do
     memory_limit_mb() > 0 or max_body_bytes() > 0 or db_max_bytes() > 0 or
-      store_max_backlog() > 0 or max_expiry_lag_seconds() > 0
+      store_max_backlog() > 0 or max_expiry_lag_seconds() > 0 or max_sync_lag_ms() > 0
   end
 
   @doc """
@@ -197,6 +295,14 @@ defmodule Spillway.Admission do
       max_expiry_lag_seconds() > 0 and expiry_lag() > max_expiry_lag_seconds() ->
         record_rejection()
         {:rejected, "expiry_lag", max_expiry_lag_seconds(), expiry_lag()}
+
+      # Writes reach the OS as they're made, but disk only when the store's
+      # sync timer runs; a machine crash or host reboot loses what came
+      # after the last sync. While syncs are this far behind, say "later"
+      # rather than accept a job that might not survive one.
+      max_sync_lag_ms() > 0 and sync_lag() > max_sync_lag_ms() ->
+        record_rejection()
+        {:rejected, "sync_lag", max_sync_lag_ms(), sync_lag()}
 
       true ->
         record_allowed()
@@ -246,6 +352,7 @@ defmodule Spillway.Admission do
       db_max_bytes() > 0 and measured_db_bytes() / db_max_bytes(),
       store_max_backlog() > 0 and sampled_store_backlog() / store_max_backlog(),
       max_expiry_lag_seconds() > 0 and expiry_lag() / max_expiry_lag_seconds(),
+      max_sync_lag_ms() > 0 and sync_lag() / max_sync_lag_ms(),
       Spillway.Intake.backlog_fullness_ratio()
     ]
     |> Enum.filter(&is_number/1)
@@ -272,6 +379,8 @@ defmodule Spillway.Admission do
       vm_memory_mb: Spillway.MemoryUsage.vm_mb(),
       storage: Spillway.IdempotentStore.storage(),
       expiry_lag_seconds: expiry_lag(),
+      sync_lag_ms: sync_lag(),
+      max_sync_lag_ms: max_sync_lag_ms(),
       max_expiry_lag_seconds: max_expiry_lag_seconds(),
       expiry: Spillway.IdempotentStore.expiry_stats(),
       store_tables_mb: Spillway.Store.table_sizes_mb(),
@@ -294,6 +403,11 @@ defmodule Spillway.Admission do
   defp sampled_store_backlog, do: sampled(6, 7, &Spillway.StorePressure.backlog/0)
 
   defp current_memory_mb, do: Spillway.MemoryUsage.mb()
+
+  # An :atomics read kept by the store's sync timer. Tests swap in a value.
+  defp sync_lag do
+    Application.get_env(:spillway, :admission_sync_lag_reader, &Spillway.Store.sync_lag_ms/0).()
+  end
 
   # An :atomics read kept by cleanup. Tests swap in a fixed value.
   defp expiry_lag do
