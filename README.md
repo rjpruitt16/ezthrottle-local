@@ -304,6 +304,7 @@ Memory/DB-size ceilings that shed new (non-duplicate) jobs with a `429` once exc
 | `SPILLWAY_MAX_BODY_BYTES` | `1048576` (1MB) | Reject oversized request bodies with `413` |
 | `SPILLWAY_DB_MAX_BYTES` | `838860800` (800MB) | Reject new jobs once the store directory exceeds this many bytes |
 | `SPILLWAY_MAX_EXPIRY_LAG_SECONDS` | `300` | Refuse new jobs with 429 (`expiry_lag`) while cleanup of expired jobs is more than this many seconds behind, so intake can't grow the store faster than it's cleaned. `0` disables. The lag and cleanup timings are on `GET /health` under `admission.expiry`. |
+| `SPILLWAY_EXPIRE_CHUNK` / `SPILLWAY_EXPIRE_CONCURRENCY` | `100` / `2` | How many expired jobs cleanup deletes per write, and how many of those writes it runs at once. Larger values clear a backlog faster, but every job write waits behind them. |
 | `SPILLWAY_MAX_PENDING_PER_USER` | `10000` | Reject new client work for one user once its queued plus in-flight jobs reach this ceiling; `0` disables it |
 | `SPILLWAY_MAX_PENDING_PER_UPSTREAM` | `10000` | Shared per-upstream backlog budget used by fair admission; `0` disables it |
 | `SPILLWAY_RETRY_AFTER_SECONDS` | `5` | Base `Retry-After` on a `429`: doubles per consecutive rejection (capped at 60s), resets the moment a request is allowed again |

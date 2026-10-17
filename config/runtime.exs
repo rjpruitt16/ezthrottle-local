@@ -87,6 +87,14 @@ if config_env() == :prod do
          :store_cache_mb,
          String.to_integer(System.get_env("SPILLWAY_STORE_CACHE_MB", "128"))
 
+  config :spillway,
+         :expire_chunk,
+         String.to_integer(System.get_env("SPILLWAY_EXPIRE_CHUNK", "100"))
+
+  config :spillway,
+         :expire_concurrency,
+         String.to_integer(System.get_env("SPILLWAY_EXPIRE_CONCURRENCY", "2"))
+
   config :spillway, SpillwayWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [

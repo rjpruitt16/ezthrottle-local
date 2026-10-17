@@ -35,8 +35,9 @@ defmodule Spillway.IdempotentStore do
   # expiry, and deleted a batch at a time.
   @cleanup_interval_ms 10_000
   @expire_batch 2_000
-  @expire_chunk 250
-  @expire_concurrency 8
+  # Deletes per write and writes in flight; see expire_due_from/3.
+  @default_expire_chunk 100
+  @default_expire_concurrency 2
 
   # ---- Public API ----
 
@@ -670,15 +671,17 @@ defmodule Spillway.IdempotentStore do
 
     {current, legacy} = Enum.split_with(due, fn {_key, value} -> is_tuple(value) end)
 
-    # One write per chunk, chunks in parallel. Cleanup is a single process
-    # competing with every request process for RocksDB's dirty schedulers,
-    # and with a read and a write per job it got a sliver of them: in soak
-    # run 3g the store still grew 1GB an hour. Owner unregistration stays in
-    # this process (it only acts when called from the store's own process).
+    # One write per chunk, a few chunks at a time. Few and small, because
+    # RocksDB applies one write group at a time: in soak run 3i, eight
+    # 250-job deletes in flight queued ahead of the small writes that finish
+    # a job, and during catch-up completions dropped to zero for whole
+    # minutes while a pass took 4 to 55 seconds. Owner unregistration stays
+    # in this process (it only acts when called from the store's own
+    # process).
     current
-    |> Enum.chunk_every(@expire_chunk)
+    |> Enum.chunk_every(expire_chunk_size())
     |> Task.async_stream(&expire_chunk/1,
-      max_concurrency: @expire_concurrency,
+      max_concurrency: expire_concurrency(),
       ordered: false,
       timeout: :infinity
     )
@@ -755,6 +758,13 @@ defmodule Spillway.IdempotentStore do
     :atomics.put(ref, 4, count)
     :atomics.put(ref, 5, micros)
   end
+
+  # SPILLWAY_EXPIRE_CHUNK and SPILLWAY_EXPIRE_CONCURRENCY (config/runtime.exs).
+  defp expire_chunk_size,
+    do: Application.get_env(:spillway, :expire_chunk, @default_expire_chunk)
+
+  defp expire_concurrency,
+    do: Application.get_env(:spillway, :expire_concurrency, @default_expire_concurrency)
 
   defp rewind(<<expires_at::unsigned-64, _::binary>>),
     do: <<max(expires_at - 60_000, 0)::unsigned-64>>
