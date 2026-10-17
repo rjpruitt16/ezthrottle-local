@@ -48,12 +48,20 @@ defmodule Spillway.AdmissionTest do
     Admission.check()
   end
 
-  test "memory stays disabled by default, body/db default on, with no env vars set" do
+  test "with no env vars set, memory follows the machine and body/db default on" do
     System.delete_env("SPILLWAY_MEMORY_LIMIT_MB")
     System.delete_env("SPILLWAY_MAX_BODY_BYTES")
     System.delete_env("SPILLWAY_DB_MAX_BYTES")
 
-    assert Admission.memory_limit_mb() == 0
+    # 70% of this machine's memory on Linux (CI), 0 where it can't be read
+    # (macOS has neither cgroups nor /proc/meminfo).
+    assert Admission.memory_limit_mb() ==
+             Admission.derive_memory_limit_mb(%{
+               cgroup_v2: "/sys/fs/cgroup/memory.max",
+               cgroup_v1: "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+               meminfo: "/proc/meminfo"
+             })
+
     assert Admission.max_body_bytes() == 1 * 1024 * 1024
     assert Admission.db_max_bytes() == 800 * 1024 * 1024
     assert Admission.any_limit_configured?()
