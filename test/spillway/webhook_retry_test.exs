@@ -142,13 +142,12 @@ defmodule Spillway.WebhookRetryTest do
 
   # Four retries used to be the default, which gave a webhook about 15 seconds
   # of backoff before it was dropped (spillway#67).
-  test "webhook delivery retries past four by default until the receiver accepts it" do
-    hook = receiver(fn n -> n <= 9 end)
-    job = submit(start_server(OkPlug, nil) <> "/x", hook, %{})
+  test "webhook delivery defaults to ten retries" do
+    hook = receiver(fn _ -> true end)
+    submit(start_server(OkPlug, nil) <> "/x", hook, %{})
 
-    assert_receive {:delivered, id}, 15_000
-    assert id == job.id
-    assert last_attempt(10) == 10
+    assert_receive {:hook_attempt, 11}, 15_000
+    refute_receive {:hook_attempt, 12}, 500
   end
 
   test "an explicit webhook_max_retries still caps delivery" do
@@ -160,12 +159,12 @@ defmodule Spillway.WebhookRetryTest do
   end
 
   test "webhook_max_retries -1 keeps retrying until the receiver accepts it" do
-    hook = receiver(fn n -> n <= 7 end)
+    hook = receiver(fn n -> n <= 12 end)
     job = submit(start_server(OkPlug, nil) <> "/x", hook, %{"webhook_max_retries" => -1})
 
     assert_receive {:delivered, id}, 15_000
     assert id == job.id
-    assert last_attempt(8) == 8
+    assert last_attempt(13) == 13
   end
 
   test "webhook_max_retries leaves the upstream's retries alone" do
@@ -255,10 +254,10 @@ defmodule Spillway.WebhookRetryTest do
       })
 
     assert job.webhook_max_retries == nil
-    assert Job.webhook_max_retries(job) == -1
+    assert Job.webhook_max_retries(job) == 10
 
     # A job stored before this field existed has no :webhook_max_retries key.
     old = Map.delete(job, :webhook_max_retries)
-    assert Job.webhook_max_retries(Job.upgrade(old)) == -1
+    assert Job.webhook_max_retries(Job.upgrade(old)) == 10
   end
 end
